@@ -1,0 +1,7 @@
+{
+  "name": "fomo-haifa",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  }
+}
