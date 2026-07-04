@@ -2,6 +2,7 @@ const http = require("http");
 const fs = require("fs");
 const { URLSearchParams } = require("url");
 const { loadEvents, makeDigest } = require("./make-digest");
+const { extractEvent } = require("./extract-event");
 
 const CSV_HEADERS = [
   "id", "status", "event_name", "date", "start_time", "end_time", "location",
@@ -13,7 +14,25 @@ const PORT = Number(process.env.PORT || 3000);
 const EVENTS_FILE = process.env.EVENTS_FILE || "events.csv";
 const ADMIN_PHONE = process.env.ADMIN_PHONE || "+972528762432";
 
-const awaitingEventDetails = new Set(); // senders who chose "1" and should send free text next
+const activeSubmissions = new Map(); // sender -> array of message texts collected while drafting an event
+const llmCallTimestamps = new Map(); // sender -> array of ms timestamps of recent LLM calls
+
+const MAX_MESSAGE_LENGTH = 1000;
+const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const RATE_LIMIT_MAX_CALLS = 5;
+
+const MESSAGE_TOO_LONG_TEXT = "ההודעה ארוכה מדי. נסו לשלוח תיאור קצר יותר של האירוע.";
+const RATE_LIMITED_TEXT = "שלחתם הרבה הודעות ברצף. חכו דקה ונסו שוב.";
+
+function isRateLimited(sender) {
+  const now = Date.now();
+  const timestamps = (llmCallTimestamps.get(sender) || []).filter(
+    (ts) => now - ts < RATE_LIMIT_WINDOW_MS
+  );
+  timestamps.push(now);
+  llmCallTimestamps.set(sender, timestamps);
+  return timestamps.length > RATE_LIMIT_MAX_CALLS;
+}
 
 const MENU_TEXT = `היי! מה תרצו לעשות?
 
@@ -30,41 +49,9 @@ const CUSTOMER_SERVICE_TEXT = "לשירות לקוחות פנו לסתיו: +972
 const REVIEW_COMMAND = "סקירה";
 const REVIEWABLE_STATUS = "submitted";
 
-const fields = {
-  event_name: ["שם האירוע", "event name"],
-  date: ["תאריך", "date"],
-  start_time: ["שעת התחלה", "שעה", "start time", "time"],
-  end_time: ["שעת סיום", "end time"],
-  location: ["מיקום", "location"],
-  category: ["קטגוריה", "category"],
-  price: ["מחיר", "price"],
-  organizer: ["מארגן", "organizer"],
-  contact_link: ["קישור", "איש קשר", "contact", "link"],
-  description: ["תיאור קצר", "תיאור", "description"],
-};
-
 function csv(value) {
   const text = String(value || "");
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-}
-
-function parseMessage(body) {
-  const event = Object.fromEntries(Object.keys(fields).map((key) => [key, ""]));
-
-  for (const line of body.split(/\r?\n/)) {
-    const match = line.match(/^([^:：]+)[:：]\s*(.+)$/);
-    if (!match) continue;
-    const label = match[1].trim().toLowerCase();
-    const value = match[2].trim();
-    for (const [key, labels] of Object.entries(fields)) {
-      if (labels.some((candidate) => label.includes(candidate.toLowerCase()))) {
-        event[key] = value;
-      }
-    }
-  }
-
-  if (!event.description) event.description = body.replace(/\s+/g, " ").trim();
-  return event;
 }
 
 function missingFields(event) {
@@ -109,28 +96,58 @@ function twiml(message) {
   return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${escaped}</Message></Response>`;
 }
 
-function handleTwilio(req, res, body) {
+async function handleTwilio(req, res, body) {
   const params = new URLSearchParams(body);
   const text = params.get("Body") || "";
   const sender = params.get("From") || "";
 
+  let reply;
+  try {
+    reply = await routeMessage(sender, text);
+  } catch (err) {
+    console.error("routeMessage failed:", err);
+    reply = "מצטערים, קרתה תקלה. נסו שוב בעוד רגע.";
+  }
+
   res.writeHead(200, { "Content-Type": "text/xml; charset=utf-8" });
-  res.end(twiml(routeMessage(sender, text)));
+  res.end(twiml(reply));
 }
 
-function routeMessage(sender, text) {
-  if (awaitingEventDetails.has(sender)) {
-    awaitingEventDetails.delete(sender);
-    const event = parseMessage(text);
-    const missing = appendEvent(event, "Twilio WhatsApp", sender);
-    return missing.length
-      ? `חסרים פרטים כדי לפרסם: ${missing.join(", ")}`
-      : "קיבלנו את האירוע. הוא נכנס לבדיקה לפני פרסום.";
+async function routeMessage(sender, text) {
+  if (activeSubmissions.has(sender)) {
+    const trimmed = text.trim();
+    if (trimmed === "ביטול" || trimmed === "cancel") {
+      activeSubmissions.delete(sender);
+      return MENU_TEXT;
+    }
+
+    if (text.length > MAX_MESSAGE_LENGTH) {
+      return MESSAGE_TOO_LONG_TEXT;
+    }
+
+    if (isRateLimited(sender)) {
+      return RATE_LIMITED_TEXT;
+    }
+
+    const messages = activeSubmissions.get(sender);
+    messages.push(text);
+    const conversationText = messages.map((line, i) => `הודעה ${i + 1}: ${line}`).join("\n");
+
+    const event = await extractEvent(conversationText);
+    const missing = missingFields(event);
+
+    if (missing.length) {
+      return `חסרים עדיין פרטים: ${missing.join(", ")}\nשלחו את הפרטים החסרים, או "ביטול" כדי לצאת.`;
+    }
+
+    activeSubmissions.delete(sender);
+    appendEvent(event, "Twilio WhatsApp", sender);
+    return "קיבלנו את האירוע. הוא נכנס לבדיקה לפני פרסום.";
   }
 
   switch (text.trim()) {
     case "1":
-      awaitingEventDetails.add(sender);
+      activeSubmissions.set(sender, []);
       return ASK_EVENT_DETAILS_TEXT;
     case "2":
       return PRICE_PLACEHOLDER_TEXT;
@@ -188,4 +205,4 @@ if (require.main === module) {
   server.listen(PORT, () => console.log(`listening on ${PORT}`));
 }
 
-module.exports = { parseMessage, missingFields, routeMessage, awaitingEventDetails };
+module.exports = { missingFields, routeMessage, activeSubmissions };
