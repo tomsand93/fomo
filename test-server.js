@@ -88,6 +88,20 @@ async function demo() {
   if (!inquiryCancel.includes("מה תרצו לעשות")) throw new Error("cancel should exit the inquiry flow back to the menu");
   if (activeInquiries.has(inquirySender)) throw new Error("activeInquiries should be cleared after cancel");
 
+  // Global escape hatch: /menu and /cancel should work from any state, mid-submission included.
+  const escapeSender = "whatsapp:+972500000004";
+  await routeMessage(escapeSender, "2");
+  if (!activeSubmissions.has(escapeSender)) throw new Error("sender should be mid-submission before testing escape hatch");
+  const menuEscape = await routeMessage(escapeSender, "/menu");
+  if (!menuEscape.includes("מה תרצו לעשות")) throw new Error("/menu should return to the main menu from any state");
+  if (activeSubmissions.has(escapeSender)) throw new Error("/menu should clear an in-progress submission");
+
+  await routeMessage(escapeSender, "1");
+  if (!activeInquiries.has(escapeSender)) throw new Error("sender should be mid-inquiry before testing escape hatch");
+  const cancelEscape = await routeMessage(escapeSender, "/cancel");
+  if (!cancelEscape.includes("מה תרצו לעשות")) throw new Error("/cancel should return to the main menu from any state");
+  if (activeInquiries.has(escapeSender)) throw new Error("/cancel should clear an in-progress inquiry");
+
   fs.unlinkSync(TEST_EVENTS_FILE);
   console.log("all tests passed");
 }

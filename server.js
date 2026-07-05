@@ -186,15 +186,21 @@ async function handleTwilio(req, res, body) {
   res.end(twiml(reply));
 }
 
+const MENU_KEYWORDS = new Set(["תפריט", "/menu", "menu"]);
+const CANCEL_KEYWORDS = new Set(["ביטול", "/cancel", "cancel"]);
+
 async function routeMessage(sender, text) {
   const trimmed = text.trim();
+  const lowerTrimmed = trimmed.toLowerCase();
+
+  if (CANCEL_KEYWORDS.has(lowerTrimmed) || MENU_KEYWORDS.has(lowerTrimmed)) {
+    activeSubmissions.delete(sender);
+    activeInquiries.delete(sender);
+    recentlyCompleted.delete(sender);
+    return MENU_TEXT;
+  }
 
   if (activeSubmissions.has(sender)) {
-    if (trimmed === "ביטול" || trimmed === "cancel") {
-      activeSubmissions.delete(sender);
-      return MENU_TEXT;
-    }
-
     if (text.length > MAX_MESSAGE_LENGTH) {
       return MESSAGE_TOO_LONG_TEXT;
     }
@@ -222,11 +228,6 @@ async function routeMessage(sender, text) {
   }
 
   if (activeInquiries.has(sender)) {
-    if (trimmed === "ביטול" || trimmed === "cancel") {
-      activeInquiries.delete(sender);
-      return MENU_TEXT;
-    }
-
     if (text.length > MAX_MESSAGE_LENGTH) {
       return MESSAGE_TOO_LONG_TEXT;
     }
