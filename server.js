@@ -3,6 +3,8 @@ const fs = require("fs");
 const { URLSearchParams } = require("url");
 const { loadEvents, makeDigest } = require("./make-digest");
 const { extractEvent } = require("./extract-event");
+const { answerInquiry } = require("./answer-inquiry");
+const { sendWhatsApp } = require("./send-whatsapp");
 
 const CSV_HEADERS = [
   "id", "status", "event_name", "date", "start_time", "end_time", "location",
@@ -15,6 +17,8 @@ const EVENTS_FILE = process.env.EVENTS_FILE || "events.csv";
 const ADMIN_PHONE = process.env.ADMIN_PHONE || "+972528762432";
 
 const activeSubmissions = new Map(); // sender -> array of message texts collected while drafting an event
+const activeInquiries = new Set(); // senders currently in the "ask about events" flow
+const recentlyCompleted = new Set(); // senders whose last action was a completed submission, for a softer follow-up
 const llmCallTimestamps = new Map(); // sender -> array of ms timestamps of recent LLM calls
 
 const MAX_MESSAGE_LENGTH = 1000;
@@ -23,6 +27,38 @@ const RATE_LIMIT_MAX_CALLS = 5;
 
 const MESSAGE_TOO_LONG_TEXT = "ההודעה ארוכה מדי. נסו לשלוח תיאור קצר יותר של האירוע.";
 const RATE_LIMITED_TEXT = "שלחתם הרבה הודעות ברצף. חכו דקה ונסו שוב.";
+
+const KNOWN_CATEGORIES = ["קולנוע", "אוכל ויין", "מסיבה", "קריוקי", "מוזיקה חיה", "מוזיקה"];
+
+function todayIso() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function addDays(iso, days) {
+  const date = new Date(`${iso}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function filterEventsForInquiry(question, events) {
+  const published = events.filter((event) => event.status === "published");
+  const text = question.trim();
+
+  let dateFilter = null;
+  if (text.includes("היום")) dateFilter = todayIso();
+  else if (text.includes("מחר")) dateFilter = addDays(todayIso(), 1);
+
+  const matchedCategory = KNOWN_CATEGORIES.find((category) => text.includes(category));
+
+  return published.filter((event) => {
+    if (dateFilter && event.date !== dateFilter) return false;
+    if (matchedCategory) {
+      const related = event.category.includes(matchedCategory) || matchedCategory.includes(event.category);
+      if (!related) return false;
+    }
+    return true;
+  });
+}
 
 function isRateLimited(sender) {
   const now = Date.now();
@@ -36,15 +72,27 @@ function isRateLimited(sender) {
 
 const MENU_TEXT = `היי! מה תרצו לעשות?
 
-1. לפרסם אירוע
-2. לראות מחירון פרסום
-3. שירות לקוחות`;
+1. לברר בנוגע לאירועים
+2. לפרסם אירוע
+3. לראות מחירון פרסום
+4. שירות לקוחות`;
 
 const ASK_EVENT_DETAILS_TEXT = "שלחו את פרטי האירוע בפורמט חופשי.";
+
+const ASK_INQUIRY_TEXT = "מה תרצו לדעת על האירועים? (לדוגמה: \"אילו אירועי מוזיקה יש היום?\"). כתבו \"ביטול\" כדי לצאת.";
 
 const PRICE_PLACEHOLDER_TEXT = "מחיר הפרסום: יעודכן בקרוב, פנו אלינו לפרטים.";
 
 const CUSTOMER_SERVICE_TEXT = "לשירות לקוחות פנו לסתיו: +972528762432";
+
+const FOLLOW_UP_AFTER_SUBMISSION_TEXT = `האירוע האחרון שלכם כבר נשלח לבדיקה, אין צורך לשלוח שוב.
+
+היי! מה תרצו לעשות?
+
+1. לברר בנוגע לאירועים
+2. לפרסם אירוע
+3. לראות מחירון פרסום
+4. שירות לקוחות`;
 
 const REVIEW_COMMAND = "סקירה";
 const REVIEWABLE_STATUS = "submitted";
@@ -88,6 +136,31 @@ function appendEvent(event, source, sender) {
   return missing;
 }
 
+function formatEventForReview(event, sender) {
+  return [
+    "אירוע חדש לבדיקה:",
+    `שם: ${event.event_name}`,
+    `תאריך: ${event.date}`,
+    `שעה: ${event.start_time}${event.end_time ? ` - ${event.end_time}` : ""}`,
+    `מיקום: ${event.location}`,
+    `קטגוריה: ${event.category}`,
+    event.price ? `מחיר: ${event.price}` : null,
+    event.organizer ? `מארגן: ${event.organizer}` : null,
+    `קישור/איש קשר: ${event.contact_link}`,
+    event.description ? `תיאור: ${event.description}` : null,
+    `נשלח מ: ${sender}`,
+  ].filter(Boolean).join("\n");
+}
+
+async function forwardEventToAdmin(event, sender) {
+  if (process.env.NODE_ENV === "test") return;
+  try {
+    await sendWhatsApp(`whatsapp:${ADMIN_PHONE}`, formatEventForReview(event, sender));
+  } catch (err) {
+    console.error("failed to forward event to admin:", err);
+  }
+}
+
 function twiml(message) {
   const escaped = message
     .replace(/&/g, "&amp;")
@@ -114,8 +187,9 @@ async function handleTwilio(req, res, body) {
 }
 
 async function routeMessage(sender, text) {
+  const trimmed = text.trim();
+
   if (activeSubmissions.has(sender)) {
-    const trimmed = text.trim();
     if (trimmed === "ביטול" || trimmed === "cancel") {
       activeSubmissions.delete(sender);
       return MENU_TEXT;
@@ -142,16 +216,48 @@ async function routeMessage(sender, text) {
 
     activeSubmissions.delete(sender);
     appendEvent(event, "Twilio WhatsApp", sender);
+    recentlyCompleted.add(sender);
+    await forwardEventToAdmin(event, sender);
     return "קיבלנו את האירוע. הוא נכנס לבדיקה לפני פרסום.";
   }
 
-  switch (text.trim()) {
+  if (activeInquiries.has(sender)) {
+    if (trimmed === "ביטול" || trimmed === "cancel") {
+      activeInquiries.delete(sender);
+      return MENU_TEXT;
+    }
+
+    if (text.length > MAX_MESSAGE_LENGTH) {
+      return MESSAGE_TOO_LONG_TEXT;
+    }
+
+    if (isRateLimited(sender)) {
+      return RATE_LIMITED_TEXT;
+    }
+
+    const allEvents = loadEvents(EVENTS_FILE);
+    const relevant = filterEventsForInquiry(text, allEvents);
+    const answer = await answerInquiry(text, relevant);
+    return `${answer}\n\n(כתבו "ביטול" כדי לחזור לתפריט)`;
+  }
+
+  if (recentlyCompleted.has(sender)) {
+    recentlyCompleted.delete(sender);
+    if (trimmed !== "1" && trimmed !== "2" && trimmed !== "3" && trimmed !== "4") {
+      return FOLLOW_UP_AFTER_SUBMISSION_TEXT;
+    }
+  }
+
+  switch (trimmed) {
     case "1":
+      activeInquiries.add(sender);
+      return ASK_INQUIRY_TEXT;
+    case "2":
       activeSubmissions.set(sender, []);
       return ASK_EVENT_DETAILS_TEXT;
-    case "2":
-      return PRICE_PLACEHOLDER_TEXT;
     case "3":
+      return PRICE_PLACEHOLDER_TEXT;
+    case "4":
       return CUSTOMER_SERVICE_TEXT;
     default:
       return MENU_TEXT;
@@ -205,4 +311,4 @@ if (require.main === module) {
   server.listen(PORT, () => console.log(`listening on ${PORT}`));
 }
 
-module.exports = { missingFields, routeMessage, activeSubmissions };
+module.exports = { missingFields, routeMessage, activeSubmissions, activeInquiries, recentlyCompleted };

@@ -1,0 +1,90 @@
+const https = require("https");
+
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+const MODEL = process.env.OPENROUTER_MODEL || "anthropic/claude-haiku-4.5";
+
+function callOpenRouter(prompt) {
+  const payload = JSON.stringify({
+    model: MODEL,
+    messages: [{ role: "user", content: prompt }],
+    temperature: 0,
+  });
+
+  const options = {
+    hostname: "openrouter.ai",
+    path: "/api/v1/chat/completions",
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(payload),
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+    },
+  };
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error(`OpenRouter error ${res.statusCode}: ${data}`));
+          return;
+        }
+        resolve(data);
+      });
+    });
+    req.on("error", reject);
+    req.write(payload);
+    req.end();
+  });
+}
+
+function eventsToText(events) {
+  if (!events.length) return "(אין אירועים תואמים)";
+  return events
+    .map((event, i) => {
+      const parts = [
+        `${i + 1}. ${event.event_name}`,
+        `תאריך: ${event.date}`,
+        `שעה: ${event.start_time}`,
+        `מיקום: ${event.location}`,
+        `קטגוריה: ${event.category}`,
+      ];
+      if (event.price) parts.push(`מחיר: ${event.price}`);
+      if (event.contact_link) parts.push(`קישור: ${event.contact_link}`);
+      if (event.description) parts.push(`תיאור: ${event.description}`);
+      return parts.join(" | ");
+    })
+    .join("\n");
+}
+
+function buildPrompt(question, events, todayIso) {
+  return `אתה עוזר ידידותי שעונה על שאלות לגבי אירועי תרבות בחיפה, בהתבסס אך ורק על רשימת האירועים שסופקה למטה.
+היום התאריך הוא ${todayIso} (פורמט YYYY-MM-DD).
+
+כללים:
+- ענה רק לפי האירועים ברשימה. אל תמציא אירועים שאינם ברשימה.
+- אם אין אירועים מתאימים לשאלה, אמור זאת בנימוס בעברית.
+- ענה בטון טבעי, קליל וידידותי, כמו הודעת וואטסאפ, לא רשימה טכנית.
+- תשובה קצרה וממוקדת, בעברית בלבד.
+
+רשימת האירועים הרלוונטיים:
+${eventsToText(events)}
+
+שאלת המשתמש:
+${question}`;
+}
+
+async function answerInquiry(question, events, todayIso = new Date().toISOString().slice(0, 10)) {
+  if (!OPENROUTER_API_KEY) {
+    throw new Error("OPENROUTER_API_KEY is not set");
+  }
+
+  const prompt = buildPrompt(question, events, todayIso);
+  const raw = await callOpenRouter(prompt);
+  const parsed = JSON.parse(raw);
+  const content = parsed.choices?.[0]?.message?.content || "";
+  return content.trim();
+}
+
+module.exports = { answerInquiry };
