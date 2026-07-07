@@ -8,11 +8,14 @@ const FIELD_KEYS = [
   "category", "price", "organizer", "contact_link", "description",
 ];
 
-function buildPrompt(conversationText, todayIso) {
+function buildPrompt(conversationText, todayIso, hasImages) {
+  const imageNote = hasImages
+    ? "\nבנוסף לטקסט צורפו תמונה/ות של פלייר האירוע. חלץ מידע גם מהטקסט המופיע בתמונה (שם האירוע, תאריך, שעה, מיקום וכו').\n"
+    : "\n";
   return `אתה עוזר שמחלץ פרטי אירוע תרבות מהודעות טקסט בעברית (או מעורבות עברית/אנגלית) שנשלחות בוואטסאפ.
 היום התאריך הוא ${todayIso} (פורמט YYYY-MM-DD).
-
-חלץ את השדות הבאים מהטקסט. אם שדה לא מוזכר, השאר אותו כמחרוזת ריקה "".
+${imageNote}
+חלץ את השדות הבאים מהטקסט (ומהתמונה אם צורפה). אם שדה לא מוזכר בשום מקום, השאר אותו כמחרוזת ריקה "".
 - event_name: שם האירוע. אם אין כותרת מפורשת (כמו "שם האירוע:"), הסק שם קצר וברור מהשורה הראשונה או מהתיאור הכללי של האירוע. השאר ריק רק אם באמת אי אפשר להסיק שם כלשהו.
 - date: תאריך האירוע בפורמט YYYY-MM-DD. אם נאמר יום בשבוע (כמו "יום שישי") ללא תאריך מדויק, חשב את התאריך הקרוב ביותר בעתיד מהיום הנוכחי.
 - start_time: שעת התחלה בפורמט HH:MM (24 שעות). אם נאמר "בצהריים" השתמש ב-12:00, "בערב" 19:00, "אחר הצהריים" 16:00, אלא אם צוין אחרת.
@@ -33,10 +36,18 @@ function buildPrompt(conversationText, todayIso) {
 ${conversationText}`;
 }
 
-function callOpenRouter(prompt) {
+function buildUserContent(prompt, imageDataUrls) {
+  if (!imageDataUrls || !imageDataUrls.length) return prompt;
+  return [
+    { type: "text", text: prompt },
+    ...imageDataUrls.map((url) => ({ type: "image_url", image_url: { url } })),
+  ];
+}
+
+function callOpenRouter(content) {
   const payload = JSON.stringify({
     model: MODEL,
-    messages: [{ role: "user", content: prompt }],
+    messages: [{ role: "user", content }],
     temperature: 0,
   });
 
@@ -79,13 +90,14 @@ function extractJson(text) {
   return JSON.parse(match[0]);
 }
 
-async function extractEvent(conversationText, todayIso = new Date().toISOString().slice(0, 10)) {
+async function extractEvent(conversationText, todayIso = new Date().toISOString().slice(0, 10), imageDataUrls = []) {
   if (!OPENROUTER_API_KEY) {
     throw new Error("OPENROUTER_API_KEY is not set");
   }
 
-  const prompt = buildPrompt(conversationText, todayIso);
-  const raw = await callOpenRouter(prompt);
+  const prompt = buildPrompt(conversationText, todayIso, imageDataUrls.length > 0);
+  const userContent = buildUserContent(prompt, imageDataUrls);
+  const raw = await callOpenRouter(userContent);
   const parsed = JSON.parse(raw);
   const content = parsed.choices?.[0]?.message?.content || "";
   const fields = extractJson(content);

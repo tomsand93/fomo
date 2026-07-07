@@ -5,6 +5,7 @@ const { loadEvents, makeDigest } = require("./make-digest");
 const { extractEvent } = require("./extract-event");
 const { answerInquiry } = require("./answer-inquiry");
 const { sendWhatsApp } = require("./send-whatsapp");
+const { fetchMediaAsDataUrl } = require("./fetch-media");
 
 const CSV_HEADERS = [
   "id", "status", "event_name", "date", "start_time", "end_time", "location",
@@ -17,16 +18,19 @@ const EVENTS_FILE = process.env.EVENTS_FILE || "events.csv";
 const ADMIN_PHONE = process.env.ADMIN_PHONE || "+972528762432";
 
 const activeSubmissions = new Map(); // sender -> array of message texts collected while drafting an event
+const activeSubmissionImages = new Map(); // sender -> array of image data URLs collected while drafting an event
 const activeInquiries = new Set(); // senders currently in the "ask about events" flow
 const recentlyCompleted = new Set(); // senders whose last action was a completed submission, for a softer follow-up
 const llmCallTimestamps = new Map(); // sender -> array of ms timestamps of recent LLM calls
 
 const MAX_MESSAGE_LENGTH = 1000;
+const MAX_IMAGES_PER_EVENT = 3;
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
 const RATE_LIMIT_MAX_CALLS = 5;
 
 const MESSAGE_TOO_LONG_TEXT = "ההודעה ארוכה מדי. נסו לשלוח תיאור קצר יותר של האירוע.";
 const RATE_LIMITED_TEXT = "שלחתם הרבה הודעות ברצף. חכו דקה ונסו שוב.";
+const MEDIA_FETCH_FAILED_TEXT = "לא הצלחנו לקרוא את התמונה ששלחתם. נסו לשלוח אותה שוב, או המשיכו עם טקסט בלבד.";
 
 const KNOWN_CATEGORIES = ["קולנוע", "אוכל ויין", "מסיבה", "קריוקי", "מוזיקה חיה", "מוזיקה"];
 
@@ -190,14 +194,26 @@ function twiml(message) {
   return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${escaped}</Message></Response>`;
 }
 
+function extractMediaUrls(params) {
+  const numMedia = Number(params.get("NumMedia") || "0");
+  const urls = [];
+  for (let i = 0; i < numMedia; i++) {
+    const url = params.get(`MediaUrl${i}`);
+    const contentType = params.get(`MediaContentType${i}`) || "";
+    if (url && contentType.startsWith("image/")) urls.push(url);
+  }
+  return urls;
+}
+
 async function handleTwilio(req, res, body) {
   const params = new URLSearchParams(body);
   const text = params.get("Body") || "";
   const sender = params.get("From") || "";
+  const mediaUrls = extractMediaUrls(params);
 
   let reply;
   try {
-    reply = await routeMessage(sender, text);
+    reply = await routeMessage(sender, text, mediaUrls);
   } catch (err) {
     console.error("routeMessage failed:", err);
     reply = "מצטערים, קרתה תקלה. נסו שוב בעוד רגע.";
@@ -210,12 +226,13 @@ async function handleTwilio(req, res, body) {
 const MENU_KEYWORDS = new Set(["תפריט", "/menu", "menu"]);
 const CANCEL_KEYWORDS = new Set(["ביטול", "/cancel", "cancel"]);
 
-async function routeMessage(sender, text) {
+async function routeMessage(sender, text, mediaUrls = []) {
   const trimmed = text.trim();
   const lowerTrimmed = trimmed.toLowerCase();
 
   if (CANCEL_KEYWORDS.has(lowerTrimmed) || MENU_KEYWORDS.has(lowerTrimmed)) {
     activeSubmissions.delete(sender);
+    activeSubmissionImages.delete(sender);
     activeInquiries.delete(sender);
     recentlyCompleted.delete(sender);
     return MENU_TEXT;
@@ -230,11 +247,28 @@ async function routeMessage(sender, text) {
       return RATE_LIMITED_TEXT;
     }
 
+    const images = activeSubmissionImages.get(sender) || [];
+    if (mediaUrls.length) {
+      try {
+        const fetched = await Promise.all(mediaUrls.map(fetchMediaAsDataUrl));
+        images.push(...fetched);
+        activeSubmissionImages.set(sender, images.slice(0, MAX_IMAGES_PER_EVENT));
+      } catch (err) {
+        console.error("failed to fetch WhatsApp media:", err);
+        if (!trimmed) return MEDIA_FETCH_FAILED_TEXT;
+      }
+    }
+
     const messages = activeSubmissions.get(sender);
     messages.push(text);
+
+    if (!messages.some((m) => m.trim()) && !images.length) {
+      return ASK_EVENT_DETAILS_TEXT;
+    }
+
     const conversationText = messages.map((line, i) => `הודעה ${i + 1}: ${line}`).join("\n");
 
-    const event = await extractEvent(conversationText);
+    const event = await extractEvent(conversationText, undefined, images);
     const missing = missingFields(event);
 
     if (missing.length) {
@@ -242,6 +276,7 @@ async function routeMessage(sender, text) {
     }
 
     activeSubmissions.delete(sender);
+    activeSubmissionImages.delete(sender);
     appendEvent(event, "Twilio WhatsApp", sender);
     recentlyCompleted.add(sender);
     await forwardEventToAdmin(event, sender);
@@ -276,6 +311,7 @@ async function routeMessage(sender, text) {
       return ASK_INQUIRY_TEXT;
     case "2":
       activeSubmissions.set(sender, []);
+      activeSubmissionImages.delete(sender);
       return ASK_EVENT_DETAILS_TEXT;
     case "3":
       return PRICE_PLACEHOLDER_TEXT;
@@ -333,4 +369,4 @@ if (require.main === module) {
   server.listen(PORT, () => console.log(`listening on ${PORT}`));
 }
 
-module.exports = { missingFields, routeMessage, activeSubmissions, activeInquiries, recentlyCompleted };
+module.exports = { missingFields, routeMessage, activeSubmissions, activeSubmissionImages, activeInquiries, recentlyCompleted };
