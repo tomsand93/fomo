@@ -102,15 +102,36 @@ function csv(value) {
   return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
+const CONTACT_LINK_RE = /^(https?:\/\/\S+|\+?\d[\d\s-]{6,}\d|@\w+)$/i;
+
+function isValidDate(value) {
+  if (!DATE_RE.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+function fieldIsValid(key, value) {
+  if (!value) return true; // emptiness is handled by missingFields, not here
+  if (key === "date") return isValidDate(value);
+  if (key === "start_time" || key === "end_time") return TIME_RE.test(value);
+  if (key === "contact_link") return CONTACT_LINK_RE.test(value.trim());
+  return true;
+}
+
 function missingFields(event) {
-  return [
+  const required = [
     ["event_name", "שם האירוע"],
     ["date", "תאריך"],
     ["start_time", "שעה"],
     ["location", "מיקום"],
     ["category", "קטגוריה"],
     ["contact_link", "קישור / איש קשר"],
-  ].filter(([key]) => !event[key]).map(([, label]) => label);
+  ];
+  return required
+    .filter(([key]) => !event[key] || !fieldIsValid(key, event[key]))
+    .map(([, label]) => label);
 }
 
 function appendEvent(event, source, sender) {
