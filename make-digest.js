@@ -1,4 +1,4 @@
-const fs = require("fs");
+const { loadEvents } = require("./events-store");
 
 const icons = {
   "קולנוע": "🎬",
@@ -8,38 +8,6 @@ const icons = {
   "מוזיקה חיה": "🎸",
   "מוזיקה": "🎸",
 };
-
-function parseCsvLine(line) {
-  const fields = [];
-  let value = "";
-  let quoted = false;
-
-  for (let i = 0; i < line.length; i += 1) {
-    const char = line[i];
-    const next = line[i + 1];
-    if (char === '"' && quoted && next === '"') {
-      value += '"';
-      i += 1;
-    } else if (char === '"') {
-      quoted = !quoted;
-    } else if (char === "," && !quoted) {
-      fields.push(value);
-      value = "";
-    } else {
-      value += char;
-    }
-  }
-  fields.push(value);
-  return fields;
-}
-
-function loadEvents(path) {
-  const content = fs.readFileSync(path, "utf8").trim();
-  if (!content) return [];
-  const rows = content.split(/\r?\n/).map(parseCsvLine);
-  const headers = rows.shift();
-  return rows.map((row) => Object.fromEntries(headers.map((header, i) => [header, row[i] || ""])));
-}
 
 function eventBlock(event) {
   const icon = icons[event.category] || "🎈";
@@ -55,7 +23,7 @@ function makeDigest(events, targetDate) {
   const publishable = events
     .filter((event) =>
       event.date === targetDate &&
-      ["submitted", "approved", "published"].includes(event.status) &&
+      event.status === "published" &&
       event.start_time &&
       event.location
     )
@@ -79,7 +47,7 @@ function makeDigest(events, targetDate) {
 function demo() {
   const digest = makeDigest([
     {
-      status: "submitted",
+      status: "published",
       event_name: "בדיקה",
       date: "2026-06-25",
       start_time: "20:00",
@@ -98,7 +66,7 @@ function demo() {
 if (require.main === module) {
   demo();
   const dateArg = process.argv[2] || new Date().toISOString().slice(0, 10);
-  console.log(makeDigest(loadEvents("events.csv"), dateArg));
+  console.log(makeDigest(loadEvents(process.env.EVENTS_FILE || "events.csv"), dateArg));
 }
 
 module.exports = { loadEvents, makeDigest };

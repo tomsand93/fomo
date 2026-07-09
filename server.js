@@ -1,27 +1,52 @@
 const http = require("http");
 const fs = require("fs");
+const path = require("path");
 const { URLSearchParams } = require("url");
 const { loadEvents, makeDigest } = require("./make-digest");
+const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent } = require("./events-store");
 const { extractEvent } = require("./extract-event");
 const { answerInquiry } = require("./answer-inquiry");
 const { sendWhatsApp } = require("./send-whatsapp");
 const { fetchMediaAsDataUrl } = require("./fetch-media");
 
-const CSV_HEADERS = [
-  "id", "status", "event_name", "date", "start_time", "end_time", "location",
-  "category", "price", "organizer", "contact_link", "description", "source",
-  "published_at", "notes",
-];
-
 const PORT = Number(process.env.PORT || 3000);
 const EVENTS_FILE = process.env.EVENTS_FILE || "events.csv";
 const ADMIN_PHONE = process.env.ADMIN_PHONE || "+972528762432";
+const ADMIN_SENDER = `whatsapp:${ADMIN_PHONE}`;
+const STATE_FILE = process.env.STATE_FILE || path.join(path.dirname(EVENTS_FILE), "state.json");
 
-const activeSubmissions = new Map(); // sender -> array of message texts collected while drafting an event
-const activeSubmissionImages = new Map(); // sender -> array of image data URLs collected while drafting an event
-const activeInquiries = new Set(); // senders currently in the "ask about events" flow
-const recentlyCompleted = new Set(); // senders whose last action was a completed submission, for a softer follow-up
+let activeSubmissions = new Map(); // sender -> array of message texts collected while drafting an event
+let activeSubmissionImages = new Map(); // sender -> array of image data URLs collected while drafting an event
+let activeInquiries = new Set(); // senders currently in the "ask about events" flow
+let recentlyCompleted = new Set(); // senders whose last action was a completed submission, for a softer follow-up
 const llmCallTimestamps = new Map(); // sender -> array of ms timestamps of recent LLM calls
+
+function loadState() {
+  try {
+    const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    activeSubmissions = new Map(raw.activeSubmissions || []);
+    activeSubmissionImages = new Map(raw.activeSubmissionImages || []);
+    activeInquiries = new Set(raw.activeInquiries || []);
+    recentlyCompleted = new Set(raw.recentlyCompleted || []);
+  } catch (err) {
+    if (err.code !== "ENOENT") console.error("failed to load state:", err);
+  }
+}
+
+function saveState() {
+  const payload = {
+    activeSubmissions: [...activeSubmissions.entries()],
+    activeSubmissionImages: [...activeSubmissionImages.entries()],
+    activeInquiries: [...activeInquiries],
+    recentlyCompleted: [...recentlyCompleted],
+  };
+  try {
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+    fs.writeFileSync(STATE_FILE, JSON.stringify(payload), "utf8");
+  } catch (err) {
+    console.error("failed to save state:", err);
+  }
+}
 
 const MAX_MESSAGE_LENGTH = 1000;
 const MAX_IMAGES_PER_EVENT = 3;
@@ -98,14 +123,6 @@ const FOLLOW_UP_AFTER_SUBMISSION_TEXT = `האירוע האחרון שלכם כב
 3. לראות מחירון פרסום
 4. שירות לקוחות`;
 
-const REVIEW_COMMAND = "סקירה";
-const REVIEWABLE_STATUS = "submitted";
-
-function csv(value) {
-  const text = String(value || "");
-  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
-}
-
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 const CONTACT_LINK_RE = /^(https?:\/\/\S+|\+?\d[\d\s-]{6,}\d|@\w+)$/i;
@@ -140,30 +157,13 @@ function missingFields(event) {
 
 function appendEvent(event, source, sender) {
   const missing = missingFields(event);
-  const status = missing.length ? "needs_info" : "submitted";
-  const row = [
-    status,
-    event.event_name,
-    event.date,
-    event.start_time,
-    event.end_time,
-    event.location,
-    event.category,
-    event.price,
-    event.organizer,
-    event.contact_link,
-    event.description,
-    source,
-    "",
-    [sender, missing.length ? `חסר: ${missing.join(", ")}` : ""].filter(Boolean).join(" | "),
-  ];
-  fs.appendFileSync(EVENTS_FILE, `${row.map(csv).join(",")}\n`, "utf8");
-  return missing;
+  const id = storeAppendEvent(EVENTS_FILE, event, source, sender, missing);
+  return { missing, id };
 }
 
-function formatEventForReview(event, sender) {
+function formatEventForReview(id, event, sender) {
   return [
-    "אירוע חדש לבדיקה:",
+    `אירוע חדש לבדיקה #${id}:`,
     `שם: ${event.event_name}`,
     `תאריך: ${event.date}`,
     `שעה: ${event.start_time}${event.end_time ? ` - ${event.end_time}` : ""}`,
@@ -174,16 +174,82 @@ function formatEventForReview(event, sender) {
     `קישור/איש קשר: ${event.contact_link}`,
     event.description ? `תיאור: ${event.description}` : null,
     `נשלח מ: ${sender}`,
-  ].filter(Boolean).join("\n");
+    "",
+    `לאישור: אשר ${id}`,
+    `לדחייה: דחה ${id} [סיבה]`,
+  ].filter((line) => line !== null).join("\n");
 }
 
-async function forwardEventToAdmin(event, sender) {
+async function forwardEventToAdmin(id, event, sender) {
   if (process.env.NODE_ENV === "test") return;
   try {
-    await sendWhatsApp(`whatsapp:${ADMIN_PHONE}`, formatEventForReview(event, sender));
+    await sendWhatsApp(ADMIN_SENDER, formatEventForReview(id, event, sender));
   } catch (err) {
     console.error("failed to forward event to admin:", err);
   }
+}
+
+async function notifySubmitter(sender, text) {
+  if (process.env.NODE_ENV === "test") return;
+  try {
+    await sendWhatsApp(sender, text);
+  } catch (err) {
+    console.error("failed to notify submitter:", err);
+  }
+}
+
+const ADMIN_HELP_TEXT = `פקודות ניהול:
+אשר <מספר> - לאשר ולפרסם אירוע
+דחה <מספר> [סיבה] - לדחות אירוע
+ממתינים - רשימת אירועים ממתינים לבדיקה`;
+
+function formatPendingList(events) {
+  const pending = events.filter((e) => e.status === "submitted");
+  if (!pending.length) return "אין אירועים ממתינים כרגע.";
+  return pending
+    .map((e) => `#${e.id} ${e.event_name} — ${e.date} ${e.start_time}`)
+    .join("\n");
+}
+
+const ADMIN_COMMAND_RE = /^(אשר|דחה)\s*#?(\d+)\s*(.*)$/;
+
+async function handleAdminMessage(text) {
+  const trimmed = text.trim();
+
+  if (trimmed === "ממתינים") {
+    return formatPendingList(loadEvents(EVENTS_FILE));
+  }
+
+  const match = trimmed.match(ADMIN_COMMAND_RE);
+  if (!match) return ADMIN_HELP_TEXT;
+
+  const [, action, id, reason] = match;
+  const existing = storeFindEvent(EVENTS_FILE, id);
+  if (!existing) {
+    return `לא נמצא אירוע #${id}.\n\n${formatPendingList(loadEvents(EVENTS_FILE))}`;
+  }
+
+  if (action === "אשר") {
+    if (existing.status === "published") {
+      return `אירוע #${id} כבר מאושר ומפורסם.`;
+    }
+    storeUpdateEvent(EVENTS_FILE, id, { status: "published", published_at: todayIso() });
+    if (existing.submitter) {
+      await notifySubmitter(existing.submitter, `האירוע שלכם "${existing.event_name}" אושר ויפורסם 🎉`);
+    }
+    return `אירוע #${id} אושר ופורסם.`;
+  }
+
+  // action === "דחה"
+  if (existing.status === "rejected") {
+    return `אירוע #${id} כבר נדחה.`;
+  }
+  storeUpdateEvent(EVENTS_FILE, id, { status: "rejected", notes: `${existing.notes} | נדחה: ${reason}`.trim() });
+  if (existing.submitter) {
+    const reasonText = reason ? `\nסיבה: ${reason}` : "";
+    await notifySubmitter(existing.submitter, `האירוע שלכם "${existing.event_name}" לא אושר לפרסום.${reasonText}`);
+  }
+  return `אירוע #${id} נדחה.`;
 }
 
 function twiml(message) {
@@ -230,11 +296,16 @@ async function routeMessage(sender, text, mediaUrls = []) {
   const trimmed = text.trim();
   const lowerTrimmed = trimmed.toLowerCase();
 
+  if (sender === ADMIN_SENDER) {
+    return handleAdminMessage(text);
+  }
+
   if (CANCEL_KEYWORDS.has(lowerTrimmed) || MENU_KEYWORDS.has(lowerTrimmed)) {
     activeSubmissions.delete(sender);
     activeSubmissionImages.delete(sender);
     activeInquiries.delete(sender);
     recentlyCompleted.delete(sender);
+    saveState();
     return MENU_TEXT;
   }
 
@@ -253,6 +324,7 @@ async function routeMessage(sender, text, mediaUrls = []) {
         const fetched = await Promise.all(mediaUrls.map(fetchMediaAsDataUrl));
         images.push(...fetched);
         activeSubmissionImages.set(sender, images.slice(0, MAX_IMAGES_PER_EVENT));
+        saveState();
       } catch (err) {
         console.error("failed to fetch WhatsApp media:", err);
         if (!trimmed) return MEDIA_FETCH_FAILED_TEXT;
@@ -261,6 +333,7 @@ async function routeMessage(sender, text, mediaUrls = []) {
 
     const messages = activeSubmissions.get(sender);
     messages.push(text);
+    saveState();
 
     if (!messages.some((m) => m.trim()) && !images.length) {
       return ASK_EVENT_DETAILS_TEXT;
@@ -277,9 +350,10 @@ async function routeMessage(sender, text, mediaUrls = []) {
 
     activeSubmissions.delete(sender);
     activeSubmissionImages.delete(sender);
-    appendEvent(event, "Twilio WhatsApp", sender);
     recentlyCompleted.add(sender);
-    await forwardEventToAdmin(event, sender);
+    saveState();
+    const { id } = appendEvent(event, "Twilio WhatsApp", sender);
+    await forwardEventToAdmin(id, event, sender);
     return "קיבלנו את האירוע. הוא נכנס לבדיקה לפני פרסום.";
   }
 
@@ -300,6 +374,7 @@ async function routeMessage(sender, text, mediaUrls = []) {
 
   if (recentlyCompleted.has(sender)) {
     recentlyCompleted.delete(sender);
+    saveState();
     if (trimmed !== "1" && trimmed !== "2" && trimmed !== "3" && trimmed !== "4") {
       return FOLLOW_UP_AFTER_SUBMISSION_TEXT;
     }
@@ -308,10 +383,12 @@ async function routeMessage(sender, text, mediaUrls = []) {
   switch (trimmed) {
     case "1":
       activeInquiries.add(sender);
+      saveState();
       return ASK_INQUIRY_TEXT;
     case "2":
       activeSubmissions.set(sender, []);
       activeSubmissionImages.delete(sender);
+      saveState();
       return ASK_EVENT_DETAILS_TEXT;
     case "3":
       return PRICE_PLACEHOLDER_TEXT;
@@ -365,8 +442,17 @@ const server = http.createServer((req, res) => {
   res.end("not found");
 });
 
+loadState();
+
 if (require.main === module) {
   server.listen(PORT, () => console.log(`listening on ${PORT}`));
 }
 
-module.exports = { missingFields, routeMessage, activeSubmissions, activeSubmissionImages, activeInquiries, recentlyCompleted };
+module.exports = {
+  missingFields,
+  routeMessage,
+  get activeSubmissions() { return activeSubmissions; },
+  get activeSubmissionImages() { return activeSubmissionImages; },
+  get activeInquiries() { return activeInquiries; },
+  get recentlyCompleted() { return recentlyCompleted; },
+};
