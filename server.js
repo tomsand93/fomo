@@ -5,7 +5,7 @@ const { URLSearchParams } = require("url");
 const { loadEvents, makeDigest } = require("./make-digest");
 const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent } = require("./events-store");
 const { extractEvent } = require("./extract-event");
-const { answerInquiry } = require("./answer-inquiry");
+const answerInquiryModule = require("./answer-inquiry");
 const { sendWhatsApp } = require("./send-whatsapp");
 const { fetchMediaAsDataUrl } = require("./fetch-media");
 
@@ -18,6 +18,7 @@ const STATE_FILE = process.env.STATE_FILE || path.join(path.dirname(EVENTS_FILE)
 let activeSubmissions = new Map(); // sender -> array of message texts collected while drafting an event
 let activeSubmissionImages = new Map(); // sender -> array of image data URLs collected while drafting an event
 let activeInquiries = new Set(); // senders currently in the "ask about events" flow
+let activeInquiryHistories = new Map(); // sender -> [{ role, content }] conversation so far in inquiry mode
 let recentlyCompleted = new Set(); // senders whose last action was a completed submission, for a softer follow-up
 const llmCallTimestamps = new Map(); // sender -> array of ms timestamps of recent LLM calls
 
@@ -27,6 +28,7 @@ function loadState() {
     activeSubmissions = new Map(raw.activeSubmissions || []);
     activeSubmissionImages = new Map(raw.activeSubmissionImages || []);
     activeInquiries = new Set(raw.activeInquiries || []);
+    activeInquiryHistories = new Map(raw.activeInquiryHistories || []);
     recentlyCompleted = new Set(raw.recentlyCompleted || []);
   } catch (err) {
     if (err.code !== "ENOENT") console.error("failed to load state:", err);
@@ -38,6 +40,7 @@ function saveState() {
     activeSubmissions: [...activeSubmissions.entries()],
     activeSubmissionImages: [...activeSubmissionImages.entries()],
     activeInquiries: [...activeInquiries],
+    activeInquiryHistories: [...activeInquiryHistories.entries()],
     recentlyCompleted: [...recentlyCompleted],
   };
   try {
@@ -57,36 +60,18 @@ const MESSAGE_TOO_LONG_TEXT = "ההודעה ארוכה מדי. נסו לשלוח
 const RATE_LIMITED_TEXT = "שלחתם הרבה הודעות ברצף. חכו דקה ונסו שוב.";
 const MEDIA_FETCH_FAILED_TEXT = "לא הצלחנו לקרוא את התמונה ששלחתם. נסו לשלוח אותה שוב, או המשיכו עם טקסט בלבד.";
 
-const KNOWN_CATEGORIES = ["קולנוע", "אוכל ויין", "מסיבה", "קריוקי", "מוזיקה חיה", "מוזיקה"];
+const MAX_INQUIRY_EVENTS = 50;
+const MAX_INQUIRY_HISTORY = 12;
 
 function todayIso() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function addDays(iso, days) {
-  const date = new Date(`${iso}T00:00:00Z`);
-  date.setUTCDate(date.getUTCDate() + days);
-  return date.toISOString().slice(0, 10);
-}
-
-function filterEventsForInquiry(question, events) {
-  const published = events.filter((event) => event.status === "published");
-  const text = question.trim();
-
-  let dateFilter = null;
-  if (text.includes("היום")) dateFilter = todayIso();
-  else if (text.includes("מחר")) dateFilter = addDays(todayIso(), 1);
-
-  const matchedCategory = KNOWN_CATEGORIES.find((category) => text.includes(category));
-
-  return published.filter((event) => {
-    if (dateFilter && event.date !== dateFilter) return false;
-    if (matchedCategory) {
-      const related = event.category.includes(matchedCategory) || matchedCategory.includes(event.category);
-      if (!related) return false;
-    }
-    return true;
-  });
+function upcomingPublishedEvents(events, today = todayIso()) {
+  return events
+    .filter((event) => event.status === "published" && event.date >= today)
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .slice(0, MAX_INQUIRY_EVENTS);
 }
 
 function isRateLimited(sender) {
@@ -304,6 +289,7 @@ async function routeMessage(sender, text, mediaUrls = []) {
     activeSubmissions.delete(sender);
     activeSubmissionImages.delete(sender);
     activeInquiries.delete(sender);
+    activeInquiryHistories.delete(sender);
     recentlyCompleted.delete(sender);
     saveState();
     return MENU_TEXT;
@@ -366,10 +352,18 @@ async function routeMessage(sender, text, mediaUrls = []) {
       return RATE_LIMITED_TEXT;
     }
 
-    const allEvents = loadEvents(EVENTS_FILE);
-    const relevant = filterEventsForInquiry(text, allEvents);
-    const answer = await answerInquiry(text, relevant);
-    return `${answer}\n\n(כתבו "ביטול" כדי לחזור לתפריט)`;
+    const history = activeInquiryHistories.get(sender) || [];
+    const isFirstExchange = history.length === 0;
+    history.push({ role: "user", content: text });
+
+    const events = upcomingPublishedEvents(loadEvents(EVENTS_FILE));
+    const answer = await answerInquiryModule.answerInquiry(history, events);
+
+    history.push({ role: "assistant", content: answer });
+    activeInquiryHistories.set(sender, history.slice(-MAX_INQUIRY_HISTORY));
+    saveState();
+
+    return isFirstExchange ? `${answer}\n\n(כתבו "ביטול" כדי לחזור לתפריט)` : answer;
   }
 
   if (recentlyCompleted.has(sender)) {
@@ -383,6 +377,7 @@ async function routeMessage(sender, text, mediaUrls = []) {
   switch (trimmed) {
     case "1":
       activeInquiries.add(sender);
+      activeInquiryHistories.delete(sender);
       saveState();
       return ASK_INQUIRY_TEXT;
     case "2":
@@ -451,8 +446,10 @@ if (require.main === module) {
 module.exports = {
   missingFields,
   routeMessage,
+  upcomingPublishedEvents,
   get activeSubmissions() { return activeSubmissions; },
   get activeSubmissionImages() { return activeSubmissionImages; },
   get activeInquiries() { return activeInquiries; },
+  get activeInquiryHistories() { return activeInquiryHistories; },
   get recentlyCompleted() { return recentlyCompleted; },
 };

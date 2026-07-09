@@ -1,4 +1,5 @@
 .env
 *.log
 events.csv
+state.json
 .claude/
