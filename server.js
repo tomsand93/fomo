@@ -277,6 +277,15 @@ async function handleTwilio(req, res, body) {
 const MENU_KEYWORDS = new Set(["תפריט", "/menu", "menu"]);
 const CANCEL_KEYWORDS = new Set(["ביטול", "/cancel", "cancel"]);
 
+const LIKELY_EVENT_TEXT_MIN_LENGTH = 40;
+
+function looksLikeEventSubmission(trimmed, mediaUrls) {
+  if (mediaUrls.length) return true;
+  return trimmed.length >= LIKELY_EVENT_TEXT_MIN_LENGTH;
+}
+
+const LIKELY_EVENT_DETECTED_TEXT = "נראה ששיתפתם פרטים על אירוע — מעבדים את זה עכשיו. (כתבו \"ביטול\" כדי לחזור לתפריט)";
+
 async function routeMessage(sender, text, mediaUrls = []) {
   const trimmed = text.trim();
   const lowerTrimmed = trimmed.toLowerCase();
@@ -390,6 +399,13 @@ async function routeMessage(sender, text, mediaUrls = []) {
     case "4":
       return CUSTOMER_SERVICE_TEXT;
     default:
+      if (looksLikeEventSubmission(trimmed, mediaUrls)) {
+        activeSubmissions.set(sender, []);
+        activeSubmissionImages.delete(sender);
+        saveState();
+        const reply = await routeMessage(sender, text, mediaUrls);
+        return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
+      }
       return MENU_TEXT;
   }
 }
