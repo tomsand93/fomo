@@ -1,4 +1,4 @@
-const https = require("https");
+const { postJson } = require("./http-json");
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const MODEL = process.env.OPENROUTER_MODEL || "anthropic/claude-haiku-4.5";
@@ -8,13 +8,24 @@ const FIELD_KEYS = [
   "category", "price", "organizer", "contact_link", "description",
 ];
 
-function buildPrompt(conversationText, todayIso, hasImages) {
+function buildPreviouslyExtractedNote(previousEvent) {
+  if (!previousEvent) return "";
+  const knownFields = FIELD_KEYS
+    .filter((key) => previousEvent[key])
+    .map((key) => `${key}: ${previousEvent[key]}`)
+    .join(", ");
+  if (!knownFields) return "";
+  return `\nמהודעה קודמת (כולל תמונה שכבר לא מצורפת כעת) כבר חולצו הפרטים הבאים: ${knownFields}.\nשמור על הפרטים האלה אלא אם הטקסט החדש סותר או מעדכן אותם.\n`;
+}
+
+function buildPrompt(conversationText, todayIso, hasImages, previousEvent) {
   const imageNote = hasImages
     ? "\nבנוסף לטקסט צורפו תמונה/ות של פלייר האירוע. חלץ מידע גם מהטקסט המופיע בתמונה (שם האירוע, תאריך, שעה, מיקום וכו').\n"
     : "\n";
+  const previouslyExtractedNote = buildPreviouslyExtractedNote(previousEvent);
   return `אתה עוזר שמחלץ פרטי אירוע תרבות מהודעות טקסט בעברית (או מעורבות עברית/אנגלית) שנשלחות בוואטסאפ.
 היום התאריך הוא ${todayIso} (פורמט YYYY-MM-DD).
-${imageNote}
+${imageNote}${previouslyExtractedNote}
 חלץ את השדות הבאים מהטקסט (ומהתמונה אם צורפה). אם שדה לא מוזכר בשום מקום, השאר אותו כמחרוזת ריקה "".
 - event_name: שם האירוע. אם אין כותרת מפורשת (כמו "שם האירוע:"), הסק שם קצר וברור מהשורה הראשונה או מהתיאור הכללי של האירוע. השאר ריק רק אם באמת אי אפשר להסיק שם כלשהו.
 - date: תאריך האירוע בפורמט YYYY-MM-DD. אם נאמר יום בשבוע (כמו "יום שישי") ללא תאריך מדויק, חשב את התאריך הקרוב ביותר בעתיד מהיום הנוכחי.
@@ -45,38 +56,16 @@ function buildUserContent(prompt, imageDataUrls) {
 }
 
 function callOpenRouter(content) {
-  const payload = JSON.stringify({
-    model: MODEL,
-    messages: [{ role: "user", content }],
-    temperature: 0,
-  });
-
-  const options = {
+  return postJson({
     hostname: "openrouter.ai",
     path: "/api/v1/chat/completions",
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Content-Length": Buffer.byteLength(payload),
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+    headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` },
+    payload: {
+      model: MODEL,
+      messages: [{ role: "user", content }],
+      temperature: 0,
+      max_tokens: 500,
     },
-  };
-
-  return new Promise((resolve, reject) => {
-    const req = https.request(options, (res) => {
-      let data = "";
-      res.on("data", (chunk) => { data += chunk; });
-      res.on("end", () => {
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-          reject(new Error(`OpenRouter error ${res.statusCode}: ${data}`));
-          return;
-        }
-        resolve(data);
-      });
-    });
-    req.on("error", reject);
-    req.write(payload);
-    req.end();
   });
 }
 
@@ -90,12 +79,12 @@ function extractJson(text) {
   return JSON.parse(match[0]);
 }
 
-async function extractEvent(conversationText, todayIso = new Date().toISOString().slice(0, 10), imageDataUrls = []) {
+async function extractEvent(conversationText, todayIso = new Date().toISOString().slice(0, 10), imageDataUrls = [], previousEvent = null) {
   if (!OPENROUTER_API_KEY) {
     throw new Error("OPENROUTER_API_KEY is not set");
   }
 
-  const prompt = buildPrompt(conversationText, todayIso, imageDataUrls.length > 0);
+  const prompt = buildPrompt(conversationText, todayIso, imageDataUrls.length > 0, previousEvent);
   const userContent = buildUserContent(prompt, imageDataUrls);
   const raw = await callOpenRouter(userContent);
   const parsed = JSON.parse(raw);

@@ -82,18 +82,34 @@ function seedIfMissing(filePath) {
   }
 }
 
+const readyFilePaths = new Set();
+
 function ensureReady(filePath) {
+  if (readyFilePaths.has(filePath)) return;
   seedIfMissing(filePath);
   migrateIfNeeded(filePath);
+  readyFilePaths.add(filePath);
 }
 
-function loadEvents(filePath) {
-  ensureReady(filePath);
+const eventsCache = new Map(); // filePath -> { mtimeMs, events }
+
+function parseEventsFile(filePath) {
   const content = fs.readFileSync(filePath, "utf8").trim();
   if (!content) return [];
   const rows = content.split(/\r?\n/).map(parseCsvLine);
   const headers = rows.shift();
   return rowsToEvents(rows, headers);
+}
+
+function loadEvents(filePath) {
+  ensureReady(filePath);
+  const mtimeMs = fs.statSync(filePath).mtimeMs;
+  const cached = eventsCache.get(filePath);
+  if (cached && cached.mtimeMs === mtimeMs) return cached.events;
+
+  const events = parseEventsFile(filePath);
+  eventsCache.set(filePath, { mtimeMs, events });
+  return events;
 }
 
 function nextId(events) {

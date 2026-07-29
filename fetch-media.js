@@ -1,5 +1,8 @@
 const https = require("https");
 
+const FETCH_TIMEOUT_MS = 10_000;
+const MAX_MEDIA_BYTES = 2 * 1024 * 1024; // 2MB
+
 function requireEnv(name) {
   const value = process.env[name];
   if (!value) throw new Error(`Missing ${name}`);
@@ -21,13 +24,25 @@ function get(url, auth, redirectsLeft) {
       }
       const contentType = res.headers["content-type"] || "image/jpeg";
       const chunks = [];
-      res.on("data", (chunk) => chunks.push(chunk));
+      let totalBytes = 0;
+      res.on("data", (chunk) => {
+        totalBytes += chunk.length;
+        if (totalBytes > MAX_MEDIA_BYTES) {
+          res.destroy();
+          reject(new Error("media file exceeds maximum allowed size"));
+          return;
+        }
+        chunks.push(chunk);
+      });
       res.on("end", () => {
         const base64 = Buffer.concat(chunks).toString("base64");
         resolve(`data:${contentType};base64,${base64}`);
       });
     });
     req.on("error", reject);
+    req.setTimeout(FETCH_TIMEOUT_MS, () => {
+      req.destroy(new Error("Twilio media fetch timed out"));
+    });
   });
 }
 

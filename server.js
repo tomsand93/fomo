@@ -1,6 +1,7 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { URLSearchParams } = require("url");
 const { loadEvents, makeDigest } = require("./make-digest");
 const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent } = require("./events-store");
@@ -13,20 +14,30 @@ const PORT = Number(process.env.PORT || 3000);
 const EVENTS_FILE = process.env.EVENTS_FILE || "events.csv";
 const ADMIN_PHONE = process.env.ADMIN_PHONE || "+972528762432";
 const ADMIN_SENDER = `whatsapp:${ADMIN_PHONE}`;
-const STATE_FILE = process.env.STATE_FILE || path.join(path.dirname(EVENTS_FILE), "state.json");
+// Colocated with EVENTS_FILE (not just its dirname) so state always lands next to the
+// data it references, even when EVENTS_FILE is a bare relative filename like "events.csv".
+const STATE_FILE = process.env.STATE_FILE || path.join(path.dirname(path.resolve(EVENTS_FILE)), "state.json");
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
 
 let activeSubmissions = new Map(); // sender -> array of message texts collected while drafting an event
 let activeSubmissionImages = new Map(); // sender -> array of image data URLs collected while drafting an event
+const imagesSentToModel = new Map(); // sender -> count of images already sent to the LLM, to avoid resending unchanged images every turn
+const lastExtractedEvent = new Map(); // sender -> last extracted event fields, carried forward as context when images aren't resent
 let activeInquiries = new Set(); // senders currently in the "ask about events" flow
 let activeInquiryHistories = new Map(); // sender -> [{ role, content }] conversation so far in inquiry mode
 let recentlyCompleted = new Set(); // senders whose last action was a completed submission, for a softer follow-up
 const llmCallTimestamps = new Map(); // sender -> array of ms timestamps of recent LLM calls
+const RATE_LIMIT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
+// activeSubmissionImages is intentionally NOT persisted: images are base64 data URLs that
+// can run into megabytes each, and writing them to disk on nearly every message would block
+// the event loop for the whole process. A restart mid-submission loses attached images (the
+// user is asked to resend them) but keeps the text draft intact.
 function loadState() {
   try {
     const raw = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
     activeSubmissions = new Map(raw.activeSubmissions || []);
-    activeSubmissionImages = new Map(raw.activeSubmissionImages || []);
     activeInquiries = new Set(raw.activeInquiries || []);
     activeInquiryHistories = new Map(raw.activeInquiryHistories || []);
     recentlyCompleted = new Set(raw.recentlyCompleted || []);
@@ -35,10 +46,13 @@ function loadState() {
   }
 }
 
-function saveState() {
+const STATE_SAVE_DEBOUNCE_MS = 1000;
+let saveStateTimer = null;
+let saveStatePending = false;
+
+function writeStateNow() {
   const payload = {
     activeSubmissions: [...activeSubmissions.entries()],
-    activeSubmissionImages: [...activeSubmissionImages.entries()],
     activeInquiries: [...activeInquiries],
     activeInquiryHistories: [...activeInquiryHistories.entries()],
     recentlyCompleted: [...recentlyCompleted],
@@ -49,6 +63,26 @@ function saveState() {
   } catch (err) {
     console.error("failed to save state:", err);
   }
+}
+
+function saveState() {
+  if (process.env.NODE_ENV === "test") {
+    // Keep test runs synchronous and deterministic; no debounce.
+    writeStateNow();
+    return;
+  }
+
+  saveStatePending = true;
+  if (saveStateTimer) return;
+
+  saveStateTimer = setTimeout(() => {
+    saveStateTimer = null;
+    if (saveStatePending) {
+      saveStatePending = false;
+      writeStateNow();
+    }
+  }, STATE_SAVE_DEBOUNCE_MS);
+  saveStateTimer.unref();
 }
 
 const MAX_MESSAGE_LENGTH = 1000;
@@ -79,9 +113,25 @@ function isRateLimited(sender) {
   const timestamps = (llmCallTimestamps.get(sender) || []).filter(
     (ts) => now - ts < RATE_LIMIT_WINDOW_MS
   );
+
+  if (timestamps.length >= RATE_LIMIT_MAX_CALLS) {
+    if (timestamps.length) llmCallTimestamps.set(sender, timestamps);
+    else llmCallTimestamps.delete(sender);
+    return true;
+  }
+
   timestamps.push(now);
   llmCallTimestamps.set(sender, timestamps);
-  return timestamps.length > RATE_LIMIT_MAX_CALLS;
+  return false;
+}
+
+function sweepStaleRateLimitEntries() {
+  const now = Date.now();
+  for (const [sender, timestamps] of llmCallTimestamps) {
+    const fresh = timestamps.filter((ts) => now - ts < RATE_LIMIT_WINDOW_MS);
+    if (fresh.length) llmCallTimestamps.set(sender, fresh);
+    else llmCallTimestamps.delete(sender);
+  }
 }
 
 const MENU_TEXT = `היי! מה תרצו לעשות?
@@ -237,11 +287,40 @@ async function handleAdminMessage(text) {
   return `אירוע #${id} נדחה.`;
 }
 
+function buildTwilioSignatureBaseString(url, params) {
+  const sortedKeys = [...params.keys()].sort();
+  let data = url;
+  for (const key of sortedKeys) {
+    data += key + params.get(key);
+  }
+  return data;
+}
+
+function isValidTwilioSignature(req, body, signature) {
+  if (!TWILIO_AUTH_TOKEN || !signature) return false;
+  if (!PUBLIC_BASE_URL) {
+    console.error("PUBLIC_BASE_URL is not set; rejecting Twilio webhook request");
+    return false;
+  }
+
+  const params = new URLSearchParams(body);
+  const url = `${PUBLIC_BASE_URL.replace(/\/$/, "")}${req.url}`;
+  const baseString = buildTwilioSignatureBaseString(url, params);
+  const expected = crypto.createHmac("sha1", TWILIO_AUTH_TOKEN).update(baseString, "utf8").digest("base64");
+
+  const expectedBuf = Buffer.from(expected);
+  const signatureBuf = Buffer.from(signature);
+  if (expectedBuf.length !== signatureBuf.length) return false;
+  return crypto.timingSafeEqual(expectedBuf, signatureBuf);
+}
+
 function twiml(message) {
   const escaped = message
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
   return `<?xml version="1.0" encoding="UTF-8"?><Response><Message>${escaped}</Message></Response>`;
 }
 
@@ -257,6 +336,16 @@ function extractMediaUrls(params) {
 }
 
 async function handleTwilio(req, res, body) {
+  if (process.env.NODE_ENV !== "test") {
+    const signature = req.headers["x-twilio-signature"];
+    if (!isValidTwilioSignature(req, body, signature)) {
+      console.error("rejected Twilio webhook request: invalid or missing signature");
+      res.writeHead(403, { "Content-Type": "text/plain" });
+      res.end("forbidden");
+      return;
+    }
+  }
+
   const params = new URLSearchParams(body);
   const text = params.get("Body") || "";
   const sender = params.get("From") || "";
@@ -286,6 +375,68 @@ function looksLikeEventSubmission(trimmed, mediaUrls) {
 
 const LIKELY_EVENT_DETECTED_TEXT = "נראה ששיתפתם פרטים על אירוע — מעבדים את זה עכשיו. (כתבו \"ביטול\" כדי לחזור לתפריט)";
 
+async function handleActiveSubmission(sender, text, mediaUrls) {
+  const trimmed = text.trim();
+
+  if (text.length > MAX_MESSAGE_LENGTH) {
+    return MESSAGE_TOO_LONG_TEXT;
+  }
+
+  if (isRateLimited(sender)) {
+    return RATE_LIMITED_TEXT;
+  }
+
+  const images = activeSubmissionImages.get(sender) || [];
+  if (mediaUrls.length) {
+    const remainingSlots = Math.max(0, MAX_IMAGES_PER_EVENT - images.length);
+    const urlsToFetch = mediaUrls.slice(0, remainingSlots);
+    try {
+      const fetched = await Promise.all(urlsToFetch.map(fetchMediaAsDataUrl));
+      images.push(...fetched);
+      activeSubmissionImages.set(sender, images);
+      saveState();
+    } catch (err) {
+      console.error("failed to fetch WhatsApp media:", err);
+      if (!trimmed) return MEDIA_FETCH_FAILED_TEXT;
+    }
+  }
+
+  const messages = activeSubmissions.get(sender);
+  messages.push(text);
+  saveState();
+
+  if (!messages.some((m) => m.trim()) && !images.length) {
+    return ASK_EVENT_DETAILS_TEXT;
+  }
+
+  const conversationText = messages.map((line, i) => `הודעה ${i + 1}: ${line}`).join("\n");
+
+  // Only send images the model hasn't already seen; carry forward the previously
+  // extracted fields as text context so information from earlier images isn't lost.
+  const alreadySentCount = imagesSentToModel.get(sender) || 0;
+  const newImages = images.slice(alreadySentCount);
+  const previousEvent = alreadySentCount ? lastExtractedEvent.get(sender) || null : null;
+
+  const event = await extractEvent(conversationText, undefined, newImages, previousEvent);
+  imagesSentToModel.set(sender, images.length);
+  lastExtractedEvent.set(sender, event);
+  const missing = missingFields(event);
+
+  if (missing.length) {
+    return `חסרים עדיין פרטים: ${missing.join(", ")}\nשלחו את הפרטים החסרים, או "ביטול" כדי לצאת.`;
+  }
+
+  activeSubmissions.delete(sender);
+  activeSubmissionImages.delete(sender);
+  imagesSentToModel.delete(sender);
+  lastExtractedEvent.delete(sender);
+  recentlyCompleted.add(sender);
+  saveState();
+  const { id } = appendEvent(event, "Twilio WhatsApp", sender);
+  await forwardEventToAdmin(id, event, sender);
+  return "קיבלנו את האירוע. הוא נכנס לבדיקה לפני פרסום.";
+}
+
 async function routeMessage(sender, text, mediaUrls = []) {
   const trimmed = text.trim();
   const lowerTrimmed = trimmed.toLowerCase();
@@ -297,6 +448,8 @@ async function routeMessage(sender, text, mediaUrls = []) {
   if (CANCEL_KEYWORDS.has(lowerTrimmed) || MENU_KEYWORDS.has(lowerTrimmed)) {
     activeSubmissions.delete(sender);
     activeSubmissionImages.delete(sender);
+    imagesSentToModel.delete(sender);
+    lastExtractedEvent.delete(sender);
     activeInquiries.delete(sender);
     activeInquiryHistories.delete(sender);
     recentlyCompleted.delete(sender);
@@ -305,51 +458,7 @@ async function routeMessage(sender, text, mediaUrls = []) {
   }
 
   if (activeSubmissions.has(sender)) {
-    if (text.length > MAX_MESSAGE_LENGTH) {
-      return MESSAGE_TOO_LONG_TEXT;
-    }
-
-    if (isRateLimited(sender)) {
-      return RATE_LIMITED_TEXT;
-    }
-
-    const images = activeSubmissionImages.get(sender) || [];
-    if (mediaUrls.length) {
-      try {
-        const fetched = await Promise.all(mediaUrls.map(fetchMediaAsDataUrl));
-        images.push(...fetched);
-        activeSubmissionImages.set(sender, images.slice(0, MAX_IMAGES_PER_EVENT));
-        saveState();
-      } catch (err) {
-        console.error("failed to fetch WhatsApp media:", err);
-        if (!trimmed) return MEDIA_FETCH_FAILED_TEXT;
-      }
-    }
-
-    const messages = activeSubmissions.get(sender);
-    messages.push(text);
-    saveState();
-
-    if (!messages.some((m) => m.trim()) && !images.length) {
-      return ASK_EVENT_DETAILS_TEXT;
-    }
-
-    const conversationText = messages.map((line, i) => `הודעה ${i + 1}: ${line}`).join("\n");
-
-    const event = await extractEvent(conversationText, undefined, images);
-    const missing = missingFields(event);
-
-    if (missing.length) {
-      return `חסרים עדיין פרטים: ${missing.join(", ")}\nשלחו את הפרטים החסרים, או "ביטול" כדי לצאת.`;
-    }
-
-    activeSubmissions.delete(sender);
-    activeSubmissionImages.delete(sender);
-    recentlyCompleted.add(sender);
-    saveState();
-    const { id } = appendEvent(event, "Twilio WhatsApp", sender);
-    await forwardEventToAdmin(id, event, sender);
-    return "קיבלנו את האירוע. הוא נכנס לבדיקה לפני פרסום.";
+    return handleActiveSubmission(sender, text, mediaUrls);
   }
 
   if (activeInquiries.has(sender)) {
@@ -392,6 +501,8 @@ async function routeMessage(sender, text, mediaUrls = []) {
     case "2":
       activeSubmissions.set(sender, []);
       activeSubmissionImages.delete(sender);
+      imagesSentToModel.delete(sender);
+      lastExtractedEvent.delete(sender);
       saveState();
       return ASK_EVENT_DETAILS_TEXT;
     case "3":
@@ -402,16 +513,28 @@ async function routeMessage(sender, text, mediaUrls = []) {
       if (looksLikeEventSubmission(trimmed, mediaUrls)) {
         activeSubmissions.set(sender, []);
         activeSubmissionImages.delete(sender);
+        imagesSentToModel.delete(sender);
+        lastExtractedEvent.delete(sender);
         saveState();
-        const reply = await routeMessage(sender, text, mediaUrls);
+        const reply = await handleActiveSubmission(sender, text, mediaUrls);
         return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
       }
       return MENU_TEXT;
   }
 }
 
+const PAYPLUS_LOG_FILE = "payplus-webhooks.log";
+const PAYPLUS_LOG_MAX_BYTES = 5 * 1024 * 1024; // 5MB, rotate past this
+
 function handlePayPlus(req, res, body) {
-  fs.appendFileSync("payplus-webhooks.log", `${new Date().toISOString()} ${body}\n`, "utf8");
+  fs.stat(PAYPLUS_LOG_FILE, (statErr, stats) => {
+    const rotate = !statErr && stats.size > PAYPLUS_LOG_MAX_BYTES;
+    const line = `${new Date().toISOString()} ${body}\n`;
+    const write = rotate
+      ? fs.promises.writeFile(PAYPLUS_LOG_FILE, line, "utf8")
+      : fs.promises.appendFile(PAYPLUS_LOG_FILE, line, "utf8");
+    write.catch((err) => console.error("failed to write PayPlus log:", err));
+  });
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end(JSON.stringify({ ok: true }));
 }
@@ -457,6 +580,7 @@ loadState();
 
 if (require.main === module) {
   server.listen(PORT, () => console.log(`listening on ${PORT}`));
+  setInterval(sweepStaleRateLimitEntries, RATE_LIMIT_SWEEP_INTERVAL_MS).unref();
 }
 
 module.exports = {

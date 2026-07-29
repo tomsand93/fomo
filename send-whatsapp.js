@@ -1,6 +1,8 @@
 const https = require("https");
 const { URLSearchParams } = require("url");
 
+const SEND_TIMEOUT_MS = 10_000;
+
 function requireEnv(name) {
   const value = process.env[name];
   if (!value) throw new Error(`Missing ${name}`);
@@ -35,6 +37,9 @@ function sendWhatsApp(to, body) {
       });
     });
     req.on("error", reject);
+    req.setTimeout(SEND_TIMEOUT_MS, () => {
+      req.destroy(new Error("Twilio send message timed out"));
+    });
     req.end(payload);
   });
 }

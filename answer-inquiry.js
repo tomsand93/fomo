@@ -1,41 +1,19 @@
-const https = require("https");
+const { postJson } = require("./http-json");
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const MODEL = process.env.OPENROUTER_MODEL || "anthropic/claude-haiku-4.5";
 
 function callOpenRouter(messages) {
-  const payload = JSON.stringify({
-    model: MODEL,
-    messages,
-    temperature: 0,
-  });
-
-  const options = {
+  return postJson({
     hostname: "openrouter.ai",
     path: "/api/v1/chat/completions",
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Content-Length": Buffer.byteLength(payload),
-      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+    headers: { Authorization: `Bearer ${OPENROUTER_API_KEY}` },
+    payload: {
+      model: MODEL,
+      messages,
+      temperature: 0,
+      max_tokens: 400,
     },
-  };
-
-  return new Promise((resolve, reject) => {
-    const req = https.request(options, (res) => {
-      let data = "";
-      res.on("data", (chunk) => { data += chunk; });
-      res.on("end", () => {
-        if (res.statusCode < 200 || res.statusCode >= 300) {
-          reject(new Error(`OpenRouter error ${res.statusCode}: ${data}`));
-          return;
-        }
-        resolve(data);
-      });
-    });
-    req.on("error", reject);
-    req.write(payload);
-    req.end();
   });
 }
 
