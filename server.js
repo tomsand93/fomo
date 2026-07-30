@@ -30,6 +30,8 @@ let activeInquiryHistories = new Map(); // sender -> [{ role, content }] convers
 let recentlyCompleted = new Set(); // senders whose last action was a completed submission, for a softer follow-up
 let undeliveredAdminNotices = new Set(); // event ids whose review notice never reached the admin, surfaced on her next message
 let askedForClarification = new Set(); // senders already asked a clarifying question this submission, so we never ask twice
+let noticeSidToEventId = new Map(); // Twilio message sid of a review notice -> event id, so a WhatsApp reply to it resolves without a number
+let lastNotifiedEventId = ""; // most recent event the admin was told about, so a bare "אשר" has an obvious referent
 const llmCallTimestamps = new Map(); // sender -> array of ms timestamps of recent LLM calls
 const RATE_LIMIT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -46,6 +48,8 @@ function loadState() {
     recentlyCompleted = new Set(raw.recentlyCompleted || []);
     undeliveredAdminNotices = new Set(raw.undeliveredAdminNotices || []);
     askedForClarification = new Set(raw.askedForClarification || []);
+    noticeSidToEventId = new Map(raw.noticeSidToEventId || []);
+    lastNotifiedEventId = raw.lastNotifiedEventId || "";
   } catch (err) {
     if (err.code !== "ENOENT") console.error("failed to load state:", err);
   }
@@ -63,6 +67,9 @@ function writeStateNow() {
     recentlyCompleted: [...recentlyCompleted],
     undeliveredAdminNotices: [...undeliveredAdminNotices],
     askedForClarification: [...askedForClarification],
+    // Bounded: only recent notices need to stay resolvable by reply.
+    noticeSidToEventId: [...noticeSidToEventId].slice(-50),
+    lastNotifiedEventId,
   };
   try {
     fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
@@ -130,6 +137,40 @@ function isRateLimited(sender) {
   timestamps.push(now);
   llmCallTimestamps.set(sender, timestamps);
   return false;
+}
+
+const PENDING_REMINDER_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+// Events don't chase themselves: without a nudge a submission can sit unreviewed until its
+// date passes (as #3 and #5 did). Re-send the pending list once a day until it's empty.
+async function sendPendingReminder() {
+  if (process.env.NODE_ENV === "test") return;
+  const events = loadEvents(EVENTS_FILE);
+  const pending = events.filter((e) => e.status === "submitted");
+  if (!pending.length) return;
+
+  const today = todayIso();
+  const upcoming = pending.filter((e) => !e.date || e.date >= today);
+  const expired = pending.filter((e) => e.date && e.date < today);
+
+  const lines = [`יש ${pending.length} אירועים שממתינים לאישור:`, ""];
+  for (const e of upcoming) {
+    lines.push(`#${e.id} ${e.event_name} — ${e.date} ${e.start_time}`);
+  }
+  if (expired.length) {
+    lines.push("", "עברו כבר (אפשר לדחות):");
+    for (const e of expired) lines.push(`#${e.id} ${e.event_name} — ${e.date}`);
+  }
+  lines.push("", 'ענו על הודעת האירוע עם "אשר" או "דחה", או כתבו "אשר <מספר>".');
+
+  try {
+    const result = await sendWhatsApp(ADMIN_SENDER, lines.join("\n"));
+    // A reply to the reminder is ambiguous when several are pending, so only make it
+    // directly actionable when there's exactly one thing it could mean.
+    if (pending.length === 1) rememberNotice(result.sid, pending[0].id);
+  } catch (err) {
+    console.error("failed to send pending reminder:", err);
+  }
 }
 
 function sweepStaleRateLimitEntries() {
@@ -228,6 +269,22 @@ function formatEventForReview(id, event, sender, unresolved = []) {
   ].filter((line) => line !== null).join("\n");
 }
 
+const MAX_TRACKED_NOTICES = 50;
+
+// Remembering which event a notice was about is what lets Stav reply "אשר" to the message
+// itself instead of retyping an id she has to go find.
+function rememberNotice(sid, eventId) {
+  if (sid) {
+    noticeSidToEventId.set(sid, String(eventId));
+    if (noticeSidToEventId.size > MAX_TRACKED_NOTICES) {
+      const oldest = noticeSidToEventId.keys().next().value;
+      noticeSidToEventId.delete(oldest);
+    }
+  }
+  lastNotifiedEventId = String(eventId);
+  saveState();
+}
+
 // WhatsApp only permits free-form messages within 24h of the recipient's last inbound
 // message. Outside that window Twilio accepts the API call but reports error 63016 and
 // never delivers, so a resolved promise is NOT proof of delivery — the status must be
@@ -260,6 +317,7 @@ async function forwardEventToAdmin(id, event, sender, unresolved = []) {
   if (process.env.NODE_ENV === "test") return;
   try {
     const result = await sendWhatsApp(ADMIN_SENDER, formatEventForReview(id, event, sender, unresolved));
+    rememberNotice(result.sid, id);
     // Assume undelivered until proven otherwise, so a crash mid-check fails safe (the event
     // still gets surfaced on Stav's next message) rather than silently disappearing.
     undeliveredAdminNotices.add(String(id));
@@ -282,6 +340,8 @@ async function notifySubmitter(sender, text) {
 }
 
 const ADMIN_HELP_TEXT = `פקודות ניהול:
+הכי פשוט: ענו על הודעת האירוע עם "אשר" או "דחה" (או 1 / 2)
+
 אשר <מספר> - לאשר ולפרסם אירוע
 דחה <מספר> [סיבה] - לדחות אירוע
 ממתינים - רשימת אירועים ממתינים לבדיקה
@@ -348,7 +408,17 @@ function formatPendingList(events) {
     .join("\n");
 }
 
-const ADMIN_COMMAND_RE = /^(אשר|דחה)\s*#?(\d+)\s*(.*)$/;
+// Explicit id ("אשר 6"), or bare ("אשר") which resolves via the replied-to notice or the
+// most recent one. "1"/"2" are shortcuts for approve/reject on the last notice, because
+// that is what Stav reached for unprompted.
+const ADMIN_COMMAND_RE = /^(אשר|דחה)(?:\s*#?(\d+))?\s*(.*)$/;
+const ADMIN_SHORTCUTS = new Map([["1", "אשר"], ["2", "דחה"]]);
+
+function resolveEventId(explicitId, repliedSid) {
+  if (explicitId) return String(explicitId);
+  if (repliedSid && noticeSidToEventId.has(repliedSid)) return noticeSidToEventId.get(repliedSid);
+  return lastNotifiedEventId || "";
+}
 
 // Any inbound admin message reopens WhatsApp's 24h window, so it's the one reliable moment
 // to deliver review notices that were dropped earlier (error 63016).
@@ -368,7 +438,7 @@ function missedNoticesBanner(events) {
   return `⚠️ אירועים שההודעה עליהם לא הגיעה אליך:\n${lines}\n\n`;
 }
 
-async function handleAdminMessage(text) {
+async function handleAdminMessage(text, repliedSid = "") {
   const trimmed = text.trim();
   const banner = missedNoticesBanner(loadEvents(EVENTS_FILE));
 
@@ -381,10 +451,16 @@ async function handleAdminMessage(text) {
     return `${banner}${await handleCorrectionCommand(correction)}`;
   }
 
-  const match = trimmed.match(ADMIN_COMMAND_RE);
+  const shortcut = ADMIN_SHORTCUTS.get(trimmed);
+  const match = shortcut ? [null, shortcut, "", ""] : trimmed.match(ADMIN_COMMAND_RE);
   if (!match) return `${banner}${ADMIN_HELP_TEXT}`;
 
-  const [, action, id, reason] = match;
+  const [, action, explicitId, reason] = match;
+  const id = resolveEventId(explicitId, repliedSid);
+  if (!id) {
+    return `${banner}לא ברור לאיזה אירוע הכוונה. ענו על ההודעה של האירוע, או כתבו "אשר <מספר>".\n\n${formatPendingList(loadEvents(EVENTS_FILE))}`;
+  }
+
   const existing = storeFindEvent(EVENTS_FILE, id);
   if (!existing) {
     return `${banner}לא נמצא אירוע #${id}.\n\n${formatPendingList(loadEvents(EVENTS_FILE))}`;
@@ -479,10 +555,13 @@ async function handleTwilio(req, res, body) {
   const text = params.get("Body") || "";
   const sender = params.get("From") || "";
   const mediaUrls = extractMediaUrls(params);
+  // Present when the user replied to a specific WhatsApp message; lets a bare "אשר"
+  // resolve to the event that notice was about.
+  const repliedSid = params.get("OriginalRepliedMessageSid") || "";
 
   let reply;
   try {
-    reply = await routeMessage(sender, text, mediaUrls);
+    reply = await routeMessage(sender, text, mediaUrls, repliedSid);
   } catch (err) {
     console.error("routeMessage failed:", err);
     reply = "מצטערים, קרתה תקלה. נסו שוב בעוד רגע.";
@@ -582,12 +661,26 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
   return "קיבלנו את האירוע. הוא נכנס לבדיקה לפני פרסום.";
 }
 
-async function routeMessage(sender, text, mediaUrls = []) {
+// The admin is also a user: she forwards events to publish like anyone else. Only treat
+// her message as a command when it actually looks like one, otherwise her submissions get
+// swallowed by the admin handler and silently lost.
+function looksLikeAdminCommand(trimmed, repliedSid) {
+  if (trimmed === "ממתינים") return true;
+  if (CORRECT_COMMAND_RE.test(trimmed)) return true;
+  if (ADMIN_SHORTCUTS.has(trimmed) && (repliedSid || lastNotifiedEventId)) return true;
+  const match = trimmed.match(ADMIN_COMMAND_RE);
+  if (!match) return false;
+  // "אשר"/"דחה" with an id is always a command; bare only when there's something to act on.
+  return Boolean(match[2]) || Boolean(repliedSid) || Boolean(lastNotifiedEventId);
+}
+
+async function routeMessage(sender, text, mediaUrls = [], repliedSid = "") {
   const trimmed = text.trim();
   const lowerTrimmed = trimmed.toLowerCase();
 
-  if (sender === ADMIN_SENDER) {
-    return handleAdminMessage(text);
+  // Mid-submission the admin is acting as a submitter, so commands must not hijack her draft.
+  if (sender === ADMIN_SENDER && !activeSubmissions.has(sender) && looksLikeAdminCommand(trimmed, repliedSid)) {
+    return handleAdminMessage(text, repliedSid);
   }
 
   if (CANCEL_KEYWORDS.has(lowerTrimmed) || MENU_KEYWORDS.has(lowerTrimmed)) {
@@ -729,6 +822,7 @@ loadState();
 if (require.main === module) {
   server.listen(PORT, () => console.log(`listening on ${PORT}`));
   setInterval(sweepStaleRateLimitEntries, RATE_LIMIT_SWEEP_INTERVAL_MS).unref();
+  setInterval(sendPendingReminder, PENDING_REMINDER_INTERVAL_MS).unref();
 }
 
 module.exports = {
@@ -741,4 +835,5 @@ module.exports = {
   get activeInquiryHistories() { return activeInquiryHistories; },
   get recentlyCompleted() { return recentlyCompleted; },
   get undeliveredAdminNotices() { return undeliveredAdminNotices; },
+  rememberNotice,
 };

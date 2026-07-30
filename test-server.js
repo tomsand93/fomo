@@ -233,6 +233,53 @@ async function demo() {
   if (quietReply.includes("שאלה קטנה")) throw new Error("a confident draft should not ask anything");
   if (!quietReply.includes("קיבלנו את האירוע")) throw new Error("a confident complete draft should be accepted directly");
 
+  // Stav asked "why can't I just press 1" - bare/shortcut approval on the last notice.
+  const server = require("./server");
+  const eventsStore = require("./events-store");
+
+  // Submit an event as a normal user so there's something pending to act on.
+  const replySubmitter = "whatsapp:+972500000007";
+  extractModule.extractEvent = async () => draftWithQuestions([]);
+  await routeMessage(replySubmitter, "2");
+  await routeMessage(replySubmitter, "ערב יין, 5.5, כניסה חופשית");
+  const pendingEvents = eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.status === "submitted");
+  const targetId = pendingEvents[pendingEvents.length - 1].id;
+
+  // NODE_ENV=test skips the real send, so simulate the notice bookkeeping directly.
+  server.rememberNotice("SMtest123", targetId);
+
+  const bareApprove = await routeMessage(ADMIN, "אשר");
+  if (!bareApprove.includes("אושר ופורסם")) throw new Error('bare "אשר" should approve the most recent event');
+  if (eventsStore.findEvent(TEST_EVENTS_FILE, targetId).status !== "published") {
+    throw new Error("bare approval should actually publish the event");
+  }
+
+  // Replying to a specific notice targets that event even when it isn't the latest.
+  await routeMessage(replySubmitter, "2");
+  await routeMessage(replySubmitter, "ערב יין שני, 6.6, כניסה חופשית");
+  const pending2 = eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.status === "submitted");
+  const olderId = pending2[pending2.length - 1].id;
+  server.rememberNotice("SMolder", olderId);
+  server.rememberNotice("SMnewer", "999"); // newest notice points elsewhere
+  const repliedApprove = await routeMessage(ADMIN, "אשר", [], "SMolder");
+  if (!repliedApprove.includes(`#${olderId}`)) throw new Error("replying to a notice should target that event, not the latest");
+
+  // The "1" shortcut behaves like אשר.
+  await routeMessage(replySubmitter, "2");
+  await routeMessage(replySubmitter, "ערב יין שלישי, 7.7, כניסה חופשית");
+  const pending3 = eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.status === "submitted");
+  const shortcutId = pending3[pending3.length - 1].id;
+  server.rememberNotice("SMshortcut", shortcutId);
+  const shortcutApprove = await routeMessage(ADMIN, "1");
+  if (!shortcutApprove.includes("אושר ופורסם")) throw new Error('"1" should work as an approve shortcut');
+
+  // Regression: the admin must be able to submit events too, not have them eaten as commands.
+  const adminDraft = "ערב הופעות בשוק תלפיות, יום שישי 21:00, כניסה חופשית, https://example.com/gig";
+  const adminSubmits = await routeMessage(ADMIN, adminDraft);
+  if (adminSubmits.includes("פקודות ניהול")) {
+    throw new Error("an admin forwarding an event should not get the command help text");
+  }
+
   extractModule.extractEvent = realExtract;
 
   fs.unlinkSync(CORRECTIONS_FILE);
