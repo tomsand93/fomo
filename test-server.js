@@ -195,6 +195,46 @@ async function demo() {
   const badValue = await routeMessage(ADMIN, "תקן 2 תאריך: מחר בערב");
   if (!badValue.includes("לא בפורמט הנכון")) throw new Error("malformed correction values should be rejected");
 
+  // Clarifying questions: when the extractor is genuinely unsure, ask the submitter who
+  // actually knows the answer - but only once, so an unhelpful reply can't trap them.
+  const extractModule = require("./extract-event");
+  const realExtract = extractModule.extractEvent;
+  const completeDraft = {
+    event_name: "ערב יין", date: "2099-05-05", start_time: "20:00", end_time: "",
+    location: "השועל והכרם", category: "אוכל ויין", price: "", organizer: "",
+    contact_link: "https://example.com/wine", description: "פלייט של 3 יינות ב-180 שח",
+  };
+  function draftWithQuestions(questions) {
+    const draft = { ...completeDraft };
+    Object.defineProperty(draft, "_questions", { value: questions, enumerable: false });
+    return draft;
+  }
+
+  const askSender = "whatsapp:+972500000005";
+  extractModule.extractEvent = async () => draftWithQuestions(["המחיר 180 ש\"ח הוא דמי כניסה או מחיר הפלייט?"]);
+
+  await routeMessage(askSender, "2");
+  const askedReply = await routeMessage(askSender, "ערב יין בשועל והכרם, 5.5, פלייט 180 שח");
+  if (!askedReply.includes("שאלה קטנה")) throw new Error("an ambiguous draft should ask the submitter, not guess");
+  if (!askedReply.includes("דמי כניסה")) throw new Error("the clarifying question itself should be shown");
+  if (!activeSubmissions.has(askSender)) throw new Error("submission should stay open while awaiting clarification");
+
+  // Even if the model stays unsure, the second pass must complete rather than re-ask.
+  const resolvedReply = await routeMessage(askSender, "לא יודע");
+  if (resolvedReply.includes("שאלה קטנה")) throw new Error("the submitter must never be asked twice");
+  if (!resolvedReply.includes("קיבלנו את האירוע")) throw new Error("an unresolved question should still let the event through");
+  if (activeSubmissions.has(askSender)) throw new Error("submission should close after the single clarification round");
+
+  // A confident draft should not interrogate the submitter at all.
+  const quietSender = "whatsapp:+972500000006";
+  extractModule.extractEvent = async () => draftWithQuestions([]);
+  await routeMessage(quietSender, "2");
+  const quietReply = await routeMessage(quietSender, "ערב יין בשועל והכרם, 5.5, כניסה חופשית");
+  if (quietReply.includes("שאלה קטנה")) throw new Error("a confident draft should not ask anything");
+  if (!quietReply.includes("קיבלנו את האירוע")) throw new Error("a confident complete draft should be accepted directly");
+
+  extractModule.extractEvent = realExtract;
+
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   console.log("all tests passed");

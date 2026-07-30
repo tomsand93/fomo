@@ -5,7 +5,7 @@ const crypto = require("crypto");
 const { URLSearchParams } = require("url");
 const { loadEvents, makeDigest } = require("./make-digest");
 const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent } = require("./events-store");
-const { extractEvent } = require("./extract-event");
+const extractEventModule = require("./extract-event");
 const { addCorrection, buildCorrectionGuidance } = require("./corrections-store");
 const answerInquiryModule = require("./answer-inquiry");
 const { sendWhatsApp, getMessageStatus } = require("./send-whatsapp");
@@ -29,6 +29,7 @@ let activeInquiries = new Set(); // senders currently in the "ask about events" 
 let activeInquiryHistories = new Map(); // sender -> [{ role, content }] conversation so far in inquiry mode
 let recentlyCompleted = new Set(); // senders whose last action was a completed submission, for a softer follow-up
 let undeliveredAdminNotices = new Set(); // event ids whose review notice never reached the admin, surfaced on her next message
+let askedForClarification = new Set(); // senders already asked a clarifying question this submission, so we never ask twice
 const llmCallTimestamps = new Map(); // sender -> array of ms timestamps of recent LLM calls
 const RATE_LIMIT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -44,6 +45,7 @@ function loadState() {
     activeInquiryHistories = new Map(raw.activeInquiryHistories || []);
     recentlyCompleted = new Set(raw.recentlyCompleted || []);
     undeliveredAdminNotices = new Set(raw.undeliveredAdminNotices || []);
+    askedForClarification = new Set(raw.askedForClarification || []);
   } catch (err) {
     if (err.code !== "ENOENT") console.error("failed to load state:", err);
   }
@@ -60,6 +62,7 @@ function writeStateNow() {
     activeInquiryHistories: [...activeInquiryHistories.entries()],
     recentlyCompleted: [...recentlyCompleted],
     undeliveredAdminNotices: [...undeliveredAdminNotices],
+    askedForClarification: [...askedForClarification],
   };
   try {
     fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
@@ -200,7 +203,12 @@ function appendEvent(event, source, sender) {
   return { missing, id };
 }
 
-function formatEventForReview(id, event, sender) {
+function formatEventForReview(id, event, sender, unresolved = []) {
+  // Surface anything the submitter couldn't clear up, so Stav reviews with the same
+  // doubt the extractor had rather than trusting a silently guessed value.
+  const uncertaintyNote = unresolved.length
+    ? `\n⚠️ לא הובהר: ${unresolved.join(" | ")}\n`
+    : "";
   return [
     `אירוע חדש לבדיקה #${id}:`,
     `שם: ${event.event_name}`,
@@ -213,6 +221,7 @@ function formatEventForReview(id, event, sender) {
     `קישור/איש קשר: ${event.contact_link}`,
     event.description ? `תיאור: ${event.description}` : null,
     `נשלח מ: ${sender}`,
+    uncertaintyNote || null,
     "",
     `לאישור: אשר ${id}`,
     `לדחייה: דחה ${id} [סיבה]`,
@@ -247,10 +256,10 @@ async function confirmAdminNotification(id, sid) {
   }
 }
 
-async function forwardEventToAdmin(id, event, sender) {
+async function forwardEventToAdmin(id, event, sender, unresolved = []) {
   if (process.env.NODE_ENV === "test") return;
   try {
-    const result = await sendWhatsApp(ADMIN_SENDER, formatEventForReview(id, event, sender));
+    const result = await sendWhatsApp(ADMIN_SENDER, formatEventForReview(id, event, sender, unresolved));
     // Assume undelivered until proven otherwise, so a crash mid-check fails safe (the event
     // still gets surfaced on Stav's next message) rather than silently disappearing.
     undeliveredAdminNotices.add(String(id));
@@ -538,7 +547,7 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
   const previousEvent = alreadySentCount ? lastExtractedEvent.get(sender) || null : null;
 
   const correctionGuidance = buildCorrectionGuidance(EVENTS_FILE);
-  const event = await extractEvent(conversationText, undefined, newImages, previousEvent, correctionGuidance);
+  const event = await extractEventModule.extractEvent(conversationText, undefined, newImages, previousEvent, correctionGuidance);
   imagesSentToModel.set(sender, images.length);
   lastExtractedEvent.set(sender, event);
   const missing = missingFields(event);
@@ -547,14 +556,29 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
     return `חסרים עדיין פרטים: ${missing.join(", ")}\nשלחו את הפרטים החסרים, או "ביטול" כדי לצאת.`;
   }
 
+  // Everything required is present, but the extractor may still be genuinely unsure about
+  // something (a price that could be admission or a product, say). Ask the submitter once
+  // — they know the answer, unlike Stav. Only once: if their reply doesn't settle it, the
+  // event proceeds with a note rather than trapping them in a question loop.
+  const questions = event._questions || [];
+  if (questions.length && !askedForClarification.has(sender)) {
+    askedForClarification.add(sender);
+    saveState();
+    const list = questions.length === 1 ? questions[0] : questions.map((q, i) => `${i + 1}. ${q}`).join("\n");
+    return `כמעט סיימנו! רק שאלה קטנה:\n${list}\n\n(אפשר גם לכתוב "לא יודע" ונעביר לבדיקה כמו שזה)`;
+  }
+
+  const unresolved = questions.length ? questions : [];
+
   activeSubmissions.delete(sender);
   activeSubmissionImages.delete(sender);
   imagesSentToModel.delete(sender);
   lastExtractedEvent.delete(sender);
+  askedForClarification.delete(sender);
   recentlyCompleted.add(sender);
   saveState();
   const { id } = appendEvent(event, "Twilio WhatsApp", sender);
-  await forwardEventToAdmin(id, event, sender);
+  await forwardEventToAdmin(id, event, sender, unresolved);
   return "קיבלנו את האירוע. הוא נכנס לבדיקה לפני פרסום.";
 }
 
@@ -571,6 +595,7 @@ async function routeMessage(sender, text, mediaUrls = []) {
     activeSubmissionImages.delete(sender);
     imagesSentToModel.delete(sender);
     lastExtractedEvent.delete(sender);
+    askedForClarification.delete(sender);
     activeInquiries.delete(sender);
     activeInquiryHistories.delete(sender);
     recentlyCompleted.delete(sender);
@@ -624,6 +649,7 @@ async function routeMessage(sender, text, mediaUrls = []) {
       activeSubmissionImages.delete(sender);
       imagesSentToModel.delete(sender);
       lastExtractedEvent.delete(sender);
+      askedForClarification.delete(sender);
       saveState();
       return ASK_EVENT_DETAILS_TEXT;
     case "3":
@@ -636,6 +662,7 @@ async function routeMessage(sender, text, mediaUrls = []) {
         activeSubmissionImages.delete(sender);
         imagesSentToModel.delete(sender);
         lastExtractedEvent.delete(sender);
+        askedForClarification.delete(sender);
         saveState();
         const reply = await handleActiveSubmission(sender, text, mediaUrls);
         return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;

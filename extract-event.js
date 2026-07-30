@@ -37,14 +37,20 @@ ${imageNote}${previouslyExtractedNote}
   חשוב: אל תשים כאן מחירים של דברים שנמכרים באירוע — אוכל, שתייה, יין, כרטיסי הגרלה, סדנאות בתשלום וכו'.
   לדוגמה: "ערב יין, פלייט של 3 יינות ב-180 ש\"ח" — זה מחיר של מוצר שנמכר, לא מחיר כניסה, ולכן price נשאר ריק (""), והפרט הזה שייך ל-description.
   אם לא נאמר במפורש מה עולה הכניסה, השאר את price ריק ("") — אל תנחש ואל תשתמש במחיר אחר שמופיע בטקסט.
+  אם מופיע בטקסט מחיר כלשהו אך לא ברור אם הוא דמי כניסה או מחיר של מוצר שנמכר באירוע — השאר price ריק וגם הוסף שאלה על כך ל-_questions.
 - organizer: שם המארגן, אם צוין.
 - contact_link: קישור, מספר טלפון, או איש קשר לפרטים נוספים.
 - description: תיאור קצר וחופשי של האירוע, כולל פרטים שלא נכנסו לשדות אחרים.
 
 הטקסט הוא היסטוריית שיחה מלאה עם המשתמש (הודעות מאוחרות עשויות להשלים או לתקן מידע מהודעות קודמות). מזג את כל המידע לטיוטת אירוע אחת עדכנית.
 ${correctionGuidance}
+אם משהו באמת דו-משמעי ואי אפשר להכריע ממה שנכתב, אל תנחש: השאר את השדה ריק ("") והוסף שאלה קצרה וברורה בעברית ל-_questions.
+שאל רק כשבאמת לא ברור ויש יותר מפירוש סביר אחד — לא על פרטים שפשוט לא הוזכרו ולא חשובים.
+לדוגמה: אם מופיע מחיר בטקסט אבל לא ברור אם הוא דמי כניסה או מחיר של משהו שנמכר באירוע, שאל: "המחיר 180 ש\"ח הוא דמי כניסה או מחיר של הפלייט?"
+לכל היותר 2 שאלות. אם הכול ברור, החזר _questions כרשימה ריקה [].
+
 השב אך ורק ב-JSON תקין בפורמט הבא, ללא טקסט נוסף:
-{"event_name":"","date":"","start_time":"","end_time":"","location":"","category":"","price":"","organizer":"","contact_link":"","description":""}
+{"event_name":"","date":"","start_time":"","end_time":"","location":"","category":"","price":"","organizer":"","contact_link":"","description":"","_questions":[]}
 
 טקסט השיחה:
 ${conversationText}`;
@@ -98,7 +104,25 @@ async function extractEvent(conversationText, todayIso = new Date().toISOString(
   for (const key of FIELD_KEYS) {
     if (typeof fields[key] === "string") event[key] = fields[key].trim();
   }
+
+  // Questions ride along with the draft but must never reach the CSV, so keep them
+  // off the enumerable surface that FIELD_KEYS/serialization walk over.
+  Object.defineProperty(event, "_questions", {
+    value: normalizeQuestions(fields._questions),
+    enumerable: false,
+  });
   return event;
+}
+
+const MAX_QUESTIONS = 2;
+const MAX_QUESTION_LENGTH = 200;
+
+function normalizeQuestions(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter((q) => typeof q === "string" && q.trim())
+    .map((q) => q.trim().slice(0, MAX_QUESTION_LENGTH))
+    .slice(0, MAX_QUESTIONS);
 }
 
 module.exports = { extractEvent, FIELD_KEYS };
