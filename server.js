@@ -7,7 +7,7 @@ const { loadEvents, makeDigest } = require("./make-digest");
 const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent } = require("./events-store");
 const { extractEvent } = require("./extract-event");
 const answerInquiryModule = require("./answer-inquiry");
-const { sendWhatsApp } = require("./send-whatsapp");
+const { sendWhatsApp, getMessageStatus } = require("./send-whatsapp");
 const { fetchMediaAsDataUrl } = require("./fetch-media");
 
 const PORT = Number(process.env.PORT || 3000);
@@ -27,6 +27,7 @@ const lastExtractedEvent = new Map(); // sender -> last extracted event fields, 
 let activeInquiries = new Set(); // senders currently in the "ask about events" flow
 let activeInquiryHistories = new Map(); // sender -> [{ role, content }] conversation so far in inquiry mode
 let recentlyCompleted = new Set(); // senders whose last action was a completed submission, for a softer follow-up
+let undeliveredAdminNotices = new Set(); // event ids whose review notice never reached the admin, surfaced on her next message
 const llmCallTimestamps = new Map(); // sender -> array of ms timestamps of recent LLM calls
 const RATE_LIMIT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -41,6 +42,7 @@ function loadState() {
     activeInquiries = new Set(raw.activeInquiries || []);
     activeInquiryHistories = new Map(raw.activeInquiryHistories || []);
     recentlyCompleted = new Set(raw.recentlyCompleted || []);
+    undeliveredAdminNotices = new Set(raw.undeliveredAdminNotices || []);
   } catch (err) {
     if (err.code !== "ENOENT") console.error("failed to load state:", err);
   }
@@ -56,6 +58,7 @@ function writeStateNow() {
     activeInquiries: [...activeInquiries],
     activeInquiryHistories: [...activeInquiryHistories.entries()],
     recentlyCompleted: [...recentlyCompleted],
+    undeliveredAdminNotices: [...undeliveredAdminNotices],
   };
   try {
     fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
@@ -215,12 +218,47 @@ function formatEventForReview(id, event, sender) {
   ].filter((line) => line !== null).join("\n");
 }
 
+// WhatsApp only permits free-form messages within 24h of the recipient's last inbound
+// message. Outside that window Twilio accepts the API call but reports error 63016 and
+// never delivers, so a resolved promise is NOT proof of delivery — the status must be
+// inspected. Undelivered notifications leave the event queued for the next admin contact.
+const WHATSAPP_OUTSIDE_WINDOW_ERROR = 63016;
+const UNDELIVERED_STATUSES = new Set(["undelivered", "failed"]);
+
+// Verifying delivery means polling Twilio for several seconds, so it must never block the
+// webhook reply. The send is awaited (fast); the status check runs detached afterwards and
+// only records the outcome for the next admin contact.
+async function confirmAdminNotification(id, sid) {
+  try {
+    const status = await getMessageStatus(sid);
+    const outsideWindow = Number(status.error_code) === WHATSAPP_OUTSIDE_WINDOW_ERROR;
+    if (UNDELIVERED_STATUSES.has(status.status) || outsideWindow) {
+      console.error(
+        `admin notification for event #${id} was not delivered (status=${status.status}, error=${status.error_code}); event stays queued for the next admin contact`
+      );
+      saveState();
+      return;
+    }
+    undeliveredAdminNotices.delete(String(id));
+    saveState();
+  } catch (err) {
+    console.error(`failed to confirm admin notification for event #${id}:`, err);
+  }
+}
+
 async function forwardEventToAdmin(id, event, sender) {
   if (process.env.NODE_ENV === "test") return;
   try {
-    await sendWhatsApp(ADMIN_SENDER, formatEventForReview(id, event, sender));
+    const result = await sendWhatsApp(ADMIN_SENDER, formatEventForReview(id, event, sender));
+    // Assume undelivered until proven otherwise, so a crash mid-check fails safe (the event
+    // still gets surfaced on Stav's next message) rather than silently disappearing.
+    undeliveredAdminNotices.add(String(id));
+    saveState();
+    confirmAdminNotification(id, result.sid);
   } catch (err) {
     console.error("failed to forward event to admin:", err);
+    undeliveredAdminNotices.add(String(id));
+    saveState();
   }
 }
 
@@ -248,21 +286,43 @@ function formatPendingList(events) {
 
 const ADMIN_COMMAND_RE = /^(אשר|דחה)\s*#?(\d+)\s*(.*)$/;
 
+// Any inbound admin message reopens WhatsApp's 24h window, so it's the one reliable moment
+// to deliver review notices that were dropped earlier (error 63016).
+function missedNoticesBanner(events) {
+  if (!undeliveredAdminNotices.size) return "";
+  const stillPending = events.filter(
+    (e) => e.status === "submitted" && undeliveredAdminNotices.has(String(e.id))
+  );
+  if (!stillPending.length) {
+    undeliveredAdminNotices.clear();
+    saveState();
+    return "";
+  }
+  const lines = stillPending
+    .map((e) => `#${e.id} ${e.event_name} — ${e.date} ${e.start_time}`)
+    .join("\n");
+  return `⚠️ אירועים שההודעה עליהם לא הגיעה אליך:\n${lines}\n\n`;
+}
+
 async function handleAdminMessage(text) {
   const trimmed = text.trim();
+  const banner = missedNoticesBanner(loadEvents(EVENTS_FILE));
 
   if (trimmed === "ממתינים") {
-    return formatPendingList(loadEvents(EVENTS_FILE));
+    return `${banner}${formatPendingList(loadEvents(EVENTS_FILE))}`;
   }
 
   const match = trimmed.match(ADMIN_COMMAND_RE);
-  if (!match) return ADMIN_HELP_TEXT;
+  if (!match) return `${banner}${ADMIN_HELP_TEXT}`;
 
   const [, action, id, reason] = match;
   const existing = storeFindEvent(EVENTS_FILE, id);
   if (!existing) {
-    return `לא נמצא אירוע #${id}.\n\n${formatPendingList(loadEvents(EVENTS_FILE))}`;
+    return `${banner}לא נמצא אירוע #${id}.\n\n${formatPendingList(loadEvents(EVENTS_FILE))}`;
   }
+
+  // Acting on an event means it was seen; stop flagging it as a missed notice.
+  if (undeliveredAdminNotices.delete(String(id))) saveState();
 
   if (action === "אשר") {
     if (existing.status === "published") {
@@ -592,4 +652,5 @@ module.exports = {
   get activeInquiries() { return activeInquiries; },
   get activeInquiryHistories() { return activeInquiryHistories; },
   get recentlyCompleted() { return recentlyCompleted; },
+  get undeliveredAdminNotices() { return undeliveredAdminNotices; },
 };

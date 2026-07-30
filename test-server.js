@@ -6,7 +6,9 @@ process.env.NODE_ENV = "test"; // skip real Twilio calls (admin forwarding) duri
 const TEST_EVENTS_FILE = path.join(__dirname, "test-events.csv");
 process.env.EVENTS_FILE = TEST_EVENTS_FILE;
 
-const { routeMessage, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents } = require("./server");
+const { routeMessage, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices } = require("./server");
+
+const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
 // Stub the inquiry LLM so conversation tests are deterministic and offline.
 const answerInquiryModule = require("./answer-inquiry");
@@ -142,6 +144,29 @@ async function demo() {
   const cancelEscape = await routeMessage(escapeSender, "/cancel");
   if (!cancelEscape.includes("מה תרצו לעשות")) throw new Error("/cancel should return to the main menu from any state");
   if (activeInquiries.has(escapeSender)) throw new Error("/cancel should clear an in-progress inquiry");
+
+  // Regression test for the silent-drop bug: when a review notice never reached the admin
+  // (WhatsApp error 63016, outside the 24h window), her next message must surface it.
+  // Event #1 was submitted at the top of this run and is still "submitted".
+  undeliveredAdminNotices.add("1");
+  const adminWithMissed = await routeMessage(ADMIN, "ממתינים");
+  if (!adminWithMissed.includes("לא הגיעה אליך")) {
+    throw new Error("admin should be warned about review notices that were never delivered");
+  }
+  if (!adminWithMissed.includes("#1")) {
+    throw new Error("the missed-notice warning should name the undelivered event");
+  }
+
+  // Acting on the event clears the flag, so it isn't reported forever.
+  const adminApprove = await routeMessage(ADMIN, "אשר 1");
+  if (!adminApprove.includes("אושר ופורסם")) throw new Error("admin approval should publish the event");
+  if (undeliveredAdminNotices.has("1")) {
+    throw new Error("acting on an event should clear its missed-notice flag");
+  }
+  const adminAfterAction = await routeMessage(ADMIN, "ממתינים");
+  if (adminAfterAction.includes("לא הגיעה אליך")) {
+    throw new Error("missed-notice warning should not persist after the event was handled");
+  }
 
   fs.unlinkSync(TEST_EVENTS_FILE);
   console.log("all tests passed");
