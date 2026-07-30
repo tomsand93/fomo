@@ -18,7 +18,7 @@ function buildPreviouslyExtractedNote(previousEvent) {
   return `\nמהודעה קודמת (כולל תמונה שכבר לא מצורפת כעת) כבר חולצו הפרטים הבאים: ${knownFields}.\nשמור על הפרטים האלה אלא אם הטקסט החדש סותר או מעדכן אותם.\n`;
 }
 
-function buildPrompt(conversationText, todayIso, hasImages, previousEvent) {
+function buildPrompt(conversationText, todayIso, hasImages, previousEvent, correctionGuidance = "") {
   const imageNote = hasImages
     ? "\nבנוסף לטקסט צורפו תמונה/ות של פלייר האירוע. חלץ מידע גם מהטקסט המופיע בתמונה (שם האירוע, תאריך, שעה, מיקום וכו').\n"
     : "\n";
@@ -33,13 +33,16 @@ ${imageNote}${previouslyExtractedNote}
 - end_time: שעת סיום בפורמט HH:MM, אם צוין.
 - location: מיקום/כתובת/שם מקום.
 - category: קטגוריה (לדוגמה: מוזיקה, מסיבה, קולנוע, אוכל ויין, קריוקי, מוזיקה חיה, אחר). אם הקטגוריה לא נאמרת במפורש, הסק אותה מהתיאור (למשל אירוע שירה/נגינה/הופעה -> מוזיקה חיה).
-- price: מחיר או "כניסה חופשית" אם צוין.
+- price: אך ורק מחיר הכניסה לאירוע (דמי כניסה / כרטיס), או "כניסה חופשית" אם נאמר שהכניסה חינם.
+  חשוב: אל תשים כאן מחירים של דברים שנמכרים באירוע — אוכל, שתייה, יין, כרטיסי הגרלה, סדנאות בתשלום וכו'.
+  לדוגמה: "ערב יין, פלייט של 3 יינות ב-180 ש\"ח" — זה מחיר של מוצר שנמכר, לא מחיר כניסה, ולכן price נשאר ריק (""), והפרט הזה שייך ל-description.
+  אם לא נאמר במפורש מה עולה הכניסה, השאר את price ריק ("") — אל תנחש ואל תשתמש במחיר אחר שמופיע בטקסט.
 - organizer: שם המארגן, אם צוין.
 - contact_link: קישור, מספר טלפון, או איש קשר לפרטים נוספים.
 - description: תיאור קצר וחופשי של האירוע, כולל פרטים שלא נכנסו לשדות אחרים.
 
 הטקסט הוא היסטוריית שיחה מלאה עם המשתמש (הודעות מאוחרות עשויות להשלים או לתקן מידע מהודעות קודמות). מזג את כל המידע לטיוטת אירוע אחת עדכנית.
-
+${correctionGuidance}
 השב אך ורק ב-JSON תקין בפורמט הבא, ללא טקסט נוסף:
 {"event_name":"","date":"","start_time":"","end_time":"","location":"","category":"","price":"","organizer":"","contact_link":"","description":""}
 
@@ -79,12 +82,12 @@ function extractJson(text) {
   return JSON.parse(match[0]);
 }
 
-async function extractEvent(conversationText, todayIso = new Date().toISOString().slice(0, 10), imageDataUrls = [], previousEvent = null) {
+async function extractEvent(conversationText, todayIso = new Date().toISOString().slice(0, 10), imageDataUrls = [], previousEvent = null, correctionGuidance = "") {
   if (!OPENROUTER_API_KEY) {
     throw new Error("OPENROUTER_API_KEY is not set");
   }
 
-  const prompt = buildPrompt(conversationText, todayIso, imageDataUrls.length > 0, previousEvent);
+  const prompt = buildPrompt(conversationText, todayIso, imageDataUrls.length > 0, previousEvent, correctionGuidance);
   const userContent = buildUserContent(prompt, imageDataUrls);
   const raw = await callOpenRouter(userContent);
   const parsed = JSON.parse(raw);

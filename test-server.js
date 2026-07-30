@@ -168,6 +168,34 @@ async function demo() {
     throw new Error("missed-notice warning should not persist after the event was handled");
   }
 
+  // Admin corrections: Stav fixes a field, the event updates, and the correction is
+  // recorded so later extractions can be told about it.
+  const { buildCorrectionGuidance, correctionsPath, loadCorrections } = require("./corrections-store");
+  const CORRECTIONS_FILE = correctionsPath(TEST_EVENTS_FILE);
+  if (fs.existsSync(CORRECTIONS_FILE)) fs.unlinkSync(CORRECTIONS_FILE);
+
+  const badFieldReply = await routeMessage(ADMIN, "תקן 2 גובה: 3 מטר");
+  if (!badFieldReply.includes("לא מכיר את השדה")) throw new Error("unknown correction field should be rejected");
+
+  const correctReply = await routeMessage(ADMIN, "תקן 2 מחיר: כניסה חופשית");
+  if (!correctReply.includes("עודכן")) throw new Error("valid correction should be applied");
+  const correctedEvent = require("./events-store").findEvent(TEST_EVENTS_FILE, "2");
+  if (correctedEvent.price !== "כניסה חופשית") throw new Error("correction should update the stored event");
+
+  const stored = loadCorrections(TEST_EVENTS_FILE);
+  if (stored.length !== 1) throw new Error("the correction should be recorded for future extractions");
+  if (stored[0].field !== "price") throw new Error("correction should record which field was wrong");
+
+  // The whole point: recorded corrections must actually reach the extraction prompt.
+  const guidance = buildCorrectionGuidance(TEST_EVENTS_FILE);
+  if (!guidance.includes("price")) throw new Error("correction guidance should mention the corrected field");
+  if (!guidance.includes("כניסה חופשית")) throw new Error("correction guidance should carry the corrected value");
+
+  // Invalid values are rejected rather than silently written.
+  const badValue = await routeMessage(ADMIN, "תקן 2 תאריך: מחר בערב");
+  if (!badValue.includes("לא בפורמט הנכון")) throw new Error("malformed correction values should be rejected");
+
+  fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   console.log("all tests passed");
 }

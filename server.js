@@ -6,6 +6,7 @@ const { URLSearchParams } = require("url");
 const { loadEvents, makeDigest } = require("./make-digest");
 const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent } = require("./events-store");
 const { extractEvent } = require("./extract-event");
+const { addCorrection, buildCorrectionGuidance } = require("./corrections-store");
 const answerInquiryModule = require("./answer-inquiry");
 const { sendWhatsApp, getMessageStatus } = require("./send-whatsapp");
 const { fetchMediaAsDataUrl } = require("./fetch-media");
@@ -274,7 +275,61 @@ async function notifySubmitter(sender, text) {
 const ADMIN_HELP_TEXT = `פקודות ניהול:
 אשר <מספר> - לאשר ולפרסם אירוע
 דחה <מספר> [סיבה] - לדחות אירוע
-ממתינים - רשימת אירועים ממתינים לבדיקה`;
+ממתינים - רשימת אירועים ממתינים לבדיקה
+תקן <מספר> <שדה>: <ערך> - לתקן פרט באירוע (הבוט ילמד מהתיקון)
+
+שדות לתיקון: שם, תאריך, שעה, שעת סיום, מיקום, קטגוריה, מחיר, מארגן, קישור, תיאור
+לדוגמה: תקן 6 מחיר: כניסה חופשית`;
+
+// Hebrew labels Stav actually types, mapped to the CSV/extractor field names.
+const FIELD_LABELS = new Map([
+  ["שם", "event_name"],
+  ["תאריך", "date"],
+  ["שעה", "start_time"],
+  ["שעת סיום", "end_time"],
+  ["מיקום", "location"],
+  ["קטגוריה", "category"],
+  ["מחיר", "price"],
+  ["מארגן", "organizer"],
+  ["קישור", "contact_link"],
+  ["תיאור", "description"],
+]);
+
+const CORRECT_COMMAND_RE = /^תקן\s*#?(\d+)\s+([^:]+):\s*(.*)$/s;
+
+async function handleCorrectionCommand(match) {
+  const [, id, rawField, rawValue] = match;
+  const fieldLabel = rawField.trim();
+  const field = FIELD_LABELS.get(fieldLabel);
+  const value = rawValue.trim();
+
+  if (!field) {
+    const known = [...FIELD_LABELS.keys()].join(", ");
+    return `לא מכיר את השדה "${fieldLabel}".\nשדות אפשריים: ${known}`;
+  }
+
+  const existing = storeFindEvent(EVENTS_FILE, id);
+  if (!existing) return `לא נמצא אירוע #${id}.`;
+
+  if (!fieldIsValid(field, value)) {
+    return `הערך "${value}" לא בפורמט הנכון עבור ${fieldLabel}.`;
+  }
+
+  const wrongValue = existing[field] || "";
+  if (wrongValue === value) return `אירוע #${id}: ${fieldLabel} כבר "${value}".`;
+
+  storeUpdateEvent(EVENTS_FILE, id, { [field]: value });
+  // The description is the best available record of what the submitter actually wrote,
+  // so it doubles as the source snippet that led the extractor astray.
+  addCorrection(EVENTS_FILE, {
+    field,
+    wrongValue,
+    rightValue: value,
+    sourceText: existing.description || existing.event_name || "",
+  });
+
+  return `עודכן: אירוע #${id}, ${fieldLabel} = "${value}".\nהבוט ילמד מהתיקון הזה. 🧠`;
+}
 
 function formatPendingList(events) {
   const pending = events.filter((e) => e.status === "submitted");
@@ -310,6 +365,11 @@ async function handleAdminMessage(text) {
 
   if (trimmed === "ממתינים") {
     return `${banner}${formatPendingList(loadEvents(EVENTS_FILE))}`;
+  }
+
+  const correction = trimmed.match(CORRECT_COMMAND_RE);
+  if (correction) {
+    return `${banner}${await handleCorrectionCommand(correction)}`;
   }
 
   const match = trimmed.match(ADMIN_COMMAND_RE);
@@ -477,7 +537,8 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
   const newImages = images.slice(alreadySentCount);
   const previousEvent = alreadySentCount ? lastExtractedEvent.get(sender) || null : null;
 
-  const event = await extractEvent(conversationText, undefined, newImages, previousEvent);
+  const correctionGuidance = buildCorrectionGuidance(EVENTS_FILE);
+  const event = await extractEvent(conversationText, undefined, newImages, previousEvent, correctionGuidance);
   imagesSentToModel.set(sender, images.length);
   lastExtractedEvent.set(sender, event);
   const missing = missingFields(event);
