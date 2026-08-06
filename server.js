@@ -30,8 +30,13 @@ let activeInquiryHistories = new Map(); // sender -> [{ role, content }] convers
 let recentlyCompleted = new Set(); // senders whose last action was a completed submission, for a softer follow-up
 let undeliveredAdminNotices = new Set(); // event ids whose review notice never reached the admin, surfaced on her next message
 let askedForClarification = new Set(); // senders already asked a clarifying question this submission, so we never ask twice
+let incompleteAttempts = new Map(); // sender -> consecutive turns still missing required fields, so a draft can't loop forever
 let noticeSidToEventId = new Map(); // Twilio message sid of a review notice -> event id, so a WhatsApp reply to it resolves without a number
-let lastNotifiedEventId = ""; // most recent event the admin was told about, so a bare "אשר" has an obvious referent
+// The admin's phone is also her QA/testing phone, so her role can't be inferred from the
+// message text: "2" is both a menu choice and (previously) a reject command. She declares
+// which hat she's wearing instead. Anyone who isn't the admin is always a customer.
+let adminMode = new Map(); // ADMIN_SENDER -> "admin" | "customer"
+let lastActivity = new Map(); // sender -> ms timestamp of last inbound message, for idle expiry
 const llmCallTimestamps = new Map(); // sender -> array of ms timestamps of recent LLM calls
 const RATE_LIMIT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -48,8 +53,10 @@ function loadState() {
     recentlyCompleted = new Set(raw.recentlyCompleted || []);
     undeliveredAdminNotices = new Set(raw.undeliveredAdminNotices || []);
     askedForClarification = new Set(raw.askedForClarification || []);
+    incompleteAttempts = new Map(raw.incompleteAttempts || []);
     noticeSidToEventId = new Map(raw.noticeSidToEventId || []);
-    lastNotifiedEventId = raw.lastNotifiedEventId || "";
+    adminMode = new Map(raw.adminMode || []);
+    lastActivity = new Map(raw.lastActivity || []);
   } catch (err) {
     if (err.code !== "ENOENT") console.error("failed to load state:", err);
   }
@@ -67,9 +74,11 @@ function writeStateNow() {
     recentlyCompleted: [...recentlyCompleted],
     undeliveredAdminNotices: [...undeliveredAdminNotices],
     askedForClarification: [...askedForClarification],
+    incompleteAttempts: [...incompleteAttempts.entries()],
     // Bounded: only recent notices need to stay resolvable by reply.
     noticeSidToEventId: [...noticeSidToEventId].slice(-50),
-    lastNotifiedEventId,
+    adminMode: [...adminMode.entries()],
+    lastActivity: [...lastActivity.entries()],
   };
   try {
     fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
@@ -164,13 +173,58 @@ async function sendPendingReminder() {
   lines.push("", 'ענו על הודעת האירוע עם "אשר" או "דחה", או כתבו "אשר <מספר>".');
 
   try {
-    const result = await sendWhatsApp(ADMIN_SENDER, lines.join("\n"));
-    // A reply to the reminder is ambiguous when several are pending, so only make it
-    // directly actionable when there's exactly one thing it could mean.
-    if (pending.length === 1) rememberNotice(result.sid, pending[0].id);
+    // Deliberately not bound to an event id: a reply to a *list* has no single referent,
+    // and binding it to one (even when only one is pending) is how "דחה" in reply to a
+    // reminder rejected an unrelated event. Replies must target a specific event notice.
+    await sendWhatsApp(ADMIN_SENDER, lines.join("\n"));
   } catch (err) {
     console.error("failed to send pending reminder:", err);
   }
+}
+
+// Every per-sender conversation structure in one place. "ביטול", idle expiry and a mode
+// switch all need exactly this set; keeping it in one function stops them from drifting
+// apart and leaving half a session behind (images outliving their draft, say).
+function clearSession(sender) {
+  activeSubmissions.delete(sender);
+  activeSubmissionImages.delete(sender);
+  imagesSentToModel.delete(sender);
+  lastExtractedEvent.delete(sender);
+  askedForClarification.delete(sender);
+  incompleteAttempts.delete(sender);
+  activeInquiries.delete(sender);
+  activeInquiryHistories.delete(sender);
+  recentlyCompleted.delete(sender);
+}
+
+// A conversation that goes quiet is abandoned, not paused. Without this a half-finished
+// draft survives forever (it's persisted to state.json, so even a restart won't clear it)
+// and the next unrelated message gets answered in the context of a stale one.
+const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+const IDLE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+
+function hasSessionState(sender) {
+  return (
+    activeSubmissions.has(sender) ||
+    activeInquiries.has(sender) ||
+    recentlyCompleted.has(sender)
+  );
+}
+
+// Silent by design: no outbound "your draft expired" message. It would burn a WhatsApp
+// session message and surprise people who abandoned the draft deliberately.
+function expireIdleSessions(now = Date.now()) {
+  let changed = false;
+  for (const [sender, seenAt] of lastActivity) {
+    if (now - seenAt < IDLE_TIMEOUT_MS) continue;
+    if (hasSessionState(sender)) {
+      clearSession(sender);
+      changed = true;
+    }
+    lastActivity.delete(sender);
+    changed = true;
+  }
+  if (changed) saveState();
 }
 
 function sweepStaleRateLimitEntries() {
@@ -208,7 +262,12 @@ const FOLLOW_UP_AFTER_SUBMISSION_TEXT = `האירוע האחרון שלכם כב
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
-const CONTACT_LINK_RE = /^(https?:\/\/\S+|\+?\d[\d\s-]{6,}\d|@\w+)$/i;
+// Deliberately unanchored: the extractor often returns a usable contact with surrounding
+// words ("לפרטים: 054-1234567", "לרכישת כרטיסים https://..."). Requiring the whole field to
+// be a bare URL/phone rejected messages that plainly contained one, and the submitter was
+// re-asked for a link they had already sent. A contact anywhere in the value is enough.
+const MAX_INCOMPLETE_ATTEMPTS = 3;
+const CONTACT_LINK_RE = /(https?:\/\/\S+|\+?\d[\d\s-]{6,}\d|@\w+)/i;
 
 function isValidDate(value) {
   if (!DATE_RE.test(value)) return false;
@@ -281,7 +340,6 @@ function rememberNotice(sid, eventId) {
       noticeSidToEventId.delete(oldest);
     }
   }
-  lastNotifiedEventId = String(eventId);
   saveState();
 }
 
@@ -340,7 +398,7 @@ async function notifySubmitter(sender, text) {
 }
 
 const ADMIN_HELP_TEXT = `פקודות ניהול:
-הכי פשוט: ענו על הודעת האירוע עם "אשר" או "דחה" (או 1 / 2)
+הכי פשוט: ענו על הודעת האירוע עצמה עם "אשר" או "דחה"
 
 אשר <מספר> - לאשר ולפרסם אירוע
 דחה <מספר> [סיבה] - לדחות אירוע
@@ -348,7 +406,10 @@ const ADMIN_HELP_TEXT = `פקודות ניהול:
 תקן <מספר> <שדה>: <ערך> - לתקן פרט באירוע (הבוט ילמד מהתיקון)
 
 שדות לתיקון: שם, תאריך, שעה, שעת סיום, מיקום, קטגוריה, מחיר, מארגן, קישור, תיאור
-לדוגמה: תקן 6 מחיר: כניסה חופשית`;
+לדוגמה: תקן 6 מחיר: כניסה חופשית
+
+לקוח - מעבר למצב לקוח (לבדיקות), כדי לשלוח אירוע כמו משתמש רגיל
+ניהול - חזרה למצב ניהול`;
 
 // Hebrew labels Stav actually types, mapped to the CSV/extractor field names.
 const FIELD_LABELS = new Map([
@@ -408,16 +469,19 @@ function formatPendingList(events) {
     .join("\n");
 }
 
-// Explicit id ("אשר 6"), or bare ("אשר") which resolves via the replied-to notice or the
-// most recent one. "1"/"2" are shortcuts for approve/reject on the last notice, because
-// that is what Stav reached for unprompted.
+// Explicit id ("אשר 6"), or bare ("אשר") as a WhatsApp reply to the event's own notice.
 const ADMIN_COMMAND_RE = /^(אשר|דחה)(?:\s*#?(\d+))?\s*(.*)$/;
-const ADMIN_SHORTCUTS = new Map([["1", "אשר"], ["2", "דחה"]]);
 
+// Approving and rejecting are irreversible from the submitter's point of view - they get a
+// "your event was published/declined" message either way - so the target is never guessed.
+// A bare command used to fall back to the most recently notified event, which silently
+// rejected #8 when Stav replied "דחה" to a reminder listing #3 and #5, and rejected #10
+// when she typed "2" meaning the menu's "publish an event". An unresolvable command now
+// asks which event instead of picking one.
 function resolveEventId(explicitId, repliedSid) {
   if (explicitId) return String(explicitId);
   if (repliedSid && noticeSidToEventId.has(repliedSid)) return noticeSidToEventId.get(repliedSid);
-  return lastNotifiedEventId || "";
+  return "";
 }
 
 // Any inbound admin message reopens WhatsApp's 24h window, so it's the one reliable moment
@@ -451,14 +515,13 @@ async function handleAdminMessage(text, repliedSid = "") {
     return `${banner}${await handleCorrectionCommand(correction)}`;
   }
 
-  const shortcut = ADMIN_SHORTCUTS.get(trimmed);
-  const match = shortcut ? [null, shortcut, "", ""] : trimmed.match(ADMIN_COMMAND_RE);
+  const match = trimmed.match(ADMIN_COMMAND_RE);
   if (!match) return `${banner}${ADMIN_HELP_TEXT}`;
 
   const [, action, explicitId, reason] = match;
   const id = resolveEventId(explicitId, repliedSid);
   if (!id) {
-    return `${banner}לא ברור לאיזה אירוע הכוונה. ענו על ההודעה של האירוע, או כתבו "אשר <מספר>".\n\n${formatPendingList(loadEvents(EVENTS_FILE))}`;
+    return `${banner}לא ברור לאיזה אירוע הכוונה — לא שיניתי כלום.\nענו על הודעת האירוע עם "${action}", או כתבו "${action} <מספר>".\n\n${formatPendingList(loadEvents(EVENTS_FILE))}`;
   }
 
   const existing = storeFindEvent(EVENTS_FILE, id);
@@ -631,9 +694,29 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
   lastExtractedEvent.set(sender, event);
   const missing = missingFields(event);
 
+  // Re-asking forever is worse than forwarding an imperfect draft: a submitter who has
+  // already sent the detail (and can see it in their own message) has no way to satisfy
+  // the bot, and no reason to believe a fourth attempt will work. After a few tries, hand
+  // it to Stav with the gap named — she can fill it in or reject it.
   if (missing.length) {
-    return `חסרים עדיין פרטים: ${missing.join(", ")}\nשלחו את הפרטים החסרים, או "ביטול" כדי לצאת.`;
+    const attempts = (incompleteAttempts.get(sender) || 0) + 1;
+    incompleteAttempts.set(sender, attempts);
+    saveState();
+
+    if (attempts < MAX_INCOMPLETE_ATTEMPTS) {
+      return `חסרים עדיין פרטים: ${missing.join(", ")}\nשלחו את הפרטים החסרים, או "ביטול" כדי לצאת.`;
+    }
+
+    const unresolvedMissing = [`חסרים פרטים שלא הצלחנו לקבל: ${missing.join(", ")}`];
+    clearSession(sender);
+    recentlyCompleted.add(sender);
+    saveState();
+    const { id } = appendEvent(event, "Twilio WhatsApp", sender);
+    await forwardEventToAdmin(id, event, sender, unresolvedMissing);
+    return "קיבלנו את האירוע והעברנו אותו לבדיקה. אם חסר פרט, נשלים אותו מולכם.";
   }
+
+  incompleteAttempts.delete(sender);
 
   // Everything required is present, but the extractor may still be genuinely unsure about
   // something (a price that could be admission or a product, say). Ask the submitter once
@@ -649,11 +732,7 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
 
   const unresolved = questions.length ? questions : [];
 
-  activeSubmissions.delete(sender);
-  activeSubmissionImages.delete(sender);
-  imagesSentToModel.delete(sender);
-  lastExtractedEvent.delete(sender);
-  askedForClarification.delete(sender);
+  clearSession(sender);
   recentlyCompleted.add(sender);
   saveState();
   const { id } = appendEvent(event, "Twilio WhatsApp", sender);
@@ -661,37 +740,49 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
   return "קיבלנו את האירוע. הוא נכנס לבדיקה לפני פרסום.";
 }
 
-// The admin is also a user: she forwards events to publish like anyone else. Only treat
-// her message as a command when it actually looks like one, otherwise her submissions get
-// swallowed by the admin handler and silently lost.
-function looksLikeAdminCommand(trimmed, repliedSid) {
-  if (trimmed === "ממתינים") return true;
-  if (CORRECT_COMMAND_RE.test(trimmed)) return true;
-  if (ADMIN_SHORTCUTS.has(trimmed) && (repliedSid || lastNotifiedEventId)) return true;
-  const match = trimmed.match(ADMIN_COMMAND_RE);
-  if (!match) return false;
-  // "אשר"/"דחה" with an id is always a command; bare only when there's something to act on.
-  return Boolean(match[2]) || Boolean(repliedSid) || Boolean(lastNotifiedEventId);
-}
+const ADMIN_MODE_KEYWORDS = new Set(["ניהול", "admin"]);
+const CUSTOMER_MODE_KEYWORDS = new Set(["לקוח", "customer", "qa"]);
+
+const ADMIN_MODE_TEXT = `🛠 מצב ניהול. כתבו "לקוח" כדי לבדוק כמו משתמש רגיל.
+
+${ADMIN_HELP_TEXT}`;
+
+const CUSTOMER_MODE_TEXT = `👤 מצב לקוח (בדיקות) — פקודות הניהול כבויות. כתבו "ניהול" כדי לחזור.
+
+${MENU_TEXT}`;
 
 async function routeMessage(sender, text, mediaUrls = [], repliedSid = "") {
   const trimmed = text.trim();
   const lowerTrimmed = trimmed.toLowerCase();
 
-  // Mid-submission the admin is acting as a submitter, so commands must not hijack her draft.
-  if (sender === ADMIN_SENDER && !activeSubmissions.has(sender) && looksLikeAdminCommand(trimmed, repliedSid)) {
-    return handleAdminMessage(text, repliedSid);
+  // Expire before reading any state: the periodic sweep may not have run since a restart,
+  // and acting on an hours-old draft is exactly what this is meant to prevent.
+  expireIdleSessions();
+  lastActivity.set(sender, Date.now());
+
+  // The admin declares which role she's in rather than having it guessed from her text.
+  // Guessing is what made "2" (menu: publish an event) reject an event instead.
+  if (sender === ADMIN_SENDER) {
+    if (ADMIN_MODE_KEYWORDS.has(lowerTrimmed)) {
+      adminMode.set(sender, "admin");
+      clearSession(sender);
+      saveState();
+      return ADMIN_MODE_TEXT;
+    }
+    if (CUSTOMER_MODE_KEYWORDS.has(lowerTrimmed)) {
+      adminMode.set(sender, "customer");
+      clearSession(sender);
+      saveState();
+      return CUSTOMER_MODE_TEXT;
+    }
+    // Default is admin: her real job. QA is the mode she opts into.
+    if (adminMode.get(sender) !== "customer") {
+      return handleAdminMessage(text, repliedSid);
+    }
   }
 
   if (CANCEL_KEYWORDS.has(lowerTrimmed) || MENU_KEYWORDS.has(lowerTrimmed)) {
-    activeSubmissions.delete(sender);
-    activeSubmissionImages.delete(sender);
-    imagesSentToModel.delete(sender);
-    lastExtractedEvent.delete(sender);
-    askedForClarification.delete(sender);
-    activeInquiries.delete(sender);
-    activeInquiryHistories.delete(sender);
-    recentlyCompleted.delete(sender);
+    clearSession(sender);
     saveState();
     return MENU_TEXT;
   }
@@ -738,11 +829,8 @@ async function routeMessage(sender, text, mediaUrls = [], repliedSid = "") {
       saveState();
       return ASK_INQUIRY_TEXT;
     case "2":
+      clearSession(sender);
       activeSubmissions.set(sender, []);
-      activeSubmissionImages.delete(sender);
-      imagesSentToModel.delete(sender);
-      lastExtractedEvent.delete(sender);
-      askedForClarification.delete(sender);
       saveState();
       return ASK_EVENT_DETAILS_TEXT;
     case "3":
@@ -751,11 +839,8 @@ async function routeMessage(sender, text, mediaUrls = [], repliedSid = "") {
       return CUSTOMER_SERVICE_TEXT;
     default:
       if (looksLikeEventSubmission(trimmed, mediaUrls)) {
+        clearSession(sender);
         activeSubmissions.set(sender, []);
-        activeSubmissionImages.delete(sender);
-        imagesSentToModel.delete(sender);
-        lastExtractedEvent.delete(sender);
-        askedForClarification.delete(sender);
         saveState();
         const reply = await handleActiveSubmission(sender, text, mediaUrls);
         return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
@@ -823,6 +908,7 @@ if (require.main === module) {
   server.listen(PORT, () => console.log(`listening on ${PORT}`));
   setInterval(sweepStaleRateLimitEntries, RATE_LIMIT_SWEEP_INTERVAL_MS).unref();
   setInterval(sendPendingReminder, PENDING_REMINDER_INTERVAL_MS).unref();
+  setInterval(expireIdleSessions, IDLE_SWEEP_INTERVAL_MS).unref();
 }
 
 module.exports = {
@@ -835,5 +921,9 @@ module.exports = {
   get activeInquiryHistories() { return activeInquiryHistories; },
   get recentlyCompleted() { return recentlyCompleted; },
   get undeliveredAdminNotices() { return undeliveredAdminNotices; },
+  get adminMode() { return adminMode; },
+  get lastActivity() { return lastActivity; },
   rememberNotice,
+  expireIdleSessions,
+  IDLE_TIMEOUT_MS,
 };

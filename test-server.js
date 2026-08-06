@@ -6,7 +6,13 @@ process.env.NODE_ENV = "test"; // skip real Twilio calls (admin forwarding) duri
 const TEST_EVENTS_FILE = path.join(__dirname, "test-events.csv");
 process.env.EVENTS_FILE = TEST_EVENTS_FILE;
 
-const { routeMessage, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices } = require("./server");
+// Tests must never read or write the real state.json: a leaked flag (recentlyCompleted,
+// say) silently changes what the next run sees, and a test run would clobber live sessions.
+const TEST_STATE_FILE = path.join(__dirname, "test-state.json");
+process.env.STATE_FILE = TEST_STATE_FILE;
+if (fs.existsSync(TEST_STATE_FILE)) fs.unlinkSync(TEST_STATE_FILE);
+
+const { routeMessage, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -17,6 +23,32 @@ answerInquiryModule.answerInquiry = async (history, events) => {
   answerInquiryCalls.push({ history: history.map((m) => ({ ...m })), events });
   return `תשובה ${answerInquiryCalls.length}`;
 };
+
+// Stub the extractor too: the suite must run offline and deterministically, without
+// spending real OpenRouter calls. It parses the "field: value" shape the tests use and
+// merges across turns, which is the behaviour the routing logic actually depends on.
+const extractEventModule = require("./extract-event");
+const STUB_FIELD_LABELS = new Map([
+  ["שם האירוע", "event_name"], ["תאריך", "date"], ["שעה", "start_time"],
+  ["מיקום", "location"], ["קטגוריה", "category"], ["קישור", "contact_link"],
+]);
+
+function stubExtract(conversationText) {
+  const event = {
+    event_name: "", date: "", start_time: "", end_time: "", location: "",
+    category: "", price: "", organizer: "", contact_link: "", description: "",
+  };
+  for (const [label, key] of STUB_FIELD_LABELS) {
+    const match = conversationText.match(new RegExp(`${label}:\\s*(.+)`));
+    if (match) event[key] = match[1].trim();
+  }
+  const url = conversationText.match(/https?:\/\/\S+/);
+  if (url && !event.contact_link) event.contact_link = url[0];
+  Object.defineProperty(event, "_questions", { value: [], enumerable: false });
+  return event;
+}
+
+extractEventModule.extractEvent = async (conversationText) => stubExtract(conversationText);
 
 async function demo() {
   if (fs.existsSync(TEST_EVENTS_FILE)) fs.unlinkSync(TEST_EVENTS_FILE);
@@ -76,10 +108,12 @@ async function demo() {
   if (!activeSubmissions.has(longSender)) throw new Error("active submission should persist after a rejected long message");
 
   // Rate limit guard: 5 calls/minute allowed, the 6th within the window should be blocked.
+  // The draft is reopened each turn because an incomplete one now force-completes after a
+  // few attempts rather than looping forever - the limiter is what's under test here.
   const spamSender = "whatsapp:+972500000002";
-  await routeMessage(spamSender, "2");
   let sawRateLimit = false;
-  for (let i = 0; i < 6; i += 1) {
+  for (let i = 0; i < 8; i += 1) {
+    if (!activeSubmissions.has(spamSender)) await routeMessage(spamSender, "2");
     const reply = await routeMessage(spamSender, `הודעה מספר ${i}`);
     if (reply.includes("הרבה הודעות ברצף")) {
       sawRateLimit = true;
@@ -233,7 +267,6 @@ async function demo() {
   if (quietReply.includes("שאלה קטנה")) throw new Error("a confident draft should not ask anything");
   if (!quietReply.includes("קיבלנו את האירוע")) throw new Error("a confident complete draft should be accepted directly");
 
-  // Stav asked "why can't I just press 1" - bare/shortcut approval on the last notice.
   const server = require("./server");
   const eventsStore = require("./events-store");
 
@@ -248,37 +281,99 @@ async function demo() {
   // NODE_ENV=test skips the real send, so simulate the notice bookkeeping directly.
   server.rememberNotice("SMtest123", targetId);
 
-  const bareApprove = await routeMessage(ADMIN, "אשר");
-  if (!bareApprove.includes("אושר ופורסם")) throw new Error('bare "אשר" should approve the most recent event');
-  if (eventsStore.findEvent(TEST_EVENTS_FILE, targetId).status !== "published") {
-    throw new Error("bare approval should actually publish the event");
+  // REGRESSION (chat_history.txt:71-73): Stav replied a bare "דחה" to a reminder listing
+  // #3 and #5, and event #8 - approved one message earlier - was rejected instead. A bare
+  // command with no reply context must now refuse to act rather than guess a target.
+  const bareReject = await routeMessage(ADMIN, "דחה");
+  if (!bareReject.includes("לא ברור לאיזה אירוע")) {
+    throw new Error('bare "דחה" with no replied-to notice must ask which event, not guess');
+  }
+  if (eventsStore.findEvent(TEST_EVENTS_FILE, targetId).status !== "submitted") {
+    throw new Error("an ambiguous bare command must not change any event's status");
   }
 
-  // Replying to a specific notice targets that event even when it isn't the latest.
+  const bareApprove = await routeMessage(ADMIN, "אשר");
+  if (!bareApprove.includes("לא ברור לאיזה אירוע")) {
+    throw new Error('bare "אשר" with no replied-to notice must ask which event, not guess');
+  }
+  if (eventsStore.findEvent(TEST_EVENTS_FILE, targetId).status !== "submitted") {
+    throw new Error("an ambiguous bare approval must not publish anything");
+  }
+
+  // Replying to a specific notice is unambiguous, so it still works.
+  server.rememberNotice("SMnewer", "999"); // a newer notice must not steal the target
+  const repliedApprove = await routeMessage(ADMIN, "אשר", [], "SMtest123");
+  if (!repliedApprove.includes(`#${targetId}`)) throw new Error("replying to a notice should target that event");
+  if (eventsStore.findEvent(TEST_EVENTS_FILE, targetId).status !== "published") {
+    throw new Error("reply-based approval should publish the replied-to event");
+  }
+
+  // An explicit id is unambiguous too.
   await routeMessage(replySubmitter, "2");
   await routeMessage(replySubmitter, "ערב יין שני, 6.6, כניסה חופשית");
   const pending2 = eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.status === "submitted");
-  const olderId = pending2[pending2.length - 1].id;
-  server.rememberNotice("SMolder", olderId);
-  server.rememberNotice("SMnewer", "999"); // newest notice points elsewhere
-  const repliedApprove = await routeMessage(ADMIN, "אשר", [], "SMolder");
-  if (!repliedApprove.includes(`#${olderId}`)) throw new Error("replying to a notice should target that event, not the latest");
+  const explicitId = pending2[pending2.length - 1].id;
+  const explicitApprove = await routeMessage(ADMIN, `אשר ${explicitId}`);
+  if (!explicitApprove.includes("אושר ופורסם")) throw new Error('"אשר <id>" should approve the named event');
 
-  // The "1" shortcut behaves like אשר.
+  // REGRESSION (chat_history.txt:148-149): "2" meant the menu's "publish an event", but was
+  // read as the reject shortcut and silently rejected event #10. Digits must never act.
   await routeMessage(replySubmitter, "2");
   await routeMessage(replySubmitter, "ערב יין שלישי, 7.7, כניסה חופשית");
   const pending3 = eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.status === "submitted");
   const shortcutId = pending3[pending3.length - 1].id;
   server.rememberNotice("SMshortcut", shortcutId);
-  const shortcutApprove = await routeMessage(ADMIN, "1");
-  if (!shortcutApprove.includes("אושר ופורסם")) throw new Error('"1" should work as an approve shortcut');
 
-  // Regression: the admin must be able to submit events too, not have them eaten as commands.
-  const adminDraft = "ערב הופעות בשוק תלפיות, יום שישי 21:00, כניסה חופשית, https://example.com/gig";
-  const adminSubmits = await routeMessage(ADMIN, adminDraft);
-  if (adminSubmits.includes("פקודות ניהול")) {
-    throw new Error("an admin forwarding an event should not get the command help text");
+  const digitTwo = await routeMessage(ADMIN, "2");
+  if (digitTwo.includes("נדחה")) throw new Error('"2" must never reject an event');
+  if (eventsStore.findEvent(TEST_EVENTS_FILE, shortcutId).status !== "submitted") {
+    throw new Error('"2" must leave every event untouched');
   }
+  const digitOne = await routeMessage(ADMIN, "1");
+  if (digitOne.includes("אושר ופורסם")) throw new Error('"1" must never approve an event');
+
+  // Explicit role switching: the admin's number is also her QA number.
+  const toCustomer = await routeMessage(ADMIN, "לקוח");
+  if (!toCustomer.includes("מצב לקוח")) throw new Error('"לקוח" should switch to customer mode');
+  if (adminMode.get(ADMIN) !== "customer") throw new Error("customer mode should be recorded");
+
+  // In customer mode "2" means the menu option, and admin commands are inert.
+  const customerTwo = await routeMessage(ADMIN, "2");
+  if (!customerTwo.includes("שלחו את פרטי האירוע")) throw new Error('"2" in customer mode should open a submission');
+  if (!activeSubmissions.has(ADMIN)) throw new Error("customer-mode admin should get a real submission draft");
+
+  const adminDraft = "שם האירוע: ערב הופעות\nתאריך: 2099-09-09\nשעה: 21:00\nמיקום: שוק תלפיות\nקטגוריה: מוזיקה חיה\nקישור: https://example.com/gig";
+  const adminSubmits = await routeMessage(ADMIN, adminDraft);
+  if (adminSubmits.includes("פקודות ניהול")) throw new Error("a QA submission must not hit the admin handler");
+  if (!adminSubmits.includes("קיבלנו את האירוע")) throw new Error("a QA submission should be accepted like any other");
+
+  const backToAdmin = await routeMessage(ADMIN, "ניהול");
+  if (!backToAdmin.includes("מצב ניהול")) throw new Error('"ניהול" should switch back to admin mode');
+  const adminPending = await routeMessage(ADMIN, "ממתינים");
+  if (adminPending.includes("מה תרצו לעשות")) throw new Error("admin commands should work again after switching back");
+
+  // Idle expiry: an abandoned draft is forgotten rather than resumed 30+ minutes later.
+  const idleSender = "whatsapp:+972500000008";
+  await routeMessage(idleSender, "2");
+  if (!activeSubmissions.has(idleSender)) throw new Error("idle sender should start with an open draft");
+  lastActivity.set(idleSender, Date.now() - IDLE_TIMEOUT_MS - 1000);
+  const afterIdle = await routeMessage(idleSender, "שלום");
+  if (activeSubmissions.has(idleSender)) throw new Error("an idle draft should be discarded, not resumed");
+  if (!afterIdle.includes("מה תרצו לעשות")) throw new Error("a message after idle expiry should start fresh at the menu");
+
+  // A recent session must NOT be expired. Use an incomplete draft so the submission stays
+  // open across turns and it's the expiry sweep, not completion, that's being tested.
+  const activeSender = "whatsapp:+972500000009";
+  extractModule.extractEvent = async () => {
+    const draft = { ...completeDraft, event_name: "", date: "", contact_link: "" };
+    Object.defineProperty(draft, "_questions", { value: [], enumerable: false });
+    return draft;
+  };
+  await routeMessage(activeSender, "2");
+  const stillActive = await routeMessage(activeSender, "מסיבה בחיפה");
+  if (!activeSubmissions.has(activeSender)) throw new Error("a fresh session must not be expired");
+  if (stillActive.includes("מה תרצו לעשות")) throw new Error("an active draft should not be reset to the menu");
+  if (!stillActive.includes("חסרים עדיין פרטים")) throw new Error("an incomplete draft should ask for the missing fields");
 
   extractModule.extractEvent = realExtract;
 

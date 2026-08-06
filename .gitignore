@@ -2,4 +2,7 @@
 *.log
 events.csv
 state.json
+test-events.csv
+test-state.json
+corrections.json
 .claude/
