@@ -192,25 +192,38 @@ async function sendDueBoards(now = new Date()) {
 
 const PENDING_REMINDER_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
+// An event whose date has passed can't be published, so asking Stav to decide about it is
+// busywork - she was being nagged daily about #3 and #5 with no useful action available.
+// It closes itself instead.
+//
+// Status is "expired" rather than "rejected" so the record still says what happened: nobody
+// judged this event, it just ran out of time. The submitter is not notified either; from
+// their side nothing was decided, and a "your event was declined" message days after the
+// fact would be both confusing and slightly insulting.
+function expirePastEvents(events, today = todayIso()) {
+  const stale = events.filter((e) => e.status === "submitted" && e.date && e.date < today);
+  for (const event of stale) {
+    storeUpdateEvent(EVENTS_FILE, event.id, {
+      status: "expired",
+      notes: `${event.notes} | פג תוקף: התאריך עבר`.trim(),
+    });
+  }
+  return stale;
+}
+
 // Events don't chase themselves: without a nudge a submission can sit unreviewed until its
 // date passes (as #3 and #5 did). Re-send the pending list once a day until it's empty.
 async function sendPendingReminder() {
   if (process.env.NODE_ENV === "test") return;
+  expirePastEvents(loadEvents(EVENTS_FILE));
+
   const events = loadEvents(EVENTS_FILE);
   const pending = events.filter((e) => e.status === "submitted");
   if (!pending.length) return;
 
-  const today = todayIso();
-  const upcoming = pending.filter((e) => !e.date || e.date >= today);
-  const expired = pending.filter((e) => e.date && e.date < today);
-
   const lines = [`יש ${pending.length} אירועים שממתינים לאישור:`, ""];
-  for (const e of upcoming) {
+  for (const e of pending) {
     lines.push(`#${e.id} ${e.event_name} — ${e.date} ${e.start_time}`);
-  }
-  if (expired.length) {
-    lines.push("", "עברו כבר (אפשר לדחות):");
-    for (const e of expired) lines.push(`#${e.id} ${e.event_name} — ${e.date}`);
   }
   lines.push("", 'ענו על הודעת האירוע עם "אשר" או "דחה", או כתבו "אשר <מספר>".');
 
@@ -504,7 +517,11 @@ async function handleCorrectionCommand(match) {
 }
 
 function formatPendingList(events) {
-  const pending = events.filter((e) => e.status === "submitted");
+  const today = todayIso();
+  // Past-dated submissions are never worth showing: they can't be published, so listing
+  // them only invites a decision that has no effect. The daily sweep closes them; this
+  // filter keeps them out of the list in between sweeps.
+  const pending = events.filter((e) => e.status === "submitted" && (!e.date || e.date >= today));
   if (!pending.length) return "אין אירועים ממתינים כרגע.";
   return pending
     .map((e) => `#${e.id} ${e.event_name} — ${e.date} ${e.start_time}`)
@@ -549,6 +566,7 @@ async function handleAdminMessage(text, repliedSid = "") {
   const banner = missedNoticesBanner(loadEvents(EVENTS_FILE));
 
   if (trimmed === "ממתינים") {
+    expirePastEvents(loadEvents(EVENTS_FILE));
     return `${banner}${formatPendingList(loadEvents(EVENTS_FILE))}`;
   }
 
@@ -578,6 +596,12 @@ async function handleAdminMessage(text, repliedSid = "") {
     if (existing.status === "published") {
       return `אירוע #${id} כבר מאושר ומפורסם.`;
     }
+    // Expired events close themselves, so reaching one by explicit id is either a typo or
+    // a deliberate revival. Say what happened rather than silently publishing a past date;
+    // she can still correct the date with "תקן" and approve it then.
+    if (existing.status === "expired") {
+      return `אירוע #${id} "${existing.event_name}" כבר עבר (${existing.date}) ולכן נסגר אוטומטית.\nאם התאריך השתנה: תקן ${id} תאריך: <תאריך חדש> ואז אשר ${id}.`;
+    }
     storeUpdateEvent(EVENTS_FILE, id, { status: "published", published_at: todayIso() });
     if (existing.submitter) {
       await notifySubmitter(existing.submitter, `האירוע שלכם "${existing.event_name}" אושר ויפורסם 🎉`);
@@ -588,6 +612,11 @@ async function handleAdminMessage(text, repliedSid = "") {
   // action === "דחה"
   if (existing.status === "rejected") {
     return `אירוע #${id} כבר נדחה.`;
+  }
+  // Already closed by the date sweep. Rejecting it again would send the submitter a
+  // "declined" message for something nobody actually judged.
+  if (existing.status === "expired") {
+    return `אירוע #${id} כבר עבר (${existing.date}) ונסגר אוטומטית — אין צורך לדחות.`;
   }
   storeUpdateEvent(EVENTS_FILE, id, { status: "rejected", notes: `${existing.notes} | נדחה: ${reason}`.trim() });
   if (existing.submitter) {

@@ -62,7 +62,10 @@ async function demo() {
   if (!askReply.includes("שלחו את פרטי האירוע")) throw new Error("option 2 should ask for event details");
   if (!activeSubmissions.has(sender)) throw new Error("sender should have an active submission after choosing 2");
 
-  const eventText = "שם האירוע: מסיבת בדיקה\nתאריך: 2026-07-10\nשעה: 21:00\nמיקום: חיפה\nקטגוריה: מסיבה\nקישור: https://example.com";
+  // Dated relative to today: past-dated submissions now expire themselves, so a hardcoded
+  // date silently turns this into an expiry test the moment it slips into the past.
+  const futureDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const eventText = `שם האירוע: מסיבת בדיקה\nתאריך: ${futureDate}\nשעה: 21:00\nמיקום: חיפה\nקטגוריה: מסיבה\nקישור: https://example.com`;
   const submitReply = await routeMessage(sender, eventText);
   if (!submitReply.includes("קיבלנו את האירוע")) throw new Error("complete event should be accepted");
   if (activeSubmissions.has(sender)) throw new Error("active submission should be cleared after submission");
@@ -181,20 +184,25 @@ async function demo() {
 
   // Regression test for the silent-drop bug: when a review notice never reached the admin
   // (WhatsApp error 63016, outside the 24h window), her next message must surface it.
-  // Event #1 was submitted at the top of this run and is still "submitted".
-  undeliveredAdminNotices.add("1");
+  // The CSV is seeded from the bundled events.csv, so ids aren't predictable - find the
+  // event this run actually submitted rather than assuming it is #1.
+  const submittedNow = require("./events-store")
+    .loadEvents(TEST_EVENTS_FILE)
+    .filter((e) => e.status === "submitted");
+  const missedId = submittedNow[submittedNow.length - 1].id;
+  undeliveredAdminNotices.add(missedId);
   const adminWithMissed = await routeMessage(ADMIN, "ממתינים");
   if (!adminWithMissed.includes("לא הגיעה אליך")) {
     throw new Error("admin should be warned about review notices that were never delivered");
   }
-  if (!adminWithMissed.includes("#1")) {
+  if (!adminWithMissed.includes(`#${missedId}`)) {
     throw new Error("the missed-notice warning should name the undelivered event");
   }
 
   // Acting on the event clears the flag, so it isn't reported forever.
-  const adminApprove = await routeMessage(ADMIN, "אשר 1");
+  const adminApprove = await routeMessage(ADMIN, `אשר ${missedId}`);
   if (!adminApprove.includes("אושר ופורסם")) throw new Error("admin approval should publish the event");
-  if (undeliveredAdminNotices.has("1")) {
+  if (undeliveredAdminNotices.has(missedId)) {
     throw new Error("acting on an event should clear its missed-notice flag");
   }
   const adminAfterAction = await routeMessage(ADMIN, "ממתינים");
@@ -374,6 +382,35 @@ async function demo() {
   if (!activeSubmissions.has(activeSender)) throw new Error("a fresh session must not be expired");
   if (stillActive.includes("מה תרצו לעשות")) throw new Error("an active draft should not be reset to the menu");
   if (!stillActive.includes("חסרים עדיין פרטים")) throw new Error("an incomplete draft should ask for the missing fields");
+
+  // Past-dated submissions close themselves: Stav was being nagged daily about events
+  // (#3, #5) that could no longer be published whatever she decided.
+  const pastEvent = {
+    id: "", status: "submitted", event_name: "אירוע שעבר", date: "2020-01-01",
+    start_time: "20:00", location: "חיפה", category: "מסיבה", contact_link: "https://e.com",
+  };
+  const pastId = eventsStore.appendEvent(TEST_EVENTS_FILE, pastEvent, "test", "whatsapp:+972500000088", []);
+
+  const pendingAfterExpiry = await routeMessage(ADMIN, "ממתינים");
+  if (pendingAfterExpiry.includes(`#${pastId}`)) {
+    throw new Error("a past-dated event must not be listed as awaiting review");
+  }
+  if (eventsStore.findEvent(TEST_EVENTS_FILE, pastId).status !== "expired") {
+    throw new Error("a past-dated event should be closed automatically");
+  }
+  // "expired", not "rejected": nobody judged it, it just ran out of time.
+  if (eventsStore.findEvent(TEST_EVENTS_FILE, pastId).status === "rejected") {
+    throw new Error("expiry must be distinguishable from a real rejection");
+  }
+
+  // Reaching an expired event by explicit id explains itself instead of acting silently.
+  const approveExpired = await routeMessage(ADMIN, `אשר ${pastId}`);
+  if (!approveExpired.includes("כבר עבר")) throw new Error("approving an expired event should explain why it can't publish");
+  if (eventsStore.findEvent(TEST_EVENTS_FILE, pastId).status === "published") {
+    throw new Error("an expired event must never be published with a past date");
+  }
+  const rejectExpired = await routeMessage(ADMIN, `דחה ${pastId}`);
+  if (!rejectExpired.includes("נסגר אוטומטית")) throw new Error("rejecting an expired event should say it already closed");
 
   extractModule.extractEvent = realExtract;
 
