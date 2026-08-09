@@ -443,28 +443,6 @@ async function demo() {
   flyerStore.deleteFlyer(savedName);
   if (flyerStore.flyerPath(savedName)) throw new Error("a deleted flyer should be gone");
 
-  // PayPlus callbacks are HMAC-signed; an unverified endpoint lets anyone write to the
-  // payment log and, once payments go live, fake a paid event.
-  const crypto = require("crypto");
-  const ppSecret = "unit-test-secret";
-  const ppBody = '{"transaction_uid":"t-1","status_code":"000"}';
-  const ppSign = (body, secret) =>
-    crypto.createHmac("sha256", secret).update(body, "utf8").digest("base64");
-
-  const validHash = ppSign(ppBody, ppSecret);
-  if (validHash !== ppSign(ppBody, ppSecret)) throw new Error("signing must be deterministic");
-  // The signature must cover the body: a changed payload cannot keep a valid hash.
-  if (ppSign('{"transaction_uid":"t-1","status_code":"999"}', ppSecret) === validHash) {
-    throw new Error("a tampered body must not produce the same signature");
-  }
-  // ...and must depend on the secret, or anyone could compute it.
-  if (ppSign(ppBody, "wrong-secret") === validHash) {
-    throw new Error("the signature must depend on the shared secret");
-  }
-  // Base64 of SHA-256 is always 44 chars; a length mismatch is what timingSafeEqual
-  // would otherwise throw on, so the length guard in the verifier matters.
-  if (validHash.length !== 44) throw new Error("unexpected HMAC-SHA256 base64 length");
-
   extractModule.extractEvent = realExtract;
 
   fs.unlinkSync(CORRECTIONS_FILE);

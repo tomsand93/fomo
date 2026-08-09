@@ -1,5 +1,11 @@
 # PayPlus Setup
 
+> **Status: not implemented, not planned for now.** Paid publication was never
+> built — nothing creates payment links and no event ever reaches a paid status.
+> The `/webhook/payplus` endpoint existed but only logged callbacks, so it was
+> removed along with its settings rather than left as an unused open endpoint.
+> This document is kept as the design if the idea returns.
+
 ## Purpose
 
 Use PayPlus for paid event publication.
