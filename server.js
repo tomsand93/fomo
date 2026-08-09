@@ -22,6 +22,7 @@ const ADMIN_SENDER = `whatsapp:${ADMIN_PHONE}`;
 const STATE_FILE = process.env.STATE_FILE || path.join(path.dirname(path.resolve(EVENTS_FILE)), "state.json");
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "";
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const PAYPLUS_WEBHOOK_SECRET = process.env.PAYPLUS_WEBHOOK_SECRET || "";
 
 let activeSubmissions = new Map(); // sender -> array of message texts collected while drafting an event
 let activeSubmissionImages = new Map(); // sender -> array of image data URLs collected while drafting an event
@@ -1020,10 +1021,47 @@ async function routeMessage(sender, text, mediaUrls = [], repliedSid = "") {
   }
 }
 
-const PAYPLUS_LOG_FILE = "payplus-webhooks.log";
+// Colocated with the events file so the payment record lands on the mounted volume rather
+// than inside the container, where a deploy would discard it.
+const PAYPLUS_LOG_FILE =
+  process.env.PAYPLUS_LOG_FILE ||
+  path.join(path.dirname(path.resolve(EVENTS_FILE)), "payplus-webhooks.log");
 const PAYPLUS_LOG_MAX_BYTES = 5 * 1024 * 1024; // 5MB, rotate past this
 
+// PayPlus signs callbacks with HMAC-SHA256 (base64) over the request body, keyed by the
+// account's secret key, and sends it in a "hash" header alongside "user-agent: PayPlus".
+// https://docs.payplus.co.il/reference/validate-requests-received-from-payplus
+//
+// Their sample hashes JSON.stringify(parsedBody). We hash the raw body instead:
+// re-serializing can reorder keys or change number/unicode formatting, which silently
+// breaks the MAC. The raw bytes are what was actually signed.
+function isValidPayPlusSignature(req, body) {
+  if (!PAYPLUS_WEBHOOK_SECRET) {
+    console.error("PAYPLUS_WEBHOOK_SECRET is not set; rejecting PayPlus webhook request");
+    return false;
+  }
+
+  const signature = req.headers.hash;
+  if (!signature) return false;
+
+  const userAgent = String(req.headers["user-agent"] || "");
+  if (userAgent.toLowerCase() !== "payplus") return false;
+
+  const expected = crypto.createHmac("sha256", PAYPLUS_WEBHOOK_SECRET).update(body, "utf8").digest("base64");
+  const expectedBuf = Buffer.from(expected);
+  const signatureBuf = Buffer.from(String(signature));
+  if (expectedBuf.length !== signatureBuf.length) return false;
+  return crypto.timingSafeEqual(expectedBuf, signatureBuf);
+}
+
 function handlePayPlus(req, res, body) {
+  if (process.env.NODE_ENV !== "test" && !isValidPayPlusSignature(req, body)) {
+    console.error("rejected PayPlus webhook request: invalid or missing signature");
+    res.writeHead(403, { "Content-Type": "text/plain" });
+    res.end("forbidden");
+    return;
+  }
+
   fs.stat(PAYPLUS_LOG_FILE, (statErr, stats) => {
     const rotate = !statErr && stats.size > PAYPLUS_LOG_MAX_BYTES;
     const line = `${new Date().toISOString()} ${body}\n`;
