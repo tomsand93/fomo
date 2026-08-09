@@ -9,11 +9,15 @@ function requireEnv(name) {
   return value;
 }
 
-function sendWhatsApp(to, body) {
+// mediaUrl must be publicly reachable — Twilio fetches it itself, so a local path or a
+// base64 data URL will not work.
+function sendWhatsApp(to, body, mediaUrl = "") {
   const accountSid = requireEnv("TWILIO_ACCOUNT_SID");
   const authToken = requireEnv("TWILIO_AUTH_TOKEN");
   const from = requireEnv("TWILIO_WHATSAPP_FROM");
-  const payload = new URLSearchParams({ From: from, To: to, Body: body }).toString();
+  const fields = { From: from, To: to, Body: body };
+  if (mediaUrl) fields.MediaUrl = mediaUrl;
+  const payload = new URLSearchParams(fields).toString();
 
   return new Promise((resolve, reject) => {
     const req = https.request({

@@ -4,7 +4,7 @@ const path = require("path");
 const CSV_HEADERS = [
   "id", "status", "event_name", "date", "start_time", "end_time", "location",
   "category", "price", "organizer", "contact_link", "description", "source",
-  "published_at", "notes", "submitter",
+  "published_at", "notes", "submitter", "flyer",
 ];
 
 function csv(value) {
@@ -59,7 +59,9 @@ function migrateIfNeeded(filePath) {
   const rows = content.split(/\r?\n/).map(parseCsvLine);
   const headers = rows.shift();
 
-  if (headers.includes("id") && headers.includes("submitter")) return;
+  // Check every expected header, not just a couple: each new column added over time needs
+  // the rewrite below to run once, and keying on an older column silently skips it.
+  if (CSV_HEADERS.every((header) => headers.includes(header))) return;
 
   const events = rowsToEvents(rows, headers);
   const migrated = events.map((event, i) => ({
@@ -139,6 +141,7 @@ function appendEvent(filePath, event, source, sender, missing) {
     published_at: "",
     notes: [sender, missing.length ? `חסר: ${missing.join(", ")}` : ""].filter(Boolean).join(" | "),
     submitter: sender,
+    flyer: "",
   };
 
   events.push(row);

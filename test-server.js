@@ -12,6 +12,12 @@ const TEST_STATE_FILE = path.join(__dirname, "test-state.json");
 process.env.STATE_FILE = TEST_STATE_FILE;
 if (fs.existsSync(TEST_STATE_FILE)) fs.unlinkSync(TEST_STATE_FILE);
 
+// Flyers are real files, so give the suite its own directory rather than writing into
+// the one a running instance serves from.
+const TEST_FLYER_DIR = path.join(__dirname, "test-flyers");
+process.env.FLYER_DIR = TEST_FLYER_DIR;
+fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
+
 const { routeMessage, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
@@ -412,10 +418,36 @@ async function demo() {
   const rejectExpired = await routeMessage(ADMIN, `דחה ${pastId}`);
   if (!rejectExpired.includes("נסגר אוטומטית")) throw new Error("rejecting an expired event should say it already closed");
 
+  // Flyers: stored on disk for Twilio to fetch, then swept once the event date passes.
+  const flyerStore = require("./flyer-store");
+  const pngBytes = fs.readFileSync(path.join(__dirname, "file.jpg"));
+  const flyerDataUrl = `data:image/png;base64,${pngBytes.toString("base64")}`;
+
+  const savedName = flyerStore.saveFlyer(flyerDataUrl, "999");
+  if (!savedName) throw new Error("a valid image should be stored as a flyer");
+  if (!flyerStore.flyerPath(savedName)) throw new Error("a stored flyer should be readable back");
+  if (!fs.readFileSync(flyerStore.flyerPath(savedName)).equals(pngBytes)) {
+    throw new Error("a stored flyer must round-trip byte-for-byte");
+  }
+  // The name is content-addressed, so resending the same image must not pile up copies.
+  if (flyerStore.saveFlyer(flyerDataUrl, "999") !== savedName) {
+    throw new Error("the same image should resolve to the same stored flyer");
+  }
+  // The served name reaches flyerPath from the CSV, which a person edits by hand.
+  for (const bad of ["../events.csv", "..\\events.csv", "/etc/passwd", "nope.png"]) {
+    if (flyerStore.flyerPath(bad)) throw new Error(`flyerPath must refuse ${bad}`);
+  }
+  if (flyerStore.saveFlyer("data:text/html;base64,PHNjcmlwdD4=", "999")) {
+    throw new Error("a non-image upload must not be stored as a flyer");
+  }
+  flyerStore.deleteFlyer(savedName);
+  if (flyerStore.flyerPath(savedName)) throw new Error("a deleted flyer should be gone");
+
   extractModule.extractEvent = realExtract;
 
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
+  fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
   console.log("all tests passed");
 }
 

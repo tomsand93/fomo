@@ -4,5 +4,7 @@ events.csv
 state.json
 test-events.csv
 test-state.json
+test-flyers/
+flyers/
 corrections.json
 .claude/

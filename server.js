@@ -11,6 +11,7 @@ const { addCorrection, buildCorrectionGuidance } = require("./corrections-store"
 const answerInquiryModule = require("./answer-inquiry");
 const { sendWhatsApp, getMessageStatus } = require("./send-whatsapp");
 const { fetchMediaAsDataUrl } = require("./fetch-media");
+const { saveFlyer, flyerPath, contentTypeFor, deleteFlyer } = require("./flyer-store");
 
 const PORT = Number(process.env.PORT || 3000);
 const EVENTS_FILE = process.env.EVENTS_FILE || "events.csv";
@@ -234,7 +235,20 @@ function expirePastEvents(events, today = todayIso()) {
       notes: `${event.notes} | פג תוקף: התאריך עבר`.trim(),
     });
   }
+  sweepPastFlyers(events, today);
   return stale;
+}
+
+// A flyer is only useful while its event is still ahead, and these are megabyte-scale
+// files on a small volume. Once the date has passed, drop the image but keep the row —
+// the event's text stays in the history either way.
+function sweepPastFlyers(events, today = todayIso()) {
+  for (const event of events) {
+    if (!event.flyer || !event.date || event.date >= today) continue;
+    if (deleteFlyer(event.flyer)) {
+      storeUpdateEvent(EVENTS_FILE, event.id, { flyer: "" });
+    }
+  }
 }
 
 // Events don't chase themselves: without a nudge a submission can sit unreviewed until its
@@ -452,10 +466,30 @@ async function confirmAdminNotification(id, sid) {
   }
 }
 
-async function forwardEventToAdmin(id, event, sender, unresolved = []) {
+// Only the first image becomes the event's flyer: WhatsApp attaches one image per message,
+// and a submitter who sends several is almost always sending variants of the same poster.
+function persistFlyer(id, dataUrl) {
+  if (!dataUrl) return "";
+  const name = saveFlyer(dataUrl, id);
+  if (name) storeUpdateEvent(EVENTS_FILE, id, { flyer: name });
+  return name;
+}
+
+// Twilio fetches media itself, so the flyer needs an absolute URL it can reach. Without
+// PUBLIC_BASE_URL there is no such address and the message goes out as text.
+function flyerUrl(name) {
+  if (!name || !PUBLIC_BASE_URL) return "";
+  return `${PUBLIC_BASE_URL.replace(/\/$/, "")}/flyer/${encodeURIComponent(name)}`;
+}
+
+async function forwardEventToAdmin(id, event, sender, unresolved = [], flyer = "") {
   if (process.env.NODE_ENV === "test") return;
   try {
-    const result = await sendWhatsApp(ADMIN_SENDER, formatEventForReview(id, event, sender, unresolved));
+    const result = await sendWhatsApp(
+      ADMIN_SENDER,
+      formatEventForReview(id, event, sender, unresolved),
+      flyerUrl(flyer)
+    );
     rememberNotice(result.sid, id);
     // Assume undelivered until proven otherwise, so a crash mid-check fails safe (the event
     // still gets surfaced on Stav's next message) rather than silently disappearing.
@@ -466,6 +500,34 @@ async function forwardEventToAdmin(id, event, sender, unresolved = []) {
     console.error("failed to forward event to admin:", err);
     undeliveredAdminNotices.add(String(id));
     saveState();
+  }
+}
+
+// A ready-to-forward post for the group, in the same shape as the daily digest so the
+// group sees one consistent format however an event reaches it.
+function formatPublishedPost(event) {
+  const [, , month, day] = (event.date || "").match(/^(\d{4})-(\d{2})-(\d{2})$/) || [];
+  const when = day ? `📅 ${Number(day)}.${Number(month)}` : "";
+  return [
+    `${event.event_name}`,
+    "",
+    [when, event.start_time ? `🕗 ${event.start_time}` : ""].filter(Boolean).join(" | "),
+    event.location ? `📍 ${event.location}` : null,
+    event.price ? `💸 ${event.price}` : null,
+    event.contact_link ? `🔗 ${event.contact_link}` : null,
+  ].filter((line) => line !== null && line !== "").join("\n");
+}
+
+async function sendPublishedPost(id, event) {
+  if (process.env.NODE_ENV === "test") return;
+  const url = flyerUrl(event.flyer);
+  if (!url) {
+    console.error(`event #${id} has a flyer but PUBLIC_BASE_URL is unset; sending text only`);
+  }
+  try {
+    await sendWhatsApp(ADMIN_SENDER, formatPublishedPost(event), url);
+  } catch (err) {
+    console.error(`failed to send published post for event #${id}:`, err);
   }
 }
 
@@ -631,6 +693,13 @@ async function handleAdminMessage(text, repliedSid = "") {
     storeUpdateEvent(EVENTS_FILE, id, { status: "published", published_at: todayIso() });
     if (existing.submitter) {
       await notifySubmitter(existing.submitter, `האירוע שלכם "${existing.event_name}" אושר ויפורסם 🎉`);
+    }
+    // The API can't post into a normal WhatsApp group (channels.md), so send the finished
+    // post — flyer included — for her to forward. Without a flyer the daily digest already
+    // covers the text, so there's nothing extra worth sending.
+    if (existing.flyer) {
+      await sendPublishedPost(id, existing);
+      return `אירוע #${id} אושר ופורסם.\nשלחתי לך את הפוסט עם התמונה — אפשר להעביר לקבוצה.`;
     }
     return `אירוע #${id} אושר ופורסם.`;
   }
@@ -805,11 +874,13 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
     }
 
     const unresolvedMissing = [`חסרים פרטים שלא הצלחנו לקבל: ${missing.join(", ")}`];
+    const firstImage = images[0] || "";
     clearSession(sender);
     recentlyCompleted.add(sender);
     saveState();
     const { id } = appendEvent(event, "Twilio WhatsApp", sender);
-    await forwardEventToAdmin(id, event, sender, unresolvedMissing);
+    const flyer = persistFlyer(id, firstImage);
+    await forwardEventToAdmin(id, event, sender, unresolvedMissing, flyer);
     return "קיבלנו את האירוע והעברנו אותו לבדיקה. אם חסר פרט, נשלים אותו מולכם.";
   }
 
@@ -829,11 +900,14 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
 
   const unresolved = questions.length ? questions : [];
 
+  // Read the flyer before clearSession drops it.
+  const firstImage = images[0] || "";
   clearSession(sender);
   recentlyCompleted.add(sender);
   saveState();
   const { id } = appendEvent(event, "Twilio WhatsApp", sender);
-  await forwardEventToAdmin(id, event, sender, unresolved);
+  const flyer = persistFlyer(id, firstImage);
+  await forwardEventToAdmin(id, event, sender, unresolved, flyer);
   return "קיבלנו את האירוע. הוא נכנס לבדיקה לפני פרסום.";
 }
 
@@ -1000,6 +1074,24 @@ const server = http.createServer((req, res) => {
     const post = makeWeekly(loadEvents(EVENTS_FILE), board, fromDate);
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end(post);
+    return;
+  }
+
+  // Twilio fetches this URL to attach the flyer. Unguessable by content hash rather than
+  // authenticated, because Twilio's fetch carries no credentials of ours.
+  if (req.method === "GET" && url.pathname.startsWith("/flyer/")) {
+    const name = decodeURIComponent(url.pathname.slice("/flyer/".length));
+    const resolved = flyerPath(name);
+    if (!resolved) {
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("not found");
+      return;
+    }
+    res.writeHead(200, {
+      "Content-Type": contentTypeFor(name),
+      "Cache-Control": "public, max-age=86400",
+    });
+    fs.createReadStream(resolved).pipe(res);
     return;
   }
 
