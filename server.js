@@ -150,9 +150,11 @@ function isRateLimited(sender) {
 }
 
 // The two boards Stav publishes to the group: midweek on Sunday evening, weekend on
-// Thursday afternoon. Times are Israel local, but the server runs in UTC (Fly), so the
-// offset is applied explicitly rather than trusting the host clock's timezone.
-const ISRAEL_UTC_OFFSET_HOURS = 3; // IDT; Israel is UTC+2 in winter, so this drifts by an hour off-season
+// Thursday afternoon. Times are Israel local and the server runs in UTC (Fly), so the
+// conversion goes through the IANA zone rather than a fixed offset — Israel switches
+// between UTC+2 and UTC+3, and a hardcoded offset silently sends an hour off for half
+// the year.
+const ISRAEL_TZ = "Asia/Jerusalem";
 const BOARD_SCHEDULE = [
   { board: "midweek", day: 0, hour: 18 }, // Sunday 18:00
   { board: "weekend", day: 4, hour: 17 }, // Thursday 17:00
@@ -160,8 +162,32 @@ const BOARD_SCHEDULE = [
 const BOARD_CHECK_INTERVAL_MS = 15 * 60 * 1000;
 const sentBoards = new Set(); // `${board}:${date}` already sent, so a restart can't double-post
 
-function israelNow(now = new Date()) {
-  return new Date(now.getTime() + ISRAEL_UTC_OFFSET_HOURS * 60 * 60 * 1000);
+const WEEKDAY_INDEX = new Map([
+  ["Sun", 0], ["Mon", 1], ["Tue", 2], ["Wed", 3], ["Thu", 4], ["Fri", 5], ["Sat", 6],
+]);
+
+const israelParts = new Intl.DateTimeFormat("en-US", {
+  timeZone: ISRAEL_TZ,
+  weekday: "short",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  hour12: false,
+});
+
+// Israel-local wall-clock reading of an instant: { day, hour, date } where day is 0..6
+// (Sunday-first, matching BOARD_SCHEDULE) and date is the local YYYY-MM-DD.
+function israelClock(now = new Date()) {
+  const parts = Object.fromEntries(
+    israelParts.formatToParts(now).map((part) => [part.type, part.value])
+  );
+  return {
+    day: WEEKDAY_INDEX.get(parts.weekday),
+    // "24" appears at midnight in some ICU versions; normalise it to 0.
+    hour: Number(parts.hour) % 24,
+    date: `${parts.year}-${parts.month}-${parts.day}`,
+  };
 }
 
 // Fires within the hour the board is due. The sent-marker is keyed by date so a crash and
@@ -169,11 +195,11 @@ function israelNow(now = new Date()) {
 // skipped instead of firing late at an odd hour.
 async function sendDueBoards(now = new Date()) {
   if (process.env.NODE_ENV === "test") return;
-  const local = israelNow(now);
-  const localDate = local.toISOString().slice(0, 10);
+  const local = israelClock(now);
+  const localDate = local.date;
 
   for (const { board, day, hour } of BOARD_SCHEDULE) {
-    if (local.getUTCDay() !== day || local.getUTCHours() !== hour) continue;
+    if (local.day !== day || local.hour !== hour) continue;
     const key = `${board}:${localDate}`;
     if (sentBoards.has(key)) continue;
     sentBoards.add(key);

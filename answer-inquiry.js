@@ -1,7 +1,13 @@
 const { postJson } = require("./http-json");
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const MODEL = process.env.OPENROUTER_MODEL || "anthropic/claude-haiku-4.5";
+// This is the only place the bot writes Hebrew prose a customer reads, so it gets its own
+// model setting: the extractor fills fields (a small model does that fine), while sloppy
+// grammar here is visible to everyone in the group. Falls back to the shared setting.
+const MODEL =
+  process.env.OPENROUTER_INQUIRY_MODEL ||
+  process.env.OPENROUTER_MODEL ||
+  "anthropic/claude-sonnet-5";
 
 function callOpenRouter(messages) {
   return postJson({
