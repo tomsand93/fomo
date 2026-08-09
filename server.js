@@ -4,6 +4,7 @@ const path = require("path");
 const crypto = require("crypto");
 const { URLSearchParams } = require("url");
 const { loadEvents, makeDigest } = require("./make-digest");
+const { makeWeekly, BOARDS } = require("./make-weekly");
 const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent } = require("./events-store");
 const extractEventModule = require("./extract-event");
 const { addCorrection, buildCorrectionGuidance } = require("./corrections-store");
@@ -146,6 +147,47 @@ function isRateLimited(sender) {
   timestamps.push(now);
   llmCallTimestamps.set(sender, timestamps);
   return false;
+}
+
+// The two boards Stav publishes to the group: midweek on Sunday evening, weekend on
+// Thursday afternoon. Times are Israel local, but the server runs in UTC (Fly), so the
+// offset is applied explicitly rather than trusting the host clock's timezone.
+const ISRAEL_UTC_OFFSET_HOURS = 3; // IDT; Israel is UTC+2 in winter, so this drifts by an hour off-season
+const BOARD_SCHEDULE = [
+  { board: "midweek", day: 0, hour: 18 }, // Sunday 18:00
+  { board: "weekend", day: 4, hour: 17 }, // Thursday 17:00
+];
+const BOARD_CHECK_INTERVAL_MS = 15 * 60 * 1000;
+const sentBoards = new Set(); // `${board}:${date}` already sent, so a restart can't double-post
+
+function israelNow(now = new Date()) {
+  return new Date(now.getTime() + ISRAEL_UTC_OFFSET_HOURS * 60 * 60 * 1000);
+}
+
+// Fires within the hour the board is due. The sent-marker is keyed by date so a crash and
+// restart inside that window re-checks rather than re-sends, and a missed window is simply
+// skipped instead of firing late at an odd hour.
+async function sendDueBoards(now = new Date()) {
+  if (process.env.NODE_ENV === "test") return;
+  const local = israelNow(now);
+  const localDate = local.toISOString().slice(0, 10);
+
+  for (const { board, day, hour } of BOARD_SCHEDULE) {
+    if (local.getUTCDay() !== day || local.getUTCHours() !== hour) continue;
+    const key = `${board}:${localDate}`;
+    if (sentBoards.has(key)) continue;
+    sentBoards.add(key);
+
+    try {
+      const post = makeWeekly(loadEvents(EVENTS_FILE), board, localDate);
+      // Goes to Stav, not the group: WhatsApp's API can't post into a normal group
+      // (channels.md), so she forwards it — and gets to eyeball it first.
+      await sendWhatsApp(ADMIN_SENDER, post);
+    } catch (err) {
+      console.error(`failed to send ${board} board:`, err);
+      sentBoards.delete(key); // let the next check retry within the same window
+    }
+  }
 }
 
 const PENDING_REMINDER_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -892,6 +934,20 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === "GET" && url.pathname === "/weekly") {
+    const board = url.searchParams.get("board") || "midweek";
+    if (!BOARDS[board]) {
+      res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end(`unknown board "${board}". use one of: ${Object.keys(BOARDS).join(", ")}`);
+      return;
+    }
+    const fromDate = url.searchParams.get("date") || new Date().toISOString().slice(0, 10);
+    const post = makeWeekly(loadEvents(EVENTS_FILE), board, fromDate);
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    res.end(post);
+    return;
+  }
+
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("ok");
@@ -909,6 +965,7 @@ if (require.main === module) {
   setInterval(sweepStaleRateLimitEntries, RATE_LIMIT_SWEEP_INTERVAL_MS).unref();
   setInterval(sendPendingReminder, PENDING_REMINDER_INTERVAL_MS).unref();
   setInterval(expireIdleSessions, IDLE_SWEEP_INTERVAL_MS).unref();
+  setInterval(sendDueBoards, BOARD_CHECK_INTERVAL_MS).unref();
 }
 
 module.exports = {
