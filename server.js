@@ -378,6 +378,19 @@ function fieldIsValid(key, value) {
   return true;
 }
 
+// The extractor normalizes free entry to "כניסה חופשית", but it's an LLM writing free text
+// and submitters phrase it many ways, so match the family rather than that one literal.
+// "הופעת כובע" and "תרומה חופשית" are hat-passing shows: nothing to pay to get in.
+const FREE_ENTRY_RE = /(כניסה\s*(חופשית|חינם|ללא\s*תשלום|ללא\s*עלות)|חופשית|חינם|ללא\s*תשלום|ללא\s*עלות|הופעת\s*כובע|תרומה\s*חופשית|free\s*(entry|admission)?)/i;
+
+function isFreeEntry(event) {
+  return FREE_ENTRY_RE.test(String(event.price || ""));
+}
+
+// A paid event needs a link or contact — that's where people buy a ticket, so without it
+// the listing is useless. A free one has nothing to buy: "just show up" is the whole
+// instruction, and demanding a link traps submitters who have nothing to give (the ג'אם
+// שישי and הופעת כובע submissions in the transcript are exactly this shape).
 function missingFields(event) {
   const required = [
     ["event_name", "שם האירוע"],
@@ -385,8 +398,9 @@ function missingFields(event) {
     ["start_time", "שעה"],
     ["location", "מיקום"],
     ["category", "קטגוריה"],
-    ["contact_link", "קישור / איש קשר"],
   ];
+  if (!isFreeEntry(event)) required.push(["contact_link", "קישור / איש קשר"]);
+
   return required
     .filter(([key]) => !event[key] || !fieldIsValid(key, event[key]))
     .map(([, label]) => label);
@@ -413,7 +427,7 @@ function formatEventForReview(id, event, sender, unresolved = []) {
     `קטגוריה: ${event.category}`,
     event.price ? `מחיר: ${event.price}` : null,
     event.organizer ? `מארגן: ${event.organizer}` : null,
-    `קישור/איש קשר: ${event.contact_link}`,
+    event.contact_link ? `קישור/איש קשר: ${event.contact_link}` : null,
     event.description ? `תיאור: ${event.description}` : null,
     `נשלח מ: ${sender}`,
     uncertaintyNote || null,
@@ -898,7 +912,12 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
     return `כמעט סיימנו! רק שאלה קטנה:\n${list}\n\n(אפשר גם לכתוב "לא יודע" ונעביר לבדיקה כמו שזה)`;
   }
 
-  const unresolved = questions.length ? questions : [];
+  const unresolved = questions.length ? [...questions] : [];
+  // A free event is allowed through without a link, but say so on the review message:
+  // Stav should see that attendees have no way to ask a question before she publishes it.
+  if (!event.contact_link && isFreeEntry(event)) {
+    unresolved.push("אין קישור או איש קשר — אירוע חינמי");
+  }
 
   // Read the flyer before clearSession drops it.
   const firstImage = images[0] || "";

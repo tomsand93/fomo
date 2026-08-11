@@ -443,6 +443,30 @@ async function demo() {
   flyerStore.deleteFlyer(savedName);
   if (flyerStore.flyerPath(savedName)) throw new Error("a deleted flyer should be gone");
 
+  // A free event has nothing to buy, so a link or contact isn't required — demanding one
+  // trapped submitters who had nothing to give (the ג'אם שישי / הופעת כובע shape).
+  const { missingFields: mf } = require("./server");
+  const freeBase = {
+    event_name: "ג'אם", date: "2099-08-14", start_time: "12:00",
+    location: "חיפה", category: "מוזיקה חיה", contact_link: "",
+  };
+  const wantsLink = (price) => mf({ ...freeBase, price }).some((f) => f.includes("קישור"));
+
+  for (const price of ["כניסה חופשית", "הכניסה חופשית", "חינם", "ללא תשלום", "הופעת כובע", "תרומה חופשית", "free"]) {
+    if (wantsLink(price)) throw new Error(`a free event (${price}) must not require a link`);
+  }
+  // Paid events still need somewhere to buy a ticket.
+  for (const price of ["45 שח", "50 שח לפני 01:00 / 80 שח אחרי", "₪120"]) {
+    if (!wantsLink(price)) throw new Error(`a paid event (${price}) must still require a link`);
+  }
+  // An unknown price is not the same as free — it must not open the exemption.
+  if (!wantsLink("")) throw new Error("an unpriced event must still require a link");
+  // The exemption is scoped to contact_link; everything else stays required.
+  const stillMissing = mf({ ...freeBase, price: "כניסה חופשית", event_name: "", location: "" });
+  if (!stillMissing.includes("שם האירוע") || !stillMissing.includes("מיקום")) {
+    throw new Error("the free-entry exemption must not relax the other required fields");
+  }
+
   extractModule.extractEvent = realExtract;
 
   fs.unlinkSync(CORRECTIONS_FILE);
