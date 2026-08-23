@@ -9,12 +9,20 @@ function requireEnv(name) {
   return value;
 }
 
+// Twilio hands off media to a storage host, so the redirect has to be followed. The
+// credentials must not follow it: `auth` is the full account SID and auth token, and
+// anything but Twilio's own host receiving them is a total account compromise. Sent
+// only while the host is unchanged, dropped for good once it isn't.
 function get(url, auth, redirectsLeft) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, { headers: { Authorization: `Basic ${auth}` } }, (res) => {
+    const headers = auth ? { Authorization: `Basic ${auth}` } : {};
+    const req = https.get(url, { headers }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirectsLeft > 0) {
         res.resume();
-        resolve(get(res.headers.location, auth, redirectsLeft - 1));
+        // Location is allowed to be relative, so resolve it against the URL we just asked.
+        const target = new URL(res.headers.location, url);
+        const sameHost = target.host === new URL(url).host;
+        resolve(get(target.toString(), sameHost ? auth : "", redirectsLeft - 1));
         return;
       }
       if (res.statusCode < 200 || res.statusCode >= 300) {

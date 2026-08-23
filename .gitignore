@@ -8,3 +8,12 @@ test-flyers/
 flyers/
 corrections.json
 .claude/
+
+# Local scratch data pulled from real WhatsApp traffic: transcripts carry
+# third-party phone numbers and submitted media is user content. This repo is
+# public, so neither may ever be committed.
+chat_history.txt
+*.jpg
+*.jpeg
+*.png
+*.webp
