@@ -47,12 +47,14 @@ function windowFor(board, fromDate) {
   return days.map((_, i) => addDays(start, i));
 }
 
-// Name, time and link only. Stav asked for a summary, not a second copy of the daily
-// digest: the point of the board is scanning a whole stretch of days at a glance, and
-// location/price/description belong to the per-event daily post.
+// Name, time, location and link. Location earns its place because "where" is the first
+// thing someone scanning the week asks — without it the board is a list of names you
+// have to chase a link to act on. Price and description still belong to the per-event
+// daily post: the board is for scanning a stretch of days, not reading them.
 function eventLine(event) {
   const icon = icons[event.category] || "🎈";
   const parts = [`${icon} ${event.start_time} ${event.event_name}`];
+  if (event.location) parts.push(`   📍 ${event.location}`);
   if (event.contact_link) parts.push(`   ${event.contact_link}`);
   return parts.join("\n");
 }
@@ -90,7 +92,8 @@ function makeWeekly(events, board = "midweek", fromDate = new Date().toISOString
     lines.push("");
   }
 
-  lines.push("❤️ המלצה חמה: לשים את הקבוצה על שקט ולהכנס כשרוצים לעשות משהו בעיר ולא יודעים מה");
+  // The board ends on the last event. The standing "put the group on mute" recommendation
+  // was dropped: it repeated on every board and said nothing about this week.
   return lines.join("\n").trim();
 }
 

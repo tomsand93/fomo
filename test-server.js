@@ -568,6 +568,45 @@ async function demo() {
     throw new Error("admin-mode replies must not carry the customer-mode banner");
   }
 
+  // The weekly board carries the location, because "where" is the first thing someone
+  // scanning the week asks. An event without one must simply omit the line rather than
+  // print an empty marker. Neither the board nor the digest carries the standing
+  // "put the group on mute" recommendation any more.
+  const { makeWeekly } = require("./make-weekly");
+  const { makeDigest } = require("./make-digest");
+  const boardFile = path.join(__dirname, "test-board.csv");
+  if (fs.existsSync(boardFile)) fs.unlinkSync(boardFile);
+  fs.writeFileSync(boardFile, eventsStore.CSV_HEADERS.join(",") + "\n", "utf8");
+  const boardRows = [
+    { event_name: "עם מיקום", date: "2026-09-20", start_time: "21:00", location: "סילביה, החלוץ 27", category: "מוזיקה", contact_link: "https://x.co/1" },
+    { event_name: "בלי מיקום", date: "2026-09-21", start_time: "19:30", location: "", category: "קולנוע", contact_link: "https://x.co/2" },
+  ];
+  for (const r of boardRows) {
+    const rid = eventsStore.appendEvent(
+      boardFile,
+      { end_time: "", price: "", organizer: "", description: "", ...r },
+      "Twilio WhatsApp",
+      "whatsapp:+972500009999",
+      []
+    );
+    eventsStore.updateEvent(boardFile, rid, { status: "published" });
+  }
+  const boardEvents = eventsStore.loadEvents(boardFile);
+  const board = makeWeekly(boardEvents, "midweek", "2026-09-20");
+  if (!board.includes("📍 סילביה, החלוץ 27")) {
+    throw new Error("the weekly board must show the location of an event that has one");
+  }
+  if (board.includes("📍 \n") || board.includes("📍 המלצה")) {
+    throw new Error("an event without a location must omit the line, not print an empty marker");
+  }
+  if (board.includes("המלצה חמה")) {
+    throw new Error("the weekly board must not carry the standing recommendation any more");
+  }
+  if (makeDigest(boardEvents, "2026-09-20").includes("המלצה חמה")) {
+    throw new Error("the daily digest must not carry the standing recommendation any more");
+  }
+  fs.unlinkSync(boardFile);
+
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });

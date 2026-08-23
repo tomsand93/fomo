@@ -40,7 +40,8 @@ function makeDigest(events, targetDate) {
     lines.push(eventBlock(event), "");
   }
 
-  lines.push("❤️ המלצה חמה: לשים את הקבוצה על שקט ולהכנס כשרוצים לעשות משהו בעיר ולא יודעים מה");
+  // Ends on the last event, like the weekly boards: the standing "put the group on mute"
+  // recommendation repeated on every post and said nothing about that day.
   return lines.join("\n").trim();
 }
 
