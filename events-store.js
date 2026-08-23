@@ -36,6 +36,38 @@ function parseCsvLine(line) {
   return fields;
 }
 
+// Splitting the file on newlines before parsing quotes tears any field that contains one.
+// WhatsApp submissions are routinely multi-line, and csv() quotes those correctly on write,
+// so the round-trip silently shifted every column after the break: one event became two
+// rows, and the flyer name landed in a column nothing reads. Newlines are only row
+// separators outside quotes, so the split has to track quoting itself.
+function splitCsvRows(content) {
+  const rows = [];
+  let row = "";
+  let quoted = false;
+
+  for (let i = 0; i < content.length; i += 1) {
+    const char = content[i];
+    if (char === '"' && quoted && content[i + 1] === '"') {
+      row += '""';
+      i += 1;
+      continue;
+    }
+    if (char === '"') quoted = !quoted;
+
+    if (!quoted && (char === "\n" || char === "\r")) {
+      // Consume CRLF as a single separator.
+      if (char === "\r" && content[i + 1] === "\n") i += 1;
+      rows.push(row);
+      row = "";
+      continue;
+    }
+    row += char;
+  }
+  if (row !== "") rows.push(row);
+  return rows;
+}
+
 function rowsToEvents(rows, headers) {
   return rows.map((row) => Object.fromEntries(headers.map((header, i) => [header, row[i] || ""])));
 }
@@ -56,7 +88,7 @@ function extractSubmitterFromNotes(notes) {
 function migrateIfNeeded(filePath) {
   const content = fs.readFileSync(filePath, "utf8").trim();
   if (!content) return;
-  const rows = content.split(/\r?\n/).map(parseCsvLine);
+  const rows = splitCsvRows(content).map(parseCsvLine);
   const headers = rows.shift();
 
   // Check every expected header, not just a couple: each new column added over time needs
@@ -98,7 +130,7 @@ const eventsCache = new Map(); // filePath -> { mtimeMs, events }
 function parseEventsFile(filePath) {
   const content = fs.readFileSync(filePath, "utf8").trim();
   if (!content) return [];
-  const rows = content.split(/\r?\n/).map(parseCsvLine);
+  const rows = splitCsvRows(content).map(parseCsvLine);
   const headers = rows.shift();
   return rowsToEvents(rows, headers);
 }
