@@ -30,6 +30,7 @@ const lastExtractedEvent = new Map(); // sender -> last extracted event fields, 
 let activeInquiries = new Set(); // senders currently in the "ask about events" flow
 let activeInquiryHistories = new Map(); // sender -> [{ role, content }] conversation so far in inquiry mode
 let recentlyCompleted = new Set(); // senders whose last action was a completed submission, for a softer follow-up
+let lastSubmittedEventId = new Map(); // sender -> id of their most recent submission, so a follow-up correction can be attached to it
 let undeliveredAdminNotices = new Set(); // event ids whose review notice never reached the admin, surfaced on her next message
 let askedForClarification = new Set(); // senders already asked a clarifying question this submission, so we never ask twice
 let incompleteAttempts = new Map(); // sender -> consecutive turns still missing required fields, so a draft can't loop forever
@@ -53,6 +54,9 @@ function loadState() {
     activeInquiries = new Set(raw.activeInquiries || []);
     activeInquiryHistories = new Map(raw.activeInquiryHistories || []);
     recentlyCompleted = new Set(raw.recentlyCompleted || []);
+    lastSubmittedEventId = new Map(raw.lastSubmittedEventId || []);
+    sentBoards = new Set(raw.sentBoards || []);
+    pendingBoards = new Map(raw.pendingBoards || []);
     undeliveredAdminNotices = new Set(raw.undeliveredAdminNotices || []);
     askedForClarification = new Set(raw.askedForClarification || []);
     incompleteAttempts = new Map(raw.incompleteAttempts || []);
@@ -74,6 +78,12 @@ function writeStateNow() {
     activeInquiries: [...activeInquiries],
     activeInquiryHistories: [...activeInquiryHistories.entries()],
     recentlyCompleted: [...recentlyCompleted],
+    // Bounded like noticeSidToEventId: only a recent submission can still be amended,
+    // and this map is never cleared per-sender (clearSession deliberately keeps it).
+    lastSubmittedEventId: [...lastSubmittedEventId.entries()].slice(-50),
+    // Only the last few send-windows matter; older keys can never fire again.
+    sentBoards: [...sentBoards].slice(-20),
+    pendingBoards: [...pendingBoards.entries()].slice(-10),
     undeliveredAdminNotices: [...undeliveredAdminNotices],
     askedForClarification: [...askedForClarification],
     incompleteAttempts: [...incompleteAttempts.entries()],
@@ -161,7 +171,11 @@ const BOARD_SCHEDULE = [
   { board: "weekend", day: 4, hour: 17 }, // Thursday 17:00
 ];
 const BOARD_CHECK_INTERVAL_MS = 15 * 60 * 1000;
-const sentBoards = new Set(); // `${board}:${date}` already sent, so a restart can't double-post
+// Both are persisted: sentBoards was previously in-memory only, so a restart inside the
+// one-hour send window re-sent the board despite the comment promising otherwise — and Fly
+// suspends this machine when idle (auto_stop_machines), making restarts routine.
+let sentBoards = new Set(); // `${board}:${date}` already sent, so a restart can't double-post
+let pendingBoards = new Map(); // `${board}:${date}` -> post text that Twilio accepted but never delivered
 
 const WEEKDAY_INDEX = new Map([
   ["Sun", 0], ["Mon", 1], ["Tue", 2], ["Wed", 3], ["Thu", 4], ["Fri", 5], ["Sat", 6],
@@ -204,17 +218,60 @@ async function sendDueBoards(now = new Date()) {
     const key = `${board}:${localDate}`;
     if (sentBoards.has(key)) continue;
     sentBoards.add(key);
+    saveState();
 
     try {
       const post = makeWeekly(loadEvents(EVENTS_FILE), board, localDate);
       // Goes to Stav, not the group: WhatsApp's API can't post into a normal group
       // (channels.md), so she forwards it — and gets to eyeball it first.
-      await sendWhatsApp(ADMIN_SENDER, post);
+      const result = await sendWhatsApp(ADMIN_SENDER, post);
+      // A resolved send is not delivery: the boards fire on Sunday evening and Thursday
+      // afternoon, when Stav is usually not mid-conversation, so her 24h WhatsApp window
+      // is typically closed and Twilio drops the message with 63016. Every board between
+      // 16 Aug and 23 Aug 2026 was lost this way, silently. Hold it until confirmed.
+      pendingBoards.set(key, post);
+      saveState();
+      confirmBoardDelivery(key, result.sid);
     } catch (err) {
       console.error(`failed to send ${board} board:`, err);
       sentBoards.delete(key); // let the next check retry within the same window
+      saveState();
     }
   }
+}
+
+// Mirrors confirmAdminNotification: poll detached, and on a non-delivery leave the board
+// queued so the next message from Stav re-sends it inside her reopened window.
+async function confirmBoardDelivery(key, sid) {
+  try {
+    const status = await getMessageStatus(sid);
+    const outsideWindow = Number(status.error_code) === WHATSAPP_OUTSIDE_WINDOW_ERROR;
+    if (UNDELIVERED_STATUSES.has(status.status) || outsideWindow) {
+      console.error(
+        `${key} board was not delivered (status=${status.status}, error=${status.error_code}); queued for the next admin contact`
+      );
+      return;
+    }
+    pendingBoards.delete(key);
+    saveState();
+  } catch (err) {
+    console.error(`failed to confirm delivery of ${key} board:`, err);
+  }
+}
+
+// Re-sends any board that never reached Stav. Called when she messages the bot, which is
+// itself proof the 24h window is open again.
+async function flushPendingBoards() {
+  if (process.env.NODE_ENV === "test" || !pendingBoards.size) return;
+  for (const [key, post] of [...pendingBoards.entries()]) {
+    try {
+      await sendWhatsApp(ADMIN_SENDER, post);
+      pendingBoards.delete(key);
+    } catch (err) {
+      console.error(`failed to re-send ${key} board:`, err);
+    }
+  }
+  saveState();
 }
 
 const PENDING_REMINDER_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -346,14 +403,27 @@ const PRICE_PLACEHOLDER_TEXT = "מחיר הפרסום: יעודכן בקרוב, 
 
 const CUSTOMER_SERVICE_TEXT = "לשירות לקוחות פנו לסתיו: +972528762432";
 
-const FOLLOW_UP_AFTER_SUBMISSION_TEXT = `האירוע האחרון שלכם כבר נשלח לבדיקה, אין צורך לשלוח שוב.
+// Sent when the message after a submission is a genuine amendment ("actually it's
+// tomorrow"). The old copy told them the event "was already sent, no need to resend" and
+// dropped the text — a correction to a date or price was silently thrown away. Forward it
+// to Stav instead and say so, so the submitter knows their fix landed.
+const AMENDMENT_FORWARDED_TEXT = "העברנו את התוספת לסתיו, היא תעדכן את האירוע לפני הפרסום.";
 
-היי! מה תרצו לעשות?
+// A follow-up right after a submission is either a question about it ("when will this be
+// published?") or a correction to it ("actually it's tomorrow"). Only the correction
+// carries content Stav needs; a question is answered by the standing acknowledgement.
+// Questions are the narrower, more recognisable set, so detect those and treat the rest
+// as a correction — the failure mode that matters is dropping a fix, not forwarding one
+// question too many.
+const QUESTION_MARKERS = /[?？]|^(מתי|איפה|מה|האם|כמה|למה|איך|מי)\b/;
 
-1. לברר בנוגע לאירועים
-2. לפרסם אירוע
-3. לראות מחירון פרסום
-4. שירות לקוחות`;
+function looksLikeQuestion(text) {
+  return QUESTION_MARKERS.test(text.trim());
+}
+
+// No menu appended: the flag is cleared as this is sent, so the next message falls through
+// to the menu on its own. Including it here printed the menu twice in a row.
+const FOLLOW_UP_AFTER_SUBMISSION_TEXT = "האירוע האחרון שלכם כבר נשלח לבדיקה, אין צורך לשלוח שוב.";
 
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -517,6 +587,18 @@ async function forwardEventToAdmin(id, event, sender, unresolved = [], flyer = "
   }
 }
 
+// A correction the submitter sent right after their event. Goes to Stav as plain text
+// rather than being re-extracted: it's usually a fragment ("actually it's tomorrow") that
+// only means anything against the event it amends, and she's editing the row by hand anyway.
+async function forwardAmendmentToAdmin(id, text, sender) {
+  if (process.env.NODE_ENV === "test") return;
+  try {
+    await sendWhatsApp(ADMIN_SENDER, `✏️ תוספת לאירוע #${id}\nמאת: ${sender}\n\n${text}`);
+  } catch (err) {
+    console.error(`failed to forward amendment for event #${id}:`, err);
+  }
+}
+
 // A ready-to-forward post for the group, in the same shape as the daily digest so the
 // group sees one consistent format however an event reaches it.
 function formatPublishedPost(event) {
@@ -665,6 +747,9 @@ function missedNoticesBanner(events) {
 
 async function handleAdminMessage(text, repliedSid = "") {
   const trimmed = text.trim();
+  // Her message just reopened the 24h WhatsApp window, so any board Twilio dropped with
+  // 63016 can finally be delivered. Detached: a slow re-send must not delay her reply.
+  flushPendingBoards();
   const banner = missedNoticesBanner(loadEvents(EVENTS_FILE));
 
   if (trimmed === "ממתינים") {
@@ -893,6 +978,7 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
     recentlyCompleted.add(sender);
     saveState();
     const { id } = appendEvent(event, "Twilio WhatsApp", sender);
+    lastSubmittedEventId.set(sender, id);
     const flyer = persistFlyer(id, firstImage);
     await forwardEventToAdmin(id, event, sender, unresolvedMissing, flyer);
     return "קיבלנו את האירוע והעברנו אותו לבדיקה. אם חסר פרט, נשלים אותו מולכם.";
@@ -925,9 +1011,31 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
   recentlyCompleted.add(sender);
   saveState();
   const { id } = appendEvent(event, "Twilio WhatsApp", sender);
+  lastSubmittedEventId.set(sender, id);
   const flyer = persistFlyer(id, firstImage);
   await forwardEventToAdmin(id, event, sender, unresolved, flyer);
-  return "קיבלנו את האירוע. הוא נכנס לבדיקה לפני פרסום.";
+  return formatSubmissionReceipt(event, flyer);
+}
+
+// A bare "we got it" gave the submitter nothing to check against, so a misread date or
+// location only surfaced after publication — or never. Echo back what was actually
+// extracted: wrong fields are obvious at a glance, and the next message can correct them.
+function formatSubmissionReceipt(event, flyer = "") {
+  const [, , month, day] = (event.date || "").match(/^(\d{4})-(\d{2})-(\d{2})$/) || [];
+  const lines = [
+    "קיבלנו את האירוע! 🎉 הוא נכנס לבדיקה לפני פרסום.",
+    "",
+    "זה מה שקלטנו:",
+    event.event_name ? `📌 ${event.event_name}` : null,
+    day ? `📅 ${Number(day)}.${Number(month)}${event.start_time ? ` בשעה ${event.start_time}` : ""}` : null,
+    event.location ? `📍 ${event.location}` : null,
+    event.price ? `💸 ${event.price}` : null,
+    event.contact_link ? `🔗 ${event.contact_link}` : null,
+    flyer ? "🖼️ הפלייר צורף" : null,
+    "",
+    'משהו לא נכון? פשוט כתבו לנו כאן מה לתקן.',
+  ];
+  return lines.filter((line) => line !== null).join("\n");
 }
 
 const ADMIN_MODE_KEYWORDS = new Set(["ניהול", "admin"]);
@@ -1005,9 +1113,18 @@ async function routeMessage(sender, text, mediaUrls = [], repliedSid = "") {
   }
 
   if (recentlyCompleted.has(sender)) {
+    const lastId = lastSubmittedEventId.get(sender) || "";
     recentlyCompleted.delete(sender);
     saveState();
     if (trimmed !== "1" && trimmed !== "2" && trimmed !== "3" && trimmed !== "4") {
+      // The message right after a submission is usually about that submission, not a new
+      // one. Treating every such message as a duplicate discarded real corrections — a
+      // date fix ("תאמת שזה מחר") never reached Stav. Anything with content gets forwarded
+      // as an amendment; only an empty/media-only message falls back to the old notice.
+      if (lastId && trimmed && !looksLikeQuestion(trimmed)) {
+        await forwardAmendmentToAdmin(lastId, trimmed, sender);
+        return AMENDMENT_FORWARDED_TEXT;
+      }
       return FOLLOW_UP_AFTER_SUBMISSION_TEXT;
     }
   }

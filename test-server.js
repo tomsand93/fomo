@@ -469,6 +469,86 @@ async function demo() {
 
   extractModule.extractEvent = realExtract;
 
+  // REGRESSION (לילה לבן #2, 23/08/2026): a submitter sent an event, then "תאמת שזה מחר"
+  // to correct the date. The bot answered "already sent, no need to resend", dropped the
+  // correction, and printed the menu twice. Three separate faults, asserted here together
+  // because they only appear in this exact sequence.
+  const amendSender = "whatsapp:+972500007777";
+  await routeMessage(amendSender, "2");
+  const receipt = await routeMessage(
+    amendSender,
+    'שם האירוע: לילה לבן\nתאריך: 2026-09-20\nשעה: 18:00\nמיקום: חיפה\nקטגוריה: תרבות\nקישור: https://haifa.muni.il/x'
+  );
+
+  // The receipt must echo the captured fields: a bare "we got it" gave the submitter
+  // nothing to check, so a misread date only surfaced after publication.
+  if (!receipt.includes("לילה לבן")) throw new Error("receipt should echo the event name");
+  if (!receipt.includes("20.9")) throw new Error("receipt should echo the parsed date so a wrong one is visible");
+  if (!receipt.includes("18:00")) throw new Error("receipt should echo the start time");
+
+  // A correction must reach Stav, not be discarded as a duplicate submission.
+  const correction = await routeMessage(amendSender, "תאמת שזה מחר");
+  if (correction.includes("אין צורך לשלוח שוב")) {
+    throw new Error("a correction after submission must not be dismissed as a duplicate");
+  }
+  if (!correction.includes("העברנו")) throw new Error("a correction should be forwarded to the admin");
+
+  // ...and the menu must appear exactly once across the follow-up and the message after it.
+  if (correction.includes("1. לברר בנוגע לאירועים")) {
+    throw new Error("the follow-up reply must not append the menu (it printed twice)");
+  }
+  const afterCorrection = await routeMessage(amendSender, "אוקיי");
+  if (!afterCorrection.includes("1. לברר בנוגע לאירועים")) {
+    throw new Error("the message after a correction should fall through to the menu");
+  }
+
+  // A question is not a correction: it must keep the standing acknowledgement rather than
+  // forwarding noise to Stav.
+  await routeMessage(amendSender, "2");
+  await routeMessage(
+    amendSender,
+    'שם האירוע: בדיקת שאלה\nתאריך: 2026-09-21\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/1'
+  );
+  const question = await routeMessage(amendSender, "מתי זה יפורסם?");
+  if (!question.includes("כבר נשלח לבדיקה")) {
+    throw new Error("a question after submission should be acknowledged, not forwarded as an amendment");
+  }
+
+  // REGRESSION: a multi-line description (every real WhatsApp submission) was split on
+  // newlines before quotes were parsed, so one event became two rows and the flyer name
+  // landed in a column nothing reads.
+  const multiline = "שורה ראשונה\nשורה שנייה, עם פסיק\n\n🤍 MADONNA LILY על גג 21";
+  const before = eventsStore.loadEvents(TEST_EVENTS_FILE).length;
+  const mlId = eventsStore.appendEvent(
+    TEST_EVENTS_FILE,
+    { event_name: "רב-שורות", date: "2026-09-22", start_time: "21:00", end_time: "", location: "חיפה", category: "מוזיקה", price: "", organizer: "", contact_link: "https://x.co/2", description: multiline },
+    "Twilio WhatsApp",
+    "whatsapp:+972500008888",
+    []
+  );
+  eventsStore.updateEvent(TEST_EVENTS_FILE, mlId, { flyer: `${mlId}-abc123.jpg` });
+  const after = eventsStore.loadEvents(TEST_EVENTS_FILE);
+  if (after.length !== before + 1) {
+    throw new Error(`a multi-line description must stay one row (got ${after.length - before} rows)`);
+  }
+  const mlRow = after.find((e) => e.id === String(mlId));
+  if (mlRow.description !== multiline) throw new Error("a multi-line description must round-trip unchanged");
+  if (mlRow.flyer !== `${mlId}-abc123.jpg`) throw new Error("the flyer name must survive a multi-line description");
+  if (mlRow.submitter !== "whatsapp:+972500008888") throw new Error("columns after a multi-line field must not shift");
+
+  // REGRESSION: the weekly boards fire on Sunday 18:00 and Thursday 17:00, when Stav's 24h
+  // WhatsApp window is usually closed. Twilio accepted the send and reported 63016 without
+  // delivering, and the code treated a resolved promise as success — every board from
+  // 16 Aug to 23 Aug 2026 was lost silently. The board must be held until delivery is
+  // confirmed, and both board maps must survive a restart (Fly suspends the machine).
+  const stateAfter = JSON.parse(fs.readFileSync(TEST_STATE_FILE, "utf8"));
+  if (!("sentBoards" in stateAfter)) {
+    throw new Error("sentBoards must be persisted, or a restart re-sends the board");
+  }
+  if (!("pendingBoards" in stateAfter)) {
+    throw new Error("pendingBoards must be persisted, or an undelivered board is lost on restart");
+  }
+
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
