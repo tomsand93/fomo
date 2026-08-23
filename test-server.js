@@ -549,6 +549,25 @@ async function demo() {
     throw new Error("pendingBoards must be persisted, or an undelivered board is lost on restart");
   }
 
+  // Customer mode is sticky and survives restarts, so announcing it only at the switch left
+  // Stav guessing which mode she was in hours later — and a customer-mode reply to an admin
+  // command looks identical to a broken command. Every customer-mode reply must say so.
+  await routeMessage(ADMIN, "לקוח");
+  const inCustomerMode = await routeMessage(ADMIN, "3");
+  if (!inCustomerMode.includes("מצב לקוח")) {
+    throw new Error("every customer-mode reply must state the mode, not just the switch message");
+  }
+  const stillTagged = await routeMessage(ADMIN, "4");
+  if (!stillTagged.includes("מצב לקוח")) {
+    throw new Error("the customer-mode banner must persist across messages, not appear once");
+  }
+  // Back in admin mode the banner must not appear: it is the default and would be noise.
+  await routeMessage(ADMIN, "ניהול");
+  const backInAdmin = await routeMessage(ADMIN, "ממתינים");
+  if (backInAdmin.includes("מצב לקוח")) {
+    throw new Error("admin-mode replies must not carry the customer-mode banner");
+  }
+
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });

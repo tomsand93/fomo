@@ -1045,11 +1045,23 @@ const ADMIN_MODE_TEXT = `🛠 מצב ניהול. כתבו "לקוח" כדי לב
 
 ${ADMIN_HELP_TEXT}`;
 
+// Prefixed to every customer-mode reply, so the mode is never something she has to
+// remember from a switch that may have happened days and a restart ago.
+const CUSTOMER_MODE_BANNER = '👤 מצב לקוח (בדיקות) — כתבו "ניהול" כדי לחזור.';
+
 const CUSTOMER_MODE_TEXT = `👤 מצב לקוח (בדיקות) — פקודות הניהול כבויות. כתבו "ניהול" כדי לחזור.
 
 ${MENU_TEXT}`;
 
+// Wrapper so the customer-mode banner reaches every reply, whichever branch below produced
+// it, without threading a flag through each return.
 async function routeMessage(sender, text, mediaUrls = [], repliedSid = "") {
+  const state = { inCustomerModeReply: false };
+  const reply = await routeMessageInner(sender, text, mediaUrls, repliedSid, state);
+  return state.inCustomerModeReply ? `${CUSTOMER_MODE_BANNER}\n\n${reply}` : reply;
+}
+
+async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", state = {}) {
   const trimmed = text.trim();
   const lowerTrimmed = trimmed.toLowerCase();
 
@@ -1077,6 +1089,11 @@ async function routeMessage(sender, text, mediaUrls = [], repliedSid = "") {
     if (adminMode.get(sender) !== "customer") {
       return handleAdminMessage(text, repliedSid);
     }
+    // Customer mode is sticky and survives restarts, so announcing it only at the switch
+    // left her guessing hours later — and a silent customer-mode reply looks exactly like
+    // a broken admin command. Tag every reply while she is in the mode she opted into;
+    // admin mode is the default and needs no banner on each message.
+    state.inCustomerModeReply = true;
   }
 
   if (CANCEL_KEYWORDS.has(lowerTrimmed) || MENU_KEYWORDS.has(lowerTrimmed)) {
