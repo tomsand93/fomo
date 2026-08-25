@@ -536,25 +536,32 @@ function appendEvent(event, source, sender) {
   return { missing, id };
 }
 
+// What Stav approves is what the group gets, so the notice shows exactly that: the
+// board line and the daily message, rendered by the same two functions that produce
+// the real thing. It used to be a field dump — labelled name/date/time lines — which
+// meant a misparsed price or an awkward description only became visible after
+// publication, when the fix costs a correction and a re-send.
+//
+// The raw fields are gone deliberately: everything in them is visible in one of the
+// two previews, and repeating it made the message twice as long to read.
 function formatEventForReview(id, event, sender, unresolved = []) {
   // Surface anything the submitter couldn't clear up, so Stav reviews with the same
   // doubt the extractor had rather than trusting a silently guessed value.
   const uncertaintyNote = unresolved.length
-    ? `\n⚠️ לא הובהר: ${unresolved.join(" | ")}\n`
+    ? `⚠️ לא הובהר: ${unresolved.join(" | ")}`
     : "";
+
+  const links = { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) };
   return [
-    `אירוע חדש לבדיקה #${id}:`,
-    `שם: ${event.event_name}`,
-    `תאריך: ${event.date}`,
-    `שעה: ${event.start_time}${event.end_time ? ` - ${event.end_time}` : ""}`,
-    `מיקום: ${event.location}`,
-    `קטגוריה: ${event.category}`,
-    event.price ? `מחיר: ${event.price}` : null,
-    event.organizer ? `מארגן: ${event.organizer}` : null,
-    event.contact_link ? `קישור/איש קשר: ${event.contact_link}` : null,
-    event.description ? `תיאור: ${event.description}` : null,
+    `אירוע חדש לבדיקה #${id}`,
     `נשלח מ: ${sender}`,
     uncertaintyNote || null,
+    "",
+    "— כך זה ייראה בלוח השבועי —",
+    formatShort(event, links),
+    "",
+    "— כך זה ייראה בהודעה היומית —",
+    formatLong(event, links).text,
     "",
     `לאישור: אשר ${id}`,
     `לדחייה: דחה ${id} [סיבה]`,
@@ -715,9 +722,14 @@ function flyerUrl(name) {
 async function forwardEventToAdmin(id, event, sender, unresolved = [], flyer = "") {
   if (process.env.NODE_ENV === "test") return;
   try {
+    // Preview the stored row, not the extractor's object: the slug and flyer are
+    // written by appendEvent and persistFlyer, so only the row has them. Previewing
+    // the extractor's version would show Stav a different link from the one the group
+    // will actually receive.
+    const stored = storeFindEvent(EVENTS_FILE, id) || { ...event, flyer };
     const result = await sendWhatsApp(
       ADMIN_SENDER,
-      formatEventForReview(id, event, sender, unresolved),
+      formatEventForReview(id, stored, sender, unresolved),
       flyerUrl(flyer)
     );
     rememberNotice(result.sid, id);
@@ -1698,6 +1710,7 @@ module.exports = {
   server,
   shortLink,
   destinationFor,
+  formatEventForReview,
   // Pure, so the schedule and the choice list can be tested without sending anything.
   isDue,
   slotsDueAt,

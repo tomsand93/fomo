@@ -1,8 +1,13 @@
 # Next up
 
-## 1. Stav must preview both formats before approving
+## ~~1. Stav must preview both formats before approving~~ — DONE
 
-**Status: identified, not started.**
+Shipped. The review notice now renders the event twice, with the same two functions
+that produce the real output, under labels saying which is which. The stored row is
+previewed rather than the extractor's object, so the link Stav sees is the link the
+group gets. Worst case measured at 721 chars against WhatsApp's 1600 limit.
+
+<details><summary>original note</summary>
 
 `formatEventForReview` (`server.js:539`) sends a raw field dump — `שם: … תאריך: … שעה: …`.
 It is neither of the two formats the group actually sees, so Stav approves without ever
@@ -35,6 +40,8 @@ Both renderings already exist and are used everywhere else:
 
 **Test:** extend the review-notice assertions in `test-server.js` — the notice must
 contain the SHORT line, the LONG block, and still end with the approve/reject lines.
+
+</details>
 
 ## 2. Reword and submit `fomo_pending_events_reminder`
 

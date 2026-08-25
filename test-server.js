@@ -18,7 +18,7 @@ const TEST_FLYER_DIR = path.join(__dirname, "test-flyers");
 process.env.FLYER_DIR = TEST_FLYER_DIR;
 fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
 
-const { routeMessage, slotsDueAt, destinationFor, shortLink, publishDayOptions, goodbyeText, sendGoodbyes, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
+const { routeMessage, slotsDueAt, destinationFor, shortLink, formatEventForReview, publishDayOptions, goodbyeText, sendGoodbyes, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -861,6 +861,49 @@ async function demo() {
   }
   if (!typedDate.includes("נשלח אותו להודעה היומית")) {
     throw new Error("a typed date should be recorded as the chosen day");
+  }
+
+  // Stav approves what the group receives, so the review notice must show both
+  // renderings. It used to be a field dump, which meant a misparsed price or an
+  // awkward description only surfaced after publication.
+  const reviewEvent = {
+    event_name: "אירוע לבדיקה", date: "2026-10-20", start_time: "21:00", end_time: "23:00",
+    location: "סילביה, החלוץ 27", category: "מוזיקה חיה", price: "70 ₪",
+    organizer: "סילביה", contact_link: "https://x.co/rev", contact_person: "מאיה",
+    description: "ערב הופעות", flyer: "", slug: "rv12",
+  };
+  const notice = formatEventForReview(77, reviewEvent, "whatsapp:+972500009777", ["המחיר לא ברור"]);
+  if (!notice.includes("בלוח השבועי")) {
+    throw new Error("the review notice must label the weekly-board preview");
+  }
+  if (!notice.includes("בהודעה היומית")) {
+    throw new Error("the review notice must label the daily-message preview");
+  }
+  // The SHORT line joins with " · "; the LONG block has its own date line. Both being
+  // present is what proves two distinct renderings, not one repeated.
+  if (!notice.includes("📍 סילביה, החלוץ 27 · 🎟️ 70 ₪")) {
+    throw new Error("the review notice must contain the short board rendering");
+  }
+  if (!notice.includes("📅 20.10 · 🕗 21:00-23:00")) {
+    throw new Error("the review notice must contain the long daily rendering");
+  }
+  if (!notice.includes("👤 מאיה")) {
+    throw new Error("the long preview must show the contact person");
+  }
+  // The uncertainty note is why she reviews at all — it must survive the rewrite.
+  if (!notice.includes("לא הובהר")) {
+    throw new Error("the review notice must keep the uncertainty warning");
+  }
+  // Reply-to-approve depends on these lines being present and naming the id.
+  if (!notice.includes("אשר 77") || !notice.includes("דחה 77")) {
+    throw new Error("the review notice must keep the approve/reject instructions");
+  }
+  // WhatsApp truncates a body over 1600 chars, which would cut off those instructions.
+  const longDescription = formatEventForReview(
+    77, { ...reviewEvent, description: "א".repeat(600) }, "whatsapp:+972500009777", []
+  );
+  if (longDescription.length > 1600) {
+    throw new Error(`the review notice must fit in one message, got ${longDescription.length}`);
   }
 
   // Declining is an answer, not a failure to answer. Before this option existed, a
