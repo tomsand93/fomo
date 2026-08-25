@@ -3,10 +3,10 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { URLSearchParams } = require("url");
-const { loadEvents, makeDigest } = require("./make-digest");
+const { loadEvents, makeDigest, digestFlyerEvents } = require("./make-digest");
 const { israelClock, todayIso, addDays } = require("./clock");
 const { isFreeEntry, formatShort, formatLong } = require("./format-event");
-const { makeWeekly, BOARDS } = require("./make-weekly");
+const { makeWeekly } = require("./make-weekly");
 const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent } = require("./events-store");
 const extractEventModule = require("./extract-event");
 const { addCorrection, buildCorrectionGuidance } = require("./corrections-store");
@@ -158,53 +158,93 @@ function isRateLimited(sender) {
   return false;
 }
 
-// The two boards Stav publishes to the group: midweek on Sunday evening, weekend on
-// Thursday afternoon. Times are Israel local and the server runs in UTC (Fly), so the
-// conversion goes through the IANA zone rather than a fixed offset — Israel switches
-// between UTC+2 and UTC+3, and a hardcoded offset silently sends an hour off for half
-// the year.
-const BOARD_SCHEDULE = [
-  { board: "midweek", day: 0, hour: 18 }, // Sunday 18:00
-  { board: "weekend", day: 4, hour: 17 }, // Thursday 17:00
+// Stav forwards to the group at these Israel-local times, so the bot hands her the
+// material ten minutes earlier. Weekends get a midday slot as well, because that is
+// when the group actually plans a Friday or Saturday.
+const DAILY_SLOTS = [
+  { slot: "12:00", sendHour: 11, sendMinute: 50, days: [5, 6] },          // Fri, Sat
+  { slot: "18:00", sendHour: 17, sendMinute: 50, days: [0, 1, 2, 3, 4, 5, 6] },
 ];
-const BOARD_CHECK_INTERVAL_MS = 15 * 60 * 1000;
+const BOARD_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+// Wide enough that a machine waking late still sends. Fly suspends this app when idle
+// (auto_stop_machines), so timers do not fire on a fixed cadence — a machine waking at
+// 17:58 must still deliver, while one waking at 18:20 should skip rather than hand Stav
+// something she was meant to forward twenty minutes ago.
+const SEND_WINDOW_MINUTES = 15;
 // Both are persisted: sentBoards was previously in-memory only, so a restart inside the
-// one-hour send window re-sent the board despite the comment promising otherwise — and Fly
+// send window re-sent the board despite the comment promising otherwise — and Fly
 // suspends this machine when idle (auto_stop_machines), making restarts routine.
-let sentBoards = new Set(); // `${board}:${date}` already sent, so a restart can't double-post
-let pendingBoards = new Map(); // `${board}:${date}` -> post text that Twilio accepted but never delivered
+let sentBoards = new Set(); // `${date}:${slot}` already sent, so a restart can't double-post
+let pendingBoards = new Map(); // `${date}:${slot}` -> post text that Twilio accepted but never delivered
 
-// Fires within the hour the board is due. The sent-marker is keyed by date so a crash and
-// restart inside that window re-checks rather than re-sends, and a missed window is simply
-// skipped instead of firing late at an odd hour.
+// Matching an exact hour could not express a 17:50 send, and matching an exact minute
+// would miss whenever the interval tick landed a minute off. A window does both.
+function isDue(local, { sendHour, sendMinute }) {
+  const nowMinutes = local.hour * 60 + local.minute;
+  const dueMinutes = sendHour * 60 + sendMinute;
+  return nowMinutes >= dueMinutes && nowMinutes < dueMinutes + SEND_WINDOW_MINUTES;
+}
+
+function slotsDueAt(local) {
+  return DAILY_SLOTS.filter((entry) => entry.days.includes(local.day) && isDue(local, entry));
+}
+
+// One delivery per slot: today's events in full, then the rolling board for the days
+// still ahead. Flyers follow as separate messages because Twilio carries one image each.
+function buildSlotPost(events, localDate) {
+  const daily = makeDigest(events, localDate, { flyerUrl: (e) => flyerUrl(e.flyer) });
+  const board = makeWeekly(events, localDate);
+  return `${daily}\n\n———\n\n${board}`;
+}
+
 async function sendDueBoards(now = new Date()) {
   if (process.env.NODE_ENV === "test") return;
   const local = israelClock(now);
   const localDate = local.date;
 
-  for (const { board, day, hour } of BOARD_SCHEDULE) {
-    if (local.day !== day || local.hour !== hour) continue;
-    const key = `${board}:${localDate}`;
+  for (const { slot } of slotsDueAt(local)) {
+    const key = `${localDate}:${slot}`;
     if (sentBoards.has(key)) continue;
     sentBoards.add(key);
     saveState();
 
     try {
-      const post = makeWeekly(loadEvents(EVENTS_FILE), board, localDate);
+      const events = loadEvents(EVENTS_FILE);
+      const post = buildSlotPost(events, localDate);
       // Goes to Stav, not the group: WhatsApp's API can't post into a normal group
       // (channels.md), so she forwards it — and gets to eyeball it first.
       const result = await sendWhatsApp(ADMIN_SENDER, post);
-      // A resolved send is not delivery: the boards fire on Sunday evening and Thursday
-      // afternoon, when Stav is usually not mid-conversation, so her 24h WhatsApp window
-      // is typically closed and Twilio drops the message with 63016. Every board between
-      // 16 Aug and 23 Aug 2026 was lost this way, silently. Hold it until confirmed.
+      // A resolved send is not delivery: the slots fire when Stav is usually not
+      // mid-conversation, so her 24h WhatsApp window is typically closed and Twilio
+      // drops the message with 63016. Every board between 16 Aug and 23 Aug 2026 was
+      // lost this way, silently. Hold it until confirmed.
       pendingBoards.set(key, post);
       saveState();
       confirmBoardDelivery(key, result.sid);
+      await sendSlotFlyers(events, localDate);
     } catch (err) {
-      console.error(`failed to send ${board} board:`, err);
+      console.error(`failed to send the ${slot} message:`, err);
       sentBoards.delete(key); // let the next check retry within the same window
       saveState();
+    }
+  }
+}
+
+// Twilio attaches one image per message, so a day with several flyered events cannot be
+// a single send. The text already went out complete; these follow so Stav has the images
+// to forward alongside it. Capped, because a busy day should not become a photo album.
+const MAX_SLOT_FLYERS = 3;
+
+async function sendSlotFlyers(events, localDate) {
+  const flyered = digestFlyerEvents(events, localDate).slice(0, MAX_SLOT_FLYERS);
+  for (const event of flyered) {
+    const { text, mediaUrl } = formatLong(event, { flyerUrl: (e) => flyerUrl(e.flyer) });
+    if (!mediaUrl) continue;
+    try {
+      await sendWhatsApp(ADMIN_SENDER, text, mediaUrl);
+    } catch (err) {
+      // One failed image must not stop the rest, and the text has already landed.
+      console.error(`failed to send the flyer for event #${event.id}:`, err);
     }
   }
 }
@@ -753,10 +793,16 @@ async function handleAdminMessage(text, repliedSid = "") {
       await notifySubmitter(existing.submitter, `האירוע שלכם "${existing.event_name}" אושר ויפורסם 🎉`);
     }
     // The API can't post into a normal WhatsApp group (channels.md), so send the finished
-    // post — flyer included — for her to forward. Without a flyer the daily digest already
-    // covers the text, so there's nothing extra worth sending.
-    if (existing.flyer) {
-      await sendPublishedPost(id, existing);
+    // post for her to forward. An event happening today has missed its scheduled slot or
+    // is about to, so it goes out immediately and on its own — no publish time mentioned,
+    // because there isn't one to wait for.
+    const publishedEvent = storeFindEvent(EVENTS_FILE, id) || existing;
+    if (publishedEvent.date === todayIso()) {
+      await sendPublishedPost(id, publishedEvent);
+      return `אירוע #${id} אושר ופורסם.\nהאירוע היום — שלחתי לך אותו עכשיו, אפשר להעביר לקבוצה.`;
+    }
+    if (publishedEvent.flyer) {
+      await sendPublishedPost(id, publishedEvent);
       return `אירוע #${id} אושר ופורסם.\nשלחתי לך את הפוסט עם התמונה — אפשר להעביר לקבוצה.`;
     }
     return `אירוע #${id} אושר ופורסם.`;
@@ -1147,7 +1193,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === "GET" && url.pathname === "/digest") {
-    const targetDate = url.searchParams.get("date") || new Date().toISOString().slice(0, 10);
+    const targetDate = url.searchParams.get("date") || todayIso();
     const digest = makeDigest(loadEvents(EVENTS_FILE), targetDate);
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end(digest);
@@ -1155,14 +1201,10 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === "GET" && url.pathname === "/weekly") {
-    const board = url.searchParams.get("board") || "midweek";
-    if (!BOARDS[board]) {
-      res.writeHead(400, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end(`unknown board "${board}". use one of: ${Object.keys(BOARDS).join(", ")}`);
-      return;
-    }
-    const fromDate = url.searchParams.get("date") || new Date().toISOString().slice(0, 10);
-    const post = makeWeekly(loadEvents(EVENTS_FILE), board, fromDate);
+    // ?board= is gone with the two fixed boards, but old links still carry it; ignoring
+    // an unknown parameter beats a 400 for something that no longer means anything.
+    const fromDate = url.searchParams.get("date") || todayIso();
+    const post = makeWeekly(loadEvents(EVENTS_FILE), fromDate);
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end(post);
     return;
@@ -1219,6 +1261,11 @@ module.exports = {
   get adminMode() { return adminMode; },
   get lastActivity() { return lastActivity; },
   rememberNotice,
+  // Pure, so the schedule can be tested without sending anything.
+  isDue,
+  slotsDueAt,
+  DAILY_SLOTS,
+  SEND_WINDOW_MINUTES,
   expireIdleSessions,
   IDLE_TIMEOUT_MS,
 };

@@ -18,7 +18,7 @@ const TEST_FLYER_DIR = path.join(__dirname, "test-flyers");
 process.env.FLYER_DIR = TEST_FLYER_DIR;
 fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
 
-const { routeMessage, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
+const { routeMessage, slotsDueAt, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -592,7 +592,7 @@ async function demo() {
     eventsStore.updateEvent(boardFile, rid, { status: "published" });
   }
   const boardEvents = eventsStore.loadEvents(boardFile);
-  const board = makeWeekly(boardEvents, "midweek", "2026-09-20");
+  const board = makeWeekly(boardEvents, "2026-09-20");
   if (!board.includes("📍 סילביה, החלוץ 27")) {
     throw new Error("the weekly board must show the location of an event that has one");
   }
@@ -686,6 +686,69 @@ async function demo() {
     throw new Error("contact_person must round-trip through the CSV");
   }
   fs.unlinkSync(cpFile);
+
+  // --- Phase 2: rolling board and the daily slots ---
+  const weekly = require("./make-weekly");
+
+  // The board starts today and runs to Saturday. The old fixed boards snapped backward
+  // to their first day, so a board sent on Wednesday still led with Sunday — days the
+  // reader could no longer act on.
+  const windowCases = [
+    ["2026-08-23", 7], // Sunday
+    ["2026-08-26", 4], // Wednesday
+    ["2026-08-28", 2], // Friday
+    ["2026-08-29", 1], // Saturday
+  ];
+  for (const [from, expected] of windowCases) {
+    const win = weekly.rollingWindow(from);
+    if (win.length !== expected) {
+      throw new Error(`rollingWindow(${from}) should span ${expected} days, got ${win.length}`);
+    }
+    if (win[0] !== from) throw new Error(`rollingWindow(${from}) must start on that day`);
+  }
+  // Never rolls into next week: the title promises this week.
+  const satWindow = weekly.rollingWindow("2026-08-29");
+  if (satWindow[satWindow.length - 1] !== "2026-08-29") {
+    throw new Error("the rolling window must stop at Saturday, not continue into next week");
+  }
+  // On a one-day window "what's on this week" would be a lie.
+  if (!weekly.boardTitle(satWindow).includes("היום")) {
+    throw new Error("a single-day board must say today, not this week");
+  }
+  if (!weekly.boardTitle(weekly.rollingWindow("2026-08-23")).includes("השבוע")) {
+    throw new Error("a multi-day board must say this week");
+  }
+
+  const rollFile = path.join(__dirname, "test-roll.csv");
+  if (fs.existsSync(rollFile)) fs.unlinkSync(rollFile);
+  fs.writeFileSync(rollFile, eventsStore.CSV_HEADERS.join(",") + "\n", "utf8");
+  for (const [name, date] of [["אתמול", "2026-08-22"], ["מחרתיים", "2026-08-26"]]) {
+    const rid = eventsStore.appendEvent(
+      rollFile,
+      { event_name: name, date, start_time: "20:00", end_time: "", location: "חיפה",
+        category: "מוזיקה", price: "", organizer: "", contact_link: "", contact_person: "",
+        description: "" },
+      "Twilio WhatsApp", "whatsapp:+972500004321", []
+    );
+    eventsStore.updateEvent(rollFile, rid, { status: "published" });
+  }
+  const rolled = weekly.makeWeekly(eventsStore.loadEvents(rollFile), "2026-08-23");
+  if (rolled.includes("אתמול")) throw new Error("a past event must never appear on the board");
+  if (!rolled.includes("מחרתיים")) throw new Error("an upcoming event must appear on the board");
+  fs.unlinkSync(rollFile);
+
+  // Slots: weekdays 18:00, weekends also 12:00, sent 10 minutes prior. A window rather
+  // than an exact minute, because Fly suspends the machine and timers drift.
+  const slotsAt = (day, hour, minute) =>
+    slotsDueAt({ day, hour, minute }).map((s) => s.slot).join(",");
+  if (slotsAt(1, 17, 50) !== "18:00") throw new Error("Monday 17:50 must be due for the 18:00 slot");
+  if (slotsAt(1, 17, 49) !== "") throw new Error("Monday 17:49 must not be due yet");
+  if (slotsAt(1, 18, 4) !== "18:00") throw new Error("a late wake inside the window must still send");
+  if (slotsAt(1, 18, 6) !== "") throw new Error("past the window it must skip, not send late");
+  if (slotsAt(1, 11, 50) !== "") throw new Error("weekdays have no midday slot");
+  if (slotsAt(5, 11, 50) !== "12:00") throw new Error("Friday must have the midday slot");
+  if (slotsAt(6, 11, 50) !== "12:00") throw new Error("Saturday must have the midday slot");
+  if (slotsAt(6, 17, 50) !== "18:00") throw new Error("Saturday must also have the evening slot");
 
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);

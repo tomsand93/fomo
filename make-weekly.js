@@ -2,29 +2,23 @@ const { loadEvents } = require("./events-store");
 const { dayOfWeek, addDays, shortDate, todayIso, DAY_NAMES } = require("./clock");
 const { formatShort } = require("./format-event");
 
-// Two boards rather than one weekly post, because the group plans in two different
-// rhythms: what to do midweek, and what to do over the weekend.
-//   midweek - Sunday..Wednesday, published Sunday 18:00
-//   weekend - Thursday..Saturday, published Thursday 17:00
-const BOARDS = {
-  midweek: { label: 'אמצע"ש', days: [0, 1, 2, 3], title: "מה עושים השבוע בחיפה? 🎈" },
-  weekend: { label: 'סופ"ש', days: [4, 5, 6], title: "מה עושים בסופ״ש בחיפה? 🎈" },
-};
-
-// The window always starts on the board's first day. Running the midweek board on
-// Tuesday still yields that week's Sunday..Wednesday, so a late or re-run send covers
-// the same days the audience was promised rather than silently shifting.
-function windowFor(board, fromDate) {
-  const { days } = BOARDS[board];
-  const startDay = days[0];
-  const offset = (dayOfWeek(fromDate) - startDay + 7) % 7;
-  const start = addDays(fromDate, -offset);
-  return days.map((_, i) => addDays(start, i));
+// One rolling board, rebuilt every day, instead of two fixed ones. The old midweek
+// and weekend boards both snapped backward to their first day, so a board sent on
+// Tuesday still led with Sunday — days the reader can no longer act on. This window
+// starts today and runs to Saturday, so it only ever shows what is still ahead. It
+// deliberately does not roll into next week: the title promises this week.
+function rollingWindow(fromDate) {
+  const daysLeft = 6 - dayOfWeek(fromDate); // Saturday = 6
+  return Array.from({ length: daysLeft + 1 }, (_, i) => addDays(fromDate, i));
 }
 
-function makeWeekly(events, board = "midweek", fromDate = todayIso()) {
-  if (!BOARDS[board]) throw new Error(`unknown board: ${board}`);
-  const dates = windowFor(board, fromDate);
+function boardTitle(dates) {
+  // On Saturday the window is a single day, and "what's on this week" would be a lie.
+  return dates.length === 1 ? "מה עושים היום בחיפה? 🎈" : "מה עושים השבוע בחיפה? 🎈";
+}
+
+function makeWeekly(events, fromDate = todayIso()) {
+  const dates = rollingWindow(fromDate);
 
   const byDate = new Map(dates.map((date) => [date, []]));
   for (const event of events) {
@@ -37,8 +31,10 @@ function makeWeekly(events, board = "midweek", fromDate = todayIso()) {
     bucket.sort((a, b) => a.start_time.localeCompare(b.start_time));
   }
 
-  const range = `${shortDate(dates[0])}-${shortDate(dates[dates.length - 1])}`;
-  const lines = [BOARDS[board].title, "", `📅 ${range}`, ""];
+  const range = dates.length === 1
+    ? shortDate(dates[0])
+    : `${shortDate(dates[0])}-${shortDate(dates[dates.length - 1])}`;
+  const lines = [boardTitle(dates), "", `📅 ${range}`, ""];
 
   const total = [...byDate.values()].reduce((sum, bucket) => sum + bucket.length, 0);
   if (!total) {
@@ -60,10 +56,9 @@ function makeWeekly(events, board = "midweek", fromDate = todayIso()) {
   return lines.join("\n").trim();
 }
 
-module.exports = { makeWeekly, windowFor, BOARDS };
+module.exports = { makeWeekly, rollingWindow, boardTitle };
 
 if (require.main === module) {
-  const board = process.argv[2] || "midweek";
-  const fromDate = process.argv[3] || todayIso();
-  console.log(makeWeekly(loadEvents(process.env.EVENTS_FILE || "events.csv"), board, fromDate));
+  const fromDate = process.argv[2] || todayIso();
+  console.log(makeWeekly(loadEvents(process.env.EVENTS_FILE || "events.csv"), fromDate));
 }
