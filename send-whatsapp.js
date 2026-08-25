@@ -9,15 +9,14 @@ function requireEnv(name) {
   return value;
 }
 
-// mediaUrl must be publicly reachable — Twilio fetches it itself, so a local path or a
-// base64 data URL will not work.
-function sendWhatsApp(to, body, mediaUrl = "") {
+// Posts to the Messages endpoint. Shared so the interactive sender can reach the same
+// endpoint with different fields (ContentSid instead of Body) without a second copy of
+// the auth, timeout and error handling.
+function postForm(fields) {
   const accountSid = requireEnv("TWILIO_ACCOUNT_SID");
   const authToken = requireEnv("TWILIO_AUTH_TOKEN");
   const from = requireEnv("TWILIO_WHATSAPP_FROM");
-  const fields = { From: from, To: to, Body: body };
-  if (mediaUrl) fields.MediaUrl = mediaUrl;
-  const payload = new URLSearchParams(fields).toString();
+  const payload = new URLSearchParams({ From: from, ...fields }).toString();
 
   return new Promise((resolve, reject) => {
     const req = https.request({
@@ -46,6 +45,14 @@ function sendWhatsApp(to, body, mediaUrl = "") {
     });
     req.end(payload);
   });
+}
+
+// mediaUrl must be publicly reachable — Twilio fetches it itself, so a local path or a
+// base64 data URL will not work.
+function sendWhatsApp(to, body, mediaUrl = "") {
+  const fields = { To: to, Body: body };
+  if (mediaUrl) fields.MediaUrl = mediaUrl;
+  return postForm(fields);
 }
 
 // Twilio reports WhatsApp delivery failures (notably error 63016, "outside the 24h
@@ -98,4 +105,4 @@ async function getMessageStatus(sid) {
   return message;
 }
 
-module.exports = { sendWhatsApp, getMessageStatus };
+module.exports = { sendWhatsApp, getMessageStatus, postForm };

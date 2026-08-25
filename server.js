@@ -15,6 +15,7 @@ const { sendWhatsApp, getMessageStatus } = require("./send-whatsapp");
 const { fetchMediaAsDataUrl } = require("./fetch-media");
 const { saveFlyer, flyerPath, contentTypeFor, deleteFlyer } = require("./flyer-store");
 const { logClick, logInteraction, clickStats, pruneOlderThan } = require("./clicks-store");
+const { sendChoice, renderNumbered } = require("./send-interactive");
 
 const PORT = Number(process.env.PORT || 3000);
 const EVENTS_FILE = process.env.EVENTS_FILE || "events.csv";
@@ -180,6 +181,10 @@ const BOARD_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 // 17:58 must still deliver, while one waking at 18:20 should skip rather than hand Stav
 // something she was meant to forward twenty minutes ago.
 const SEND_WINDOW_MINUTES = 15;
+// The Content template this bot expects for the publish-day question. Registering it
+// and getting Meta to approve it is a Twilio task, not a code one; until that happens
+// the name resolves to nothing and the question renders as a numbered list.
+const PUBLISH_DAY_TEMPLATE = "fomo_publish_day";
 const LOG_RETENTION_DAYS = 90;
 const LOG_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // Both are persisted: sentBoards was previously in-memory only, so a restart inside the
@@ -792,8 +797,17 @@ async function notifyApproved(sender, id, event) {
   const options = publishDayOptions(event.date);
   awaitingDailyChoice.set(sender, { eventId: id, options, expectingDate: false });
   saveState();
-  lines.push("", publishChoiceText(event, options));
-  await notifySubmitter(sender, lines.join("\n"));
+
+  // Unlike the question asked at submission time — which is a webhook reply, and TwiML
+  // carries no buttons — this one is an outbound send, so it can be tappable. Falls back
+  // to the same numbered list whenever no approved template is available.
+  if (process.env.NODE_ENV === "test") return;
+  const prompt = `${lines.join("\n")}\n\n${publishChoicePrompt()}`;
+  try {
+    await sendChoice(sender, { text: prompt, options, template: PUBLISH_DAY_TEMPLATE });
+  } catch (err) {
+    console.error("failed to send the approval notice:", err);
+  }
 }
 
 const ADMIN_HELP_TEXT = `פקודות ניהול:
@@ -1088,7 +1102,11 @@ async function handleTwilio(req, res, body) {
   }
 
   const params = new URLSearchParams(body);
-  const text = params.get("Body") || "";
+  // A quick-reply tap arrives as ButtonPayload, not Body, and carries the button's id.
+  // Every button is built with its id set to the option's key — the same "1" or "2" a
+  // person would type — so from here down a tap and a typed digit are the same message
+  // and nothing else in the router has to know buttons exist.
+  const text = params.get("ButtonPayload") || params.get("Body") || "";
   const sender = params.get("From") || "";
   const mediaUrls = extractMediaUrls(params);
   // Present when the user replied to a specific WhatsApp message; lets a bare "אשר"
@@ -1263,8 +1281,6 @@ function formatSubmissionReceipt(event, flyer = "") {
 // 1..n with no gaps. The shape is deliberately {key, label, date}: a quick-reply
 // button carries exactly this, so switching from typed numbers to taps later is a
 // rendering change and nothing more.
-const OTHER_DATE_KEY = "אחר";
-
 function publishDayOptions(eventDate, today = todayIso()) {
   const candidates = [
     { label: "ביום האירוע", date: eventDate },
@@ -1296,14 +1312,20 @@ const PUBLISH_CHOICE_INTRO = `רוצים שנפרסם אותו גם בהודעה
 // Everything the submitter is told once their event is in: it is already on the
 // board, other people can find it by asking the bot, and here is the one decision
 // left. Requirement order matters — board first, then the question.
-function publishChoiceText(event, options) {
+//
+// Split from its options so the same copy can be a numbered list in a webhook reply
+// (TwiML carries no buttons) and tappable buttons in an outbound send.
+function publishChoicePrompt() {
   return [
     "📋 האירוע נכנס אוטומטית ללוח השבועי שלנו,",
     "וגם מי ששואל את הבוט על אירועים בעיר יגלה אותו.",
     "",
     PUBLISH_CHOICE_INTRO,
-    renderOptions(options),
   ].join("\n");
+}
+
+function publishChoiceText(event, options) {
+  return `${publishChoicePrompt()}\n${renderOptions(options)}`;
 }
 
 const NO_DAILY_TEXT = "אין בעיה — האירוע יופיע בלוח השבועי בלבד.";

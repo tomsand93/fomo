@@ -1009,6 +1009,104 @@ async function demo() {
     }
   }
 
+  // --- Phase 5: buttons when WhatsApp will render them, text when it won't ---
+  const interactive = require("./send-interactive");
+  const whatsappModule = require("./send-whatsapp");
+
+  const realPostForm = whatsappModule.postForm;
+  const posted = [];
+  whatsappModule.postForm = async (fields) => { posted.push(fields); return { sid: "SM_stub" }; };
+
+  const threeOptions = [
+    { key: "1", label: "ביום האירוע", date: "2026-09-20" },
+    { key: "2", label: "יום לפני", date: "2026-09-19" },
+    { key: "3", label: "תאריך אחר", date: null },
+  ];
+  const fiveOptions = [
+    ...threeOptions.slice(0, 2),
+    { key: "3", label: "שבוע לפני", date: "2026-09-13" },
+    { key: "4", label: "בהקדם האפשרי", date: "2026-08-25" },
+    { key: "5", label: "תאריך אחר", date: null },
+  ];
+
+  // The fallback must be byte-identical to the numbered list the router already sends,
+  // or the copy quietly forks into two versions that drift.
+  const rendered = interactive.renderNumbered("שאלה", threeOptions);
+  if (rendered !== `שאלה\n\n1. ביום האירוע\n2. יום לפני\n3. תאריך אחר`) {
+    throw new Error("renderNumbered must match the numbered list the bot already sends");
+  }
+
+  // With no approved template — which is the state today — every choice is plain text.
+  interactive._setApprovedTemplates(new Map());
+  await interactive.sendChoice("whatsapp:+972500001111", {
+    text: "שאלה", options: threeOptions, template: "fomo_publish_day",
+  });
+  if (!posted[0].Body || posted[0].ContentSid) {
+    throw new Error("without an approved template the choice must be sent as text");
+  }
+
+  // Once approved, the same call sends a template instead, with the body and each
+  // label as positional variables.
+  interactive._setApprovedTemplates(new Map([["fomo_publish_day", "HXquick"]]));
+  await interactive.sendChoice("whatsapp:+972500001111", {
+    text: "שאלה", options: threeOptions, template: "fomo_publish_day",
+  });
+  if (posted[1].ContentSid !== "HXquick") throw new Error("an approved template should be used");
+  const vars = JSON.parse(posted[1].ContentVariables);
+  if (vars["1"] !== "שאלה" || vars["2"] !== "ביום האירוע") {
+    throw new Error("the body and option labels must be passed as positional variables");
+  }
+
+  // WhatsApp shows at most three quick replies. More than that needs a list template,
+  // and without one the choice stays text rather than being sent unrenderable.
+  await interactive.sendChoice("whatsapp:+972500001111", {
+    text: "שאלה", options: fiveOptions, template: "fomo_publish_day",
+  });
+  if (posted[2].ContentSid) {
+    throw new Error("more than three options must not be sent as a quick-reply template");
+  }
+  interactive._setApprovedTemplates(new Map([
+    ["fomo_publish_day", "HXquick"], ["fomo_publish_day_list", "HXlist"],
+  ]));
+  await interactive.sendChoice("whatsapp:+972500001111", {
+    text: "שאלה", options: fiveOptions, template: "fomo_publish_day",
+  });
+  if (posted[3].ContentSid !== "HXlist") {
+    throw new Error("more than three options should use the list template when approved");
+  }
+
+  // A template failure must never cost the message.
+  whatsappModule.postForm = async (fields) => {
+    if (fields.ContentSid) throw new Error("simulated template failure");
+    posted.push(fields);
+    return { sid: "SM_stub" };
+  };
+  await interactive.sendChoice("whatsapp:+972500001111", {
+    text: "שאלה", options: threeOptions, template: "fomo_publish_day",
+  });
+  if (!posted[posted.length - 1].Body) {
+    throw new Error("a failed template send must fall back to text, not drop the message");
+  }
+  whatsappModule.postForm = realPostForm;
+
+  // Inbound: a button tap arrives as ButtonPayload rather than Body. Each button's id
+  // is the option's key, so a tap and a typed digit must reach the router identically.
+  const tapSender = "whatsapp:+972500001222";
+  await routeMessage(tapSender, "2");
+  await routeMessage(
+    tapSender,
+    'שם האירוע: בדיקת כפתור\nתאריך: 2026-10-05\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/5'
+  );
+  if (!awaitingPublishChoice.has(tapSender)) {
+    throw new Error("the publish-day question should be open before testing a tap");
+  }
+  // routeMessage is what handleTwilio calls once it has normalised ButtonPayload into
+  // text, so passing the key directly is the same path a tap takes.
+  const tapped = await routeMessage(tapSender, "1");
+  if (!tapped.includes("נשלח אותו להודעה היומית")) {
+    throw new Error("a button payload must be handled exactly like a typed number");
+  }
+
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
