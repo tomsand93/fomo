@@ -369,7 +369,7 @@ async function sendPendingReminder() {
   for (const e of pending) {
     lines.push(`#${e.id} ${e.event_name} — ${e.date} ${e.start_time}`);
   }
-  lines.push("", 'ענו על הודעת האירוע עם "אשר" או "דחה", או כתבו "אשר <מספר>".');
+  lines.push("", 'ענו על הודעת האירוע עם "אשר" או "דחה", או כתבו "אשר [מספר]".');
 
   try {
     // Deliberately not bound to an event id: a reply to a *list* has no single referent,
@@ -799,12 +799,12 @@ async function notifyApproved(sender, id, event) {
 const ADMIN_HELP_TEXT = `פקודות ניהול:
 הכי פשוט: ענו על הודעת האירוע עצמה עם "אשר" או "דחה"
 
-אשר <מספר> - לאשר ולפרסם אירוע
-דחה <מספר> [סיבה] - לדחות אירוע
+אשר [מספר] - לאשר ולפרסם אירוע
+דחה [מספר] [סיבה] - לדחות אירוע
 ממתינים - רשימת אירועים ממתינים לבדיקה
 צפיות - כמה צפיות יש לקישורים של האירועים
-צפיות <מספר> - פירוט לאירוע אחד
-תקן <מספר> <שדה>: <ערך> - לתקן פרט באירוע (הבוט ילמד מהתיקון)
+צפיות [מספר] - פירוט לאירוע אחד
+תקן [מספר] [שדה]: [ערך] - לתקן פרט באירוע (הבוט ילמד מהתיקון)
 
 שדות לתיקון: שם, תאריך, שעה, שעת סיום, מיקום, קטגוריה, מחיר, מארגן, קישור, איש קשר, תיאור
 לדוגמה: תקן 6 מחיר: כניסה חופשית
@@ -938,7 +938,7 @@ function formatViewStats(idArg) {
     "📈 צפיות בקישורים:",
     ...ranked.map((row) => `#${row.event.id} ${row.event.event_name} — ${row.stats.total}`),
     "",
-    'לפירוט על אירוע: צפיות <מספר>',
+    'לפירוט על אירוע: צפיות [מספר]',
   ].join("\n");
 }
 
@@ -970,7 +970,7 @@ async function handleAdminMessage(text, repliedSid = "") {
   const [, action, explicitId, reason] = match;
   const id = resolveEventId(explicitId, repliedSid);
   if (!id) {
-    return `${banner}לא ברור לאיזה אירוע הכוונה — לא שיניתי כלום.\nענו על הודעת האירוע עם "${action}", או כתבו "${action} <מספר>".\n\n${formatPendingList(loadEvents(EVENTS_FILE))}`;
+    return `${banner}לא ברור לאיזה אירוע הכוונה — לא שיניתי כלום.\nענו על הודעת האירוע עם "${action}", או כתבו "${action} [מספר]".\n\n${formatPendingList(loadEvents(EVENTS_FILE))}`;
   }
 
   const existing = storeFindEvent(EVENTS_FILE, id);
@@ -989,7 +989,7 @@ async function handleAdminMessage(text, repliedSid = "") {
     // a deliberate revival. Say what happened rather than silently publishing a past date;
     // she can still correct the date with "תקן" and approve it then.
     if (existing.status === "expired") {
-      return `אירוע #${id} "${existing.event_name}" כבר עבר (${existing.date}) ולכן נסגר אוטומטית.\nאם התאריך השתנה: תקן ${id} תאריך: <תאריך חדש> ואז אשר ${id}.`;
+      return `אירוע #${id} "${existing.event_name}" כבר עבר (${existing.date}) ולכן נסגר אוטומטית.\nאם התאריך השתנה: תקן ${id} תאריך: [תאריך חדש] ואז אשר ${id}.`;
     }
     storeUpdateEvent(EVENTS_FILE, id, { status: "published", published_at: todayIso() });
     if (existing.submitter) {

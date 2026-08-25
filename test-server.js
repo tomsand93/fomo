@@ -995,6 +995,20 @@ async function demo() {
   if (urlRow.slug === plainRow.slug) throw new Error("two events must not share a slug");
   fs.unlinkSync(linkFile);
 
+  // Replies are XML-escaped into TwiML, which is correct, but that turns a literal
+  // <מספר> in the copy into "&lt;מספר&gt;" on the reader's phone. Placeholders use
+  // square brackets so they survive the escaping.
+  const bracketProbes = [
+    await routeMessage(ADMIN, "ניהול"),
+    await routeMessage(ADMIN, "צפיות"),
+    await routeMessage(ADMIN, "אשר"),
+  ];
+  for (const probe of bracketProbes) {
+    if (/<[א-ת]/.test(probe)) {
+      throw new Error(`admin copy must not contain angle-bracket placeholders: ${probe.slice(0, 60)}`);
+    }
+  }
+
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
