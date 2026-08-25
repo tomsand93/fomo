@@ -1281,6 +1281,10 @@ function formatSubmissionReceipt(event, flyer = "") {
 // 1..n with no gaps. The shape is deliberately {key, label, date}: a quick-reply
 // button carries exactly this, so switching from typed numbers to taps later is a
 // rendering change and nothing more.
+// Distinguishes "no daily message" from "a date I haven't given you yet" (null). Both
+// are non-dates, so they need to be told apart where the answer is handled.
+const DECLINE_DAILY = "decline";
+
 function publishDayOptions(eventDate, today = todayIso()) {
   const candidates = [
     { label: "ביום האירוע", date: eventDate },
@@ -1300,6 +1304,11 @@ function publishDayOptions(eventDate, today = todayIso()) {
 
   const options = unique.map((option, i) => ({ ...option, key: String(i + 1) }));
   options.push({ key: String(options.length + 1), label: "תאריך אחר", date: null });
+  // Declining has to be one of the choices. Without it every option picked a date, so a
+  // submitter who only wanted the weekly board could not say so: anything that was not
+  // an option key just re-asked the question, and ignoring it left the draft to expire
+  // half an hour later. "No" is an answer, not a failure to answer.
+  options.push({ key: String(options.length + 1), label: "לא, רק בלוח השבועי", date: DECLINE_DAILY });
   return options;
 }
 
@@ -1374,6 +1383,16 @@ function handleDayChoice(sender, trimmed, map) {
     // Not a menu key. Rather than scold, re-show the options — a submitter who
     // typed a sentence here is answering the question, just not in the shape asked.
     return `${PUBLISH_CHOICE_INTRO}\n${renderOptions(pending.options)}`;
+  }
+
+  if (chosen.date === DECLINE_DAILY) {
+    // Recorded rather than left empty. Empty means "not asked yet", and the question is
+    // asked a second time after approval — so without a marker, someone who declined at
+    // submission would be asked the same thing again days later.
+    storeUpdateEvent(EVENTS_FILE, pending.eventId, { daily_days: DECLINE_DAILY });
+    map.delete(sender);
+    saveState();
+    return NO_DAILY_TEXT;
   }
 
   if (chosen.date === null) {

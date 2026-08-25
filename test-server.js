@@ -792,8 +792,14 @@ async function demo() {
         throw new Error(`option keys must be contiguous 1..n, got ${option.key} at index ${i}`);
       }
     });
-    if (options[options.length - 1].date !== null) {
-      throw new Error('the last option must be the free-form "another date"');
+    // The two escape hatches always come last, in this order: type a date, or decline
+    // outright. Declining must be offered — without it a submitter who only wants the
+    // weekly board has no way to say so.
+    if (options[options.length - 2].date !== null) {
+      throw new Error('the second-to-last option must be the free-form "another date"');
+    }
+    if (options[options.length - 1].date !== "decline") {
+      throw new Error("the last option must be declining the daily message");
     }
     // A date the submitter cannot act on is worse than one fewer choice.
     for (const option of options) {
@@ -845,7 +851,9 @@ async function demo() {
     dateAnswerSender,
     'שם האירוע: בדיקת סדר\nתאריך: 2026-09-28\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/6'
   );
-  const lastKey = String(awaitingPublishChoice.get(dateAnswerSender).options.length);
+  // Pick by intent, not position: the option list gained a decline entry at the end.
+  const lastKey = awaitingPublishChoice.get(dateAnswerSender).options
+    .find((o) => o.date === null).key;
   await routeMessage(dateAnswerSender, lastKey); // choose "another date"
   const typedDate = await routeMessage(dateAnswerSender, "2026-09-27");
   if (typedDate.includes("העברנו")) {
@@ -855,6 +863,32 @@ async function demo() {
     throw new Error("a typed date should be recorded as the chosen day");
   }
 
+  // Declining is an answer, not a failure to answer. Before this option existed, a
+  // submitter who only wanted the weekly board had no way to say so: a non-matching
+  // reply just re-asked, and ignoring it let the question expire silently.
+  const declineSender = "whatsapp:+972500009666";
+  await routeMessage(declineSender, "2");
+  await routeMessage(
+    declineSender,
+    'שם האירוע: בדיקת סירוב\nתאריך: 2026-09-29\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/4'
+  );
+  const declineKey = awaitingPublishChoice.get(declineSender).options
+    .find((o) => o.date === "decline").key;
+  const declined = await routeMessage(declineSender, declineKey);
+  if (!declined.includes("בלוח השבועי בלבד")) {
+    throw new Error("declining should confirm the event stays on the weekly board only");
+  }
+  if (awaitingPublishChoice.has(declineSender)) {
+    throw new Error("declining should close the question");
+  }
+  // Recorded, not left empty: empty means "not asked yet", and the question is asked
+  // again after approval, so a decline must be remembered or it gets re-asked.
+  const declinedRow = eventsStore.loadEvents(TEST_EVENTS_FILE)
+    .find((e) => e.event_name === "בדיקת סירוב");
+  if (declinedRow.daily_days !== "decline") {
+    throw new Error(`declining must be recorded, got ${JSON.stringify(declinedRow.daily_days)}`);
+  }
+
   // "Another date" asks for a date and validates it rather than spending an LLM call.
   const otherSender = "whatsapp:+972500009222";
   await routeMessage(otherSender, "2");
@@ -862,7 +896,8 @@ async function demo() {
     otherSender,
     'שם האירוע: בדיקת תאריך\nתאריך: 2026-09-26\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/8'
   );
-  const otherKey = String(awaitingPublishChoice.get(otherSender).options.length);
+  const otherKey = awaitingPublishChoice.get(otherSender).options
+    .find((o) => o.date === null).key;
   const askedDate = await routeMessage(otherSender, otherKey);
   if (!askedDate.includes("איזה תאריך")) throw new Error('"another date" should ask for a date');
   if (!(await routeMessage(otherSender, "לא תאריך")).includes("איזה תאריך")) {

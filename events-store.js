@@ -8,7 +8,9 @@ const path = require("path");
 //                    because the long format shows both
 //   slug           - this event's short-link id, stable from submission onward
 //   daily_days     - comma-separated YYYY-MM-DD the submitter chose for the group
-//                    message; empty means board-only
+//                    message. Empty means they have not been asked yet; the literal
+//                    "decline" means they were asked and said no, which is why the two
+//                    are not the same value
 const CSV_HEADERS = [
   "id", "status", "event_name", "date", "start_time", "end_time", "location",
   "category", "price", "organizer", "contact_link", "contact_person", "description",
