@@ -1,4 +1,6 @@
 const { loadEvents } = require("./events-store");
+const { dayOfWeek, addDays, shortDate, todayIso, DAY_NAMES } = require("./clock");
+const { formatShort } = require("./format-event");
 
 // Two boards rather than one weekly post, because the group plans in two different
 // rhythms: what to do midweek, and what to do over the weekend.
@@ -8,33 +10,6 @@ const BOARDS = {
   midweek: { label: 'אמצע"ש', days: [0, 1, 2, 3], title: "מה עושים השבוע בחיפה? 🎈" },
   weekend: { label: 'סופ"ש', days: [4, 5, 6], title: "מה עושים בסופ״ש בחיפה? 🎈" },
 };
-
-// Reused from make-digest.js's vocabulary so both posts speak the same visual language.
-const icons = {
-  "קולנוע": "🎬",
-  "אוכל ויין": "🍷",
-  "מסיבה": "🎧",
-  "קריוקי": "🎤",
-  "מוזיקה חיה": "🎸",
-  "מוזיקה": "🎸",
-};
-
-const DAY_NAMES = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת"];
-
-function dayOfWeek(isoDate) {
-  return new Date(`${isoDate}T00:00:00Z`).getUTCDay();
-}
-
-function addDays(isoDate, count) {
-  const date = new Date(`${isoDate}T00:00:00Z`);
-  date.setUTCDate(date.getUTCDate() + count);
-  return date.toISOString().slice(0, 10);
-}
-
-function shortDate(isoDate) {
-  const [, , month, day] = isoDate.match(/^(\d{4})-(\d{2})-(\d{2})$/) || [];
-  return `${Number(day)}.${Number(month)}`;
-}
 
 // The window always starts on the board's first day. Running the midweek board on
 // Tuesday still yields that week's Sunday..Wednesday, so a late or re-run send covers
@@ -47,19 +22,7 @@ function windowFor(board, fromDate) {
   return days.map((_, i) => addDays(start, i));
 }
 
-// Name, time, location and link. Location earns its place because "where" is the first
-// thing someone scanning the week asks — without it the board is a list of names you
-// have to chase a link to act on. Price and description still belong to the per-event
-// daily post: the board is for scanning a stretch of days, not reading them.
-function eventLine(event) {
-  const icon = icons[event.category] || "🎈";
-  const parts = [`${icon} ${event.start_time} ${event.event_name}`];
-  if (event.location) parts.push(`   📍 ${event.location}`);
-  if (event.contact_link) parts.push(`   ${event.contact_link}`);
-  return parts.join("\n");
-}
-
-function makeWeekly(events, board = "midweek", fromDate = new Date().toISOString().slice(0, 10)) {
+function makeWeekly(events, board = "midweek", fromDate = todayIso()) {
   if (!BOARDS[board]) throw new Error(`unknown board: ${board}`);
   const dates = windowFor(board, fromDate);
 
@@ -88,7 +51,7 @@ function makeWeekly(events, board = "midweek", fromDate = new Date().toISOString
     // "אין אירועים" reads as a dead city, which is the opposite of the point.
     if (!bucket.length) continue;
     lines.push(`— יום ${DAY_NAMES[dayOfWeek(date)]} ${shortDate(date)} —`);
-    for (const event of bucket) lines.push(eventLine(event));
+    for (const event of bucket) lines.push(formatShort(event));
     lines.push("");
   }
 
@@ -101,6 +64,6 @@ module.exports = { makeWeekly, windowFor, BOARDS };
 
 if (require.main === module) {
   const board = process.argv[2] || "midweek";
-  const fromDate = process.argv[3] || new Date().toISOString().slice(0, 10);
+  const fromDate = process.argv[3] || todayIso();
   console.log(makeWeekly(loadEvents(process.env.EVENTS_FILE || "events.csv"), board, fromDate));
 }

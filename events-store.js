@@ -1,10 +1,18 @@
 const fs = require("fs");
 const path = require("path");
 
+// Adding a name here is the whole migration: migrateIfNeeded checks that every one of
+// these exists in the file's own header row, and rewrites in this order when one
+// doesn't. Existing rows get "" for the new column.
+//   contact_person - the person to ask, kept apart from contact_link (a URL or phone)
+//                    because the long format shows both
+//   slug           - this event's short-link id, stable from submission onward
+//   daily_days     - comma-separated YYYY-MM-DD the submitter chose for the group
+//                    message; empty means board-only
 const CSV_HEADERS = [
   "id", "status", "event_name", "date", "start_time", "end_time", "location",
-  "category", "price", "organizer", "contact_link", "description", "source",
-  "published_at", "notes", "submitter", "flyer",
+  "category", "price", "organizer", "contact_link", "contact_person", "description",
+  "source", "published_at", "notes", "submitter", "flyer", "slug", "daily_days",
 ];
 
 function csv(value) {
@@ -168,12 +176,15 @@ function appendEvent(filePath, event, source, sender, missing) {
     price: event.price,
     organizer: event.organizer,
     contact_link: event.contact_link,
+    contact_person: event.contact_person || "",
     description: event.description,
     source,
     published_at: "",
     notes: [sender, missing.length ? `חסר: ${missing.join(", ")}` : ""].filter(Boolean).join(" | "),
     submitter: sender,
     flyer: "",
+    slug: "",
+    daily_days: "",
   };
 
   events.push(row);

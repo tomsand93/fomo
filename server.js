@@ -4,6 +4,8 @@ const path = require("path");
 const crypto = require("crypto");
 const { URLSearchParams } = require("url");
 const { loadEvents, makeDigest } = require("./make-digest");
+const { israelClock, todayIso, addDays } = require("./clock");
+const { isFreeEntry, formatShort, formatLong } = require("./format-event");
 const { makeWeekly, BOARDS } = require("./make-weekly");
 const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent } = require("./events-store");
 const extractEventModule = require("./extract-event");
@@ -132,10 +134,6 @@ const MEDIA_FETCH_FAILED_TEXT = "לא הצלחנו לקרוא את התמונה 
 const MAX_INQUIRY_EVENTS = 50;
 const MAX_INQUIRY_HISTORY = 12;
 
-function todayIso() {
-  return new Date().toISOString().slice(0, 10);
-}
-
 function upcomingPublishedEvents(events, today = todayIso()) {
   return events
     .filter((event) => event.status === "published" && event.date >= today)
@@ -165,7 +163,6 @@ function isRateLimited(sender) {
 // conversion goes through the IANA zone rather than a fixed offset — Israel switches
 // between UTC+2 and UTC+3, and a hardcoded offset silently sends an hour off for half
 // the year.
-const ISRAEL_TZ = "Asia/Jerusalem";
 const BOARD_SCHEDULE = [
   { board: "midweek", day: 0, hour: 18 }, // Sunday 18:00
   { board: "weekend", day: 4, hour: 17 }, // Thursday 17:00
@@ -176,34 +173,6 @@ const BOARD_CHECK_INTERVAL_MS = 15 * 60 * 1000;
 // suspends this machine when idle (auto_stop_machines), making restarts routine.
 let sentBoards = new Set(); // `${board}:${date}` already sent, so a restart can't double-post
 let pendingBoards = new Map(); // `${board}:${date}` -> post text that Twilio accepted but never delivered
-
-const WEEKDAY_INDEX = new Map([
-  ["Sun", 0], ["Mon", 1], ["Tue", 2], ["Wed", 3], ["Thu", 4], ["Fri", 5], ["Sat", 6],
-]);
-
-const israelParts = new Intl.DateTimeFormat("en-US", {
-  timeZone: ISRAEL_TZ,
-  weekday: "short",
-  year: "numeric",
-  month: "2-digit",
-  day: "2-digit",
-  hour: "2-digit",
-  hour12: false,
-});
-
-// Israel-local wall-clock reading of an instant: { day, hour, date } where day is 0..6
-// (Sunday-first, matching BOARD_SCHEDULE) and date is the local YYYY-MM-DD.
-function israelClock(now = new Date()) {
-  const parts = Object.fromEntries(
-    israelParts.formatToParts(now).map((part) => [part.type, part.value])
-  );
-  return {
-    day: WEEKDAY_INDEX.get(parts.weekday),
-    // "24" appears at midnight in some ICU versions; normalise it to 0.
-    hour: Number(parts.hour) % 24,
-    date: `${parts.year}-${parts.month}-${parts.day}`,
-  };
-}
 
 // Fires within the hour the board is due. The sent-marker is keyed by date so a crash and
 // restart inside that window re-checks rather than re-sends, and a missed window is simply
@@ -451,11 +420,9 @@ function fieldIsValid(key, value) {
 // The extractor normalizes free entry to "כניסה חופשית", but it's an LLM writing free text
 // and submitters phrase it many ways, so match the family rather than that one literal.
 // "הופעת כובע" and "תרומה חופשית" are hat-passing shows: nothing to pay to get in.
-const FREE_ENTRY_RE = /(כניסה\s*(חופשית|חינם|ללא\s*תשלום|ללא\s*עלות)|חופשית|חינם|ללא\s*תשלום|ללא\s*עלות|הופעת\s*כובע|תרומה\s*חופשית|free\s*(entry|admission)?)/i;
-
-function isFreeEntry(event) {
-  return FREE_ENTRY_RE.test(String(event.price || ""));
-}
+// FREE_ENTRY_RE and isFreeEntry now live in format-event.js: both formatters need
+// them to pick the entrance emoji, and missingFields needs them to decide whether a
+// link is required, so a single copy avoids the two drifting apart.
 
 // A paid event needs a link or contact — that's where people buy a ticket, so without it
 // the listing is useless. A free one has nothing to buy: "just show up" is the whole
@@ -599,29 +566,20 @@ async function forwardAmendmentToAdmin(id, text, sender) {
   }
 }
 
-// A ready-to-forward post for the group, in the same shape as the daily digest so the
-// group sees one consistent format however an event reaches it.
+// A ready-to-forward post for the group. Same LONG rendering the daily message uses,
+// so the group sees one consistent format however an event reaches it.
 function formatPublishedPost(event) {
-  const [, , month, day] = (event.date || "").match(/^(\d{4})-(\d{2})-(\d{2})$/) || [];
-  const when = day ? `📅 ${Number(day)}.${Number(month)}` : "";
-  return [
-    `${event.event_name}`,
-    "",
-    [when, event.start_time ? `🕗 ${event.start_time}` : ""].filter(Boolean).join(" | "),
-    event.location ? `📍 ${event.location}` : null,
-    event.price ? `💸 ${event.price}` : null,
-    event.contact_link ? `🔗 ${event.contact_link}` : null,
-  ].filter((line) => line !== null && line !== "").join("\n");
+  return formatLong(event, { flyerUrl: (e) => flyerUrl(e.flyer) }).text;
 }
 
 async function sendPublishedPost(id, event) {
   if (process.env.NODE_ENV === "test") return;
-  const url = flyerUrl(event.flyer);
-  if (!url) {
+  const { text, mediaUrl } = formatLong(event, { flyerUrl: (e) => flyerUrl(e.flyer) });
+  if (event.flyer && !mediaUrl) {
     console.error(`event #${id} has a flyer but PUBLIC_BASE_URL is unset; sending text only`);
   }
   try {
-    await sendWhatsApp(ADMIN_SENDER, formatPublishedPost(event), url);
+    await sendWhatsApp(ADMIN_SENDER, text, mediaUrl);
   } catch (err) {
     console.error(`failed to send published post for event #${id}:`, err);
   }
@@ -661,6 +619,7 @@ const FIELD_LABELS = new Map([
   ["מחיר", "price"],
   ["מארגן", "organizer"],
   ["קישור", "contact_link"],
+  ["איש קשר", "contact_person"],
   ["תיאור", "description"],
 ]);
 

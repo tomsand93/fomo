@@ -5,7 +5,7 @@ const MODEL = process.env.OPENROUTER_MODEL || "anthropic/claude-haiku-4.5";
 
 const FIELD_KEYS = [
   "event_name", "date", "start_time", "end_time", "location",
-  "category", "price", "organizer", "contact_link", "description",
+  "category", "price", "organizer", "contact_link", "contact_person", "description",
 ];
 
 function buildPreviouslyExtractedNote(previousEvent) {
@@ -39,7 +39,8 @@ ${imageNote}${previouslyExtractedNote}
   אם לא נאמר במפורש מה עולה הכניסה, השאר את price ריק ("") — אל תנחש ואל תשתמש במחיר אחר שמופיע בטקסט.
   אם מופיע בטקסט מחיר כלשהו אך לא ברור אם הוא דמי כניסה או מחיר של מוצר שנמכר באירוע — השאר price ריק וגם הוסף שאלה על כך ל-_questions.
 - organizer: שם המארגן, אם צוין.
-- contact_link: קישור, מספר טלפון, או איש קשר לפרטים נוספים.
+- contact_link: קישור או מספר טלפון לפרטים נוספים.
+- contact_person: שם האדם שאפשר לפנות אליו לפרטים, אם צוין שם. רק שם של אדם — לא קישור, לא מספר טלפון, ולא שם של מקום או ארגון (אלה שייכים ל-organizer).
 - description: תיאור קצר וחופשי של האירוע, כולל פרטים שלא נכנסו לשדות אחרים.
 
 הטקסט הוא היסטוריית שיחה מלאה עם המשתמש (הודעות מאוחרות עשויות להשלים או לתקן מידע מהודעות קודמות). מזג את כל המידע לטיוטת אירוע אחת עדכנית.
@@ -50,7 +51,7 @@ ${correctionGuidance}
 לכל היותר 2 שאלות. אם הכול ברור, החזר _questions כרשימה ריקה [].
 
 השב אך ורק ב-JSON תקין בפורמט הבא, ללא טקסט נוסף:
-{"event_name":"","date":"","start_time":"","end_time":"","location":"","category":"","price":"","organizer":"","contact_link":"","description":"","_questions":[]}
+{"event_name":"","date":"","start_time":"","end_time":"","location":"","category":"","price":"","organizer":"","contact_link":"","contact_person":"","description":"","_questions":[]}
 
 טקסט השיחה:
 ${conversationText}`;

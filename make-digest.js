@@ -1,25 +1,11 @@
 const { loadEvents } = require("./events-store");
+const { shortDate, todayIso } = require("./clock");
+const { formatLong } = require("./format-event");
 
-const icons = {
-  "קולנוע": "🎬",
-  "אוכל ויין": "🍷",
-  "מסיבה": "🎧",
-  "קריוקי": "🎤",
-  "מוזיקה חיה": "🎸",
-  "מוזיקה": "🎸",
-};
-
-function eventBlock(event) {
-  const icon = icons[event.category] || "🎈";
-  const lines = [`${icon} ${event.start_time} | ${event.event_name}`];
-  if (event.location) lines.push(`📍 ${event.location}`);
-  if (event.price) lines.push(`💸 ${event.price}`);
-  if (event.contact_link) lines.push(`🔗 ${event.contact_link}`);
-  if (event.description && !event.description.includes("שם האירוע:")) lines.push(event.description);
-  return lines.join("\n");
-}
-
-function makeDigest(events, targetDate) {
+// The daily message carries the LONG form: the full pitch for events happening today,
+// where the board only has to say enough to recognise one. Flyers are attached per
+// event by the caller, so this returns text only.
+function makeDigest(events, targetDate, options = {}) {
   const publishable = events
     .filter((event) =>
       event.date === targetDate &&
@@ -29,20 +15,34 @@ function makeDigest(events, targetDate) {
     )
     .sort((a, b) => a.start_time.localeCompare(b.start_time));
 
-  const [, , month, day] = targetDate.match(/^(\d{4})-(\d{2})-(\d{2})$/) || [];
-  const lines = ["מה עושים היום בחיפה? 🎈", "", `📅 ${Number(day)}.${Number(month)}`, ""];
+  const lines = ["מה עושים היום בחיפה? 🎈", "", `📅 ${shortDate(targetDate)}`, ""];
 
   if (!publishable.length) {
     return [...lines, "אין אירועים מוכנים לפרסום היום."].join("\n");
   }
 
   for (const event of publishable) {
-    lines.push(eventBlock(event), "");
+    lines.push(formatLong(event, options).text, "");
   }
 
   // Ends on the last event, like the weekly boards: the standing "put the group on mute"
   // recommendation repeated on every post and said nothing about that day.
   return lines.join("\n").trim();
+}
+
+// Which of today's events carry a flyer, in the order the digest lists them. The
+// caller sends these as follow-up messages: Twilio takes one MediaUrl per message,
+// so a day with several flyers cannot be a single send.
+function digestFlyerEvents(events, targetDate) {
+  return events
+    .filter((event) =>
+      event.date === targetDate &&
+      event.status === "published" &&
+      event.start_time &&
+      event.location &&
+      event.flyer
+    )
+    .sort((a, b) => a.start_time.localeCompare(b.start_time));
 }
 
 function demo() {
@@ -66,8 +66,8 @@ function demo() {
 
 if (require.main === module) {
   demo();
-  const dateArg = process.argv[2] || new Date().toISOString().slice(0, 10);
+  const dateArg = process.argv[2] || todayIso();
   console.log(makeDigest(loadEvents(process.env.EVENTS_FILE || "events.csv"), dateArg));
 }
 
-module.exports = { loadEvents, makeDigest };
+module.exports = { loadEvents, makeDigest, digestFlyerEvents };

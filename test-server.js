@@ -607,6 +607,86 @@ async function demo() {
   }
   fs.unlinkSync(boardFile);
 
+  // --- Phase 1: shared formatter, Israel clock, contact_person ---
+  const fmt = require("./format-event");
+  const clock = require("./clock");
+
+  // One clock. todayIso used to be UTC while the board scheduler read Israel-local,
+  // which put them a day apart between 21:00 Israel and midnight UTC — survivable for
+  // a twice-weekly board, wrong for one keyed on "today".
+  if (clock.todayIso() !== clock.israelClock().date) {
+    throw new Error("todayIso must be the Israel-local date, not UTC");
+  }
+  const lateEvening = new Date("2026-08-24T21:30:00Z"); // 00:30 next day in Israel
+  if (clock.todayIso(lateEvening) === lateEvening.toISOString().slice(0, 10)) {
+    throw new Error("todayIso must differ from the UTC date late in the Israel evening");
+  }
+  if (clock.israelClock().minute === undefined) {
+    throw new Error("israelClock must expose minute — the 10-min-prior slots need it");
+  }
+
+  const freeEvent = {
+    event_name: "ג׳אם", category: "מוזיקה חיה", date: "2026-09-20", start_time: "21:00",
+    location: "סילביה", price: "כניסה חופשית", contact_person: "מאיה",
+    contact_link: "https://x.co/1", description: "ג׳אם פתוח", flyer: "9-abc.jpg",
+  };
+  const paidEvent = { ...freeEvent, price: "70 ₪", flyer: "" };
+  const noPriceEvent = { ...freeEvent, price: "", flyer: "", contact_person: "" };
+
+  // The two entrance emojis, and the third state: an unstated price shows neither.
+  // Inferring "free" from silence would put a factual error in front of the group.
+  const freeShort = fmt.formatShort(freeEvent);
+  if (!freeShort.includes("🆓") || freeShort.includes("🎟️")) {
+    throw new Error("a free event must show 🆓 and not 🎟️");
+  }
+  const paidShort = fmt.formatShort(paidEvent);
+  if (!paidShort.includes("🎟️") || paidShort.includes("🆓")) {
+    throw new Error("a paid event must show 🎟️ and not 🆓");
+  }
+  const noPriceShort = fmt.formatShort(noPriceEvent);
+  if (noPriceShort.includes("🆓") || noPriceShort.includes("🎟️")) {
+    throw new Error("an event with no stated price must show neither entrance emoji");
+  }
+
+  // SHORT is for scanning: at most two lines however much the event carries.
+  for (const [label, ev] of [["free", freeEvent], ["paid", paidEvent], ["unpriced", noPriceEvent]]) {
+    const lineCount = fmt.formatShort(ev).split("\n").length;
+    if (lineCount > 2) throw new Error(`SHORT (${label}) must be 1-2 lines, got ${lineCount}`);
+  }
+
+  // LONG is the full pitch, and the flyer rides as media rather than a text line.
+  const freeLong = fmt.formatLong(freeEvent, { flyerUrl: (e) => (e.flyer ? `https://h/${e.flyer}` : "") });
+  const longLines = freeLong.text.split("\n").length;
+  if (longLines < 5 || longLines > 7) throw new Error(`LONG must be 5-7 lines, got ${longLines}`);
+  if (!freeLong.text.includes("👤 מאיה")) throw new Error("LONG must show the contact person");
+  if (!freeLong.mediaUrl) throw new Error("LONG must return the flyer as mediaUrl");
+  if (freeLong.text.includes("9-abc.jpg")) throw new Error("the flyer must not appear as a text line");
+  if (fmt.formatLong(paidEvent).mediaUrl) {
+    throw new Error("an event with no flyer must return an empty mediaUrl");
+  }
+
+  // contact_person is a real column now, so it must survive a write/read round-trip.
+  if (!eventsStore.CSV_HEADERS.includes("contact_person")) {
+    throw new Error("contact_person must be a CSV column");
+  }
+  const cpFile = path.join(__dirname, "test-contact.csv");
+  if (fs.existsSync(cpFile)) fs.unlinkSync(cpFile);
+  fs.writeFileSync(cpFile, eventsStore.CSV_HEADERS.join(",") + "\n", "utf8");
+  const cpId = eventsStore.appendEvent(
+    cpFile,
+    { event_name: "עם איש קשר", date: "2026-09-22", start_time: "20:00", end_time: "",
+      location: "חיפה", category: "מוזיקה", price: "", organizer: "",
+      contact_link: "https://x.co/2", contact_person: "רינה", description: "" },
+    "Twilio WhatsApp",
+    "whatsapp:+972500001234",
+    []
+  );
+  const cpRow = eventsStore.loadEvents(cpFile).find((e) => e.id === String(cpId));
+  if (cpRow.contact_person !== "רינה") {
+    throw new Error("contact_person must round-trip through the CSV");
+  }
+  fs.unlinkSync(cpFile);
+
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
