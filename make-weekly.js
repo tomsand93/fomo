@@ -17,7 +17,7 @@ function boardTitle(dates) {
   return dates.length === 1 ? "מה עושים היום בחיפה? 🎈" : "מה עושים השבוע בחיפה? 🎈";
 }
 
-function makeWeekly(events, fromDate = todayIso()) {
+function makeWeekly(events, fromDate = todayIso(), options = {}) {
   const dates = rollingWindow(fromDate);
 
   const byDate = new Map(dates.map((date) => [date, []]));
@@ -47,7 +47,7 @@ function makeWeekly(events, fromDate = todayIso()) {
     // "אין אירועים" reads as a dead city, which is the opposite of the point.
     if (!bucket.length) continue;
     lines.push(`— יום ${DAY_NAMES[dayOfWeek(date)]} ${shortDate(date)} —`);
-    for (const event of bucket) lines.push(formatShort(event));
+    for (const event of bucket) lines.push(formatShort(event, options));
     lines.push("");
   }
 

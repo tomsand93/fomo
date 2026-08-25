@@ -154,6 +154,33 @@ function loadEvents(filePath) {
   return events;
 }
 
+// Short-link ids. The alphabet drops 0/O/1/l/I so a slug read aloud or copied off a
+// phone screen cannot land on the wrong event: ~923k combinations from four characters,
+// which is far more than this ever needs.
+const SLUG_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789";
+const SLUG_LENGTH = 4;
+const MAX_SLUG_ATTEMPTS = 50;
+
+function randomSlug() {
+  let slug = "";
+  for (let i = 0; i < SLUG_LENGTH; i += 1) {
+    slug += SLUG_ALPHABET[Math.floor(Math.random() * SLUG_ALPHABET.length)];
+  }
+  return slug;
+}
+
+// Bounded, never a bare do/while: on a saturated alphabet an unbounded retry loop hangs
+// the process. Falling back to a longer slug keeps links working past that point.
+function makeSlug(taken, generate = randomSlug) {
+  for (let attempt = 0; attempt < MAX_SLUG_ATTEMPTS; attempt += 1) {
+    const slug = generate();
+    if (!taken.has(slug)) return slug;
+  }
+  let slug = `${generate()}${generate()}`;
+  while (taken.has(slug)) slug += generate();
+  return slug;
+}
+
 function nextId(events) {
   const ids = events.map((e) => Number(e.id)).filter((n) => Number.isFinite(n));
   return String((ids.length ? Math.max(...ids) : 0) + 1);
@@ -183,7 +210,10 @@ function appendEvent(filePath, event, source, sender, missing) {
     notes: [sender, missing.length ? `חסר: ${missing.join(", ")}` : ""].filter(Boolean).join(" | "),
     submitter: sender,
     flyer: "",
-    slug: "",
+    // Assigned now rather than at approval, so the link in the receipt is the same one
+    // that ends up in the board and the group message. A rejected event just has a slug
+    // nobody ever publishes.
+    slug: makeSlug(new Set(events.map((e) => e.slug).filter(Boolean))),
     daily_days: "",
   };
 
@@ -214,4 +244,7 @@ module.exports = {
   updateEvent,
   findEvent,
   parseCsvLine,
+  makeSlug,
+  randomSlug,
+  SLUG_ALPHABET,
 };

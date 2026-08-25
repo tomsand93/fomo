@@ -4,7 +4,7 @@ const path = require("path");
 const crypto = require("crypto");
 const { URLSearchParams } = require("url");
 const { loadEvents, makeDigest, digestFlyerEvents } = require("./make-digest");
-const { israelClock, todayIso, addDays } = require("./clock");
+const { israelClock, todayIso, addDays, shortDate } = require("./clock");
 const { isFreeEntry, formatShort, formatLong } = require("./format-event");
 const { makeWeekly } = require("./make-weekly");
 const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent } = require("./events-store");
@@ -14,6 +14,7 @@ const answerInquiryModule = require("./answer-inquiry");
 const { sendWhatsApp, getMessageStatus } = require("./send-whatsapp");
 const { fetchMediaAsDataUrl } = require("./fetch-media");
 const { saveFlyer, flyerPath, contentTypeFor, deleteFlyer } = require("./flyer-store");
+const { logClick, logInteraction, clickStats, pruneOlderThan } = require("./clicks-store");
 
 const PORT = Number(process.env.PORT || 3000);
 const EVENTS_FILE = process.env.EVENTS_FILE || "events.csv";
@@ -179,6 +180,8 @@ const BOARD_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 // 17:58 must still deliver, while one waking at 18:20 should skip rather than hand Stav
 // something she was meant to forward twenty minutes ago.
 const SEND_WINDOW_MINUTES = 15;
+const LOG_RETENTION_DAYS = 90;
+const LOG_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // Both are persisted: sentBoards was previously in-memory only, so a restart inside the
 // send window re-sent the board despite the comment promising otherwise — and Fly
 // suspends this machine when idle (auto_stop_machines), making restarts routine.
@@ -200,8 +203,9 @@ function slotsDueAt(local) {
 // One delivery per slot: today's events in full, then the rolling board for the days
 // still ahead. Flyers follow as separate messages because Twilio carries one image each.
 function buildSlotPost(events, localDate) {
-  const daily = makeDigest(events, localDate, { flyerUrl: (e) => flyerUrl(e.flyer) });
-  const board = makeWeekly(events, localDate);
+  const links = { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) };
+  const daily = makeDigest(events, localDate, links);
+  const board = makeWeekly(events, localDate, links);
   return `${daily}\n\n———\n\n${board}`;
 }
 
@@ -246,7 +250,7 @@ const MAX_SLOT_FLYERS = 3;
 async function sendSlotFlyers(events, localDate) {
   const flyered = digestFlyerEvents(events, localDate).slice(0, MAX_SLOT_FLYERS);
   for (const event of flyered) {
-    const { text, mediaUrl } = formatLong(event, { flyerUrl: (e) => flyerUrl(e.flyer) });
+    const { text, mediaUrl } = formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) });
     if (!mediaUrl) continue;
     try {
       await sendWhatsApp(ADMIN_SENDER, text, mediaUrl);
@@ -331,7 +335,11 @@ function sendGoodbyes(events, today = todayIso()) {
     storeUpdateEvent(EVENTS_FILE, event.id, {
       notes: `${event.notes} | ${GOODBYE_NOTE}`.trim(),
     });
-    notifySubmitter(event.submitter, goodbyeText());
+    // Only mentioned when there is something to mention: "0 people viewed your event"
+    // is worse than saying nothing at all.
+    const views = event.slug ? clickStats({ eventId: event.id }).total : 0;
+    const tail = views > 0 ? `\n\n${views} אנשים צפו בקישור לאירוע שלכם דרך FOMO 📈` : "";
+    notifySubmitter(event.submitter, `${goodbyeText()}${tail}`);
   }
 }
 
@@ -600,6 +608,98 @@ function persistFlyer(id, dataUrl) {
   return name;
 }
 
+// The FOMO link for an event. Falls back to whatever contact the submitter gave rather
+// than to nothing: a message with a dead link is worse than one with a plain phone
+// number, and slugs only exist on events created since they were introduced.
+function shortLink(event) {
+  if (!event.slug || !PUBLIC_BASE_URL) return event.contact_link || "";
+  return `${PUBLIC_BASE_URL.replace(/\/$/, "")}/e/${event.slug}`;
+}
+
+// contact_link holds whatever the submitter wrote, and in practice that is almost never
+// a bare URL — of the events in production only one is, the rest being names, phone
+// numbers or prices. So the link resolves to a real destination only when there is one
+// to resolve to; otherwise the landing page below carries the details itself.
+const URL_IN_TEXT_RE = /https?:\/\/\S+/;
+
+function destinationFor(event) {
+  const match = String(event.contact_link || "").match(URL_IN_TEXT_RE);
+  return match ? match[0] : "";
+}
+
+function escapeHtml(value) {
+  return String(value == null ? "" : value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+// Where a short link lands when the submitter gave a contact rather than a URL, which
+// is the common case. Self-contained: one file, no external assets, so it renders on a
+// phone with a bad connection and nothing to fetch.
+function eventLandingPage(event) {
+  const rows = [
+    ["📅", event.date ? shortDate(event.date) : ""],
+    ["🕗", event.start_time ? `${event.start_time}${event.end_time ? `-${event.end_time}` : ""}` : ""],
+    ["📍", event.location],
+    [isFreeEntry(event) ? "🆓" : "🎟️", isFreeEntry(event) ? "כניסה חופשית" : event.price],
+    ["👤", event.contact_person],
+    ["📞", destinationFor(event) ? "" : event.contact_link],
+  ]
+    .filter(([, value]) => value)
+    .map(([icon, value]) => `<div class="row"><span>${icon}</span><span>${escapeHtml(value)}</span></div>`)
+    .join("\n      ");
+
+  const flyer = event.flyer && flyerUrl(event.flyer)
+    ? `<img src="${escapeHtml(flyerUrl(event.flyer))}" alt="">`
+    : "";
+
+  return `<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(event.event_name)} · FOMO חיפה</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px 16px; font-family: system-ui, -apple-system, "Segoe UI", Arial, sans-serif;
+         background: #faf7f2; color: #1c1a17; display: flex; justify-content: center; }
+  .card { width: 100%; max-width: 32rem; background: #fff; border-radius: 18px; padding: 24px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.08), 0 8px 24px rgba(0,0,0,.06); }
+  .brand { font-size: .8rem; letter-spacing: .12em; color: #b4652a; font-weight: 700; margin-bottom: 14px; }
+  h1 { margin: 0 0 4px; font-size: 1.5rem; line-height: 1.25; }
+  .cat { color: #6b6560; font-size: .95rem; margin-bottom: 18px; }
+  .row { display: flex; gap: 10px; align-items: baseline; padding: 7px 0; font-size: 1.02rem; }
+  .row span:first-child { flex: 0 0 1.4rem; }
+  .desc { margin-top: 16px; padding-top: 16px; border-top: 1px solid #eee7dd;
+          white-space: pre-wrap; line-height: 1.55; color: #3b3733; }
+  img { width: 100%; border-radius: 12px; margin-top: 18px; display: block; }
+  .foot { margin-top: 20px; font-size: .82rem; color: #8a837c; text-align: center; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #17150f; color: #f2ede4; }
+    .card { background: #221f18; box-shadow: none; }
+    .desc { color: #ccc5b8; border-top-color: #332f26; }
+    .cat, .foot { color: #9a938a; }
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand">FOMO חיפה</div>
+    <h1>${escapeHtml(event.event_name)}</h1>
+    ${event.category ? `<div class="cat">${escapeHtml(event.category)}</div>` : ""}
+      ${rows}
+    ${event.description ? `<div class="desc">${escapeHtml(event.description)}</div>` : ""}
+    ${flyer}
+    <div class="foot">מה עושים היום בחיפה?</div>
+  </div>
+</body>
+</html>`;
+}
+
 // Twilio fetches media itself, so the flyer needs an absolute URL it can reach. Without
 // PUBLIC_BASE_URL there is no such address and the message goes out as text.
 function flyerUrl(name) {
@@ -643,12 +743,12 @@ async function forwardAmendmentToAdmin(id, text, sender) {
 // A ready-to-forward post for the group. Same LONG rendering the daily message uses,
 // so the group sees one consistent format however an event reaches it.
 function formatPublishedPost(event) {
-  return formatLong(event, { flyerUrl: (e) => flyerUrl(e.flyer) }).text;
+  return formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) }).text;
 }
 
 async function sendPublishedPost(id, event) {
   if (process.env.NODE_ENV === "test") return;
-  const { text, mediaUrl } = formatLong(event, { flyerUrl: (e) => flyerUrl(e.flyer) });
+  const { text, mediaUrl } = formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) });
   if (event.flyer && !mediaUrl) {
     console.error(`event #${id} has a flyer but PUBLIC_BASE_URL is unset; sending text only`);
   }
@@ -702,9 +802,11 @@ const ADMIN_HELP_TEXT = `פקודות ניהול:
 אשר <מספר> - לאשר ולפרסם אירוע
 דחה <מספר> [סיבה] - לדחות אירוע
 ממתינים - רשימת אירועים ממתינים לבדיקה
+צפיות - כמה צפיות יש לקישורים של האירועים
+צפיות <מספר> - פירוט לאירוע אחד
 תקן <מספר> <שדה>: <ערך> - לתקן פרט באירוע (הבוט ילמד מהתיקון)
 
-שדות לתיקון: שם, תאריך, שעה, שעת סיום, מיקום, קטגוריה, מחיר, מארגן, קישור, תיאור
+שדות לתיקון: שם, תאריך, שעה, שעת סיום, מיקום, קטגוריה, מחיר, מארגן, קישור, איש קשר, תיאור
 לדוגמה: תקן 6 מחיר: כניסה חופשית
 
 לקוח - מעבר למצב לקוח (לבדיקות), כדי לשלוח אירוע כמו משתמש רגיל
@@ -806,12 +908,51 @@ function missedNoticesBanner(events) {
   return `⚠️ אירועים שההודעה עליהם לא הגיעה אליך:\n${lines}\n\n`;
 }
 
+// "Views" rather than "clicks" on purpose: WhatsApp and every preview crawler fetch a
+// link the moment it appears in a message. Those are filtered out by user-agent, but no
+// filter is perfect, so the word stays honest about what the number is.
+function formatViewStats(idArg) {
+  const events = loadEvents(EVENTS_FILE);
+
+  if (idArg) {
+    const event = events.find((e) => e.id === String(idArg));
+    if (!event) return `לא נמצא אירוע #${idArg}.`;
+    const stats = clickStats({ eventId: event.id });
+    return [
+      `📈 אירוע #${event.id} — ${event.event_name}`,
+      `צפיות בקישור: ${stats.total}`,
+      `מכשירים שונים: ${stats.unique}`,
+      event.slug ? `קישור: ${shortLink(event)}` : "",
+    ].filter(Boolean).join("\n");
+  }
+
+  const ranked = events
+    .filter((e) => e.slug)
+    .map((e) => ({ event: e, stats: clickStats({ eventId: e.id }) }))
+    .filter((row) => row.stats.total > 0)
+    .sort((a, b) => b.stats.total - a.stats.total)
+    .slice(0, 10);
+
+  if (!ranked.length) return "עוד אין צפיות בקישורים.";
+  return [
+    "📈 צפיות בקישורים:",
+    ...ranked.map((row) => `#${row.event.id} ${row.event.event_name} — ${row.stats.total}`),
+    "",
+    'לפירוט על אירוע: צפיות <מספר>',
+  ].join("\n");
+}
+
 async function handleAdminMessage(text, repliedSid = "") {
   const trimmed = text.trim();
   // Her message just reopened the 24h WhatsApp window, so any board Twilio dropped with
   // 63016 can finally be delivered. Detached: a slow re-send must not delay her reply.
   flushPendingBoards();
   const banner = missedNoticesBanner(loadEvents(EVENTS_FILE));
+
+  // "צפיות" on its own gives the busiest events; with an id, that event alone.
+  if (trimmed === "צפיות" || trimmed.startsWith("צפיות ")) {
+    return `${banner}${formatViewStats(trimmed.slice("צפיות".length).trim())}`;
+  }
 
   if (trimmed === "ממתינים") {
     expirePastEvents(loadEvents(EVENTS_FILE));
@@ -1239,10 +1380,35 @@ ${MENU_TEXT}`;
 
 // Wrapper so the customer-mode banner reaches every reply, whichever branch below produced
 // it, without threading a flag through each return.
+// Which flow the sender was in when a message arrived. Recorded with the interaction so
+// the log can answer "where do people drop out", which raw text alone cannot.
+function senderFlow(sender) {
+  if (activeSubmissions.has(sender)) return "submission";
+  if (activeInquiries.has(sender)) return "inquiry";
+  if (awaitingPublishChoice.has(sender) || awaitingDailyChoice.has(sender)) return "publish-choice";
+  if (recentlyCompleted.has(sender)) return "post-submission";
+  return "menu";
+}
+
 async function routeMessage(sender, text, mediaUrls = [], repliedSid = "") {
   const state = { inCustomerModeReply: false };
+  // Captured before routing, since routing is what changes it.
+  const flow = senderFlow(sender);
+  logInteraction({
+    dir: "in",
+    sender,
+    flow,
+    text: String(text || "").slice(0, MAX_MESSAGE_LENGTH),
+    media: mediaUrls.length,
+  });
+
   const reply = await routeMessageInner(sender, text, mediaUrls, repliedSid, state);
-  return state.inCustomerModeReply ? `${CUSTOMER_MODE_BANNER}\n\n${reply}` : reply;
+  const full = state.inCustomerModeReply ? `${CUSTOMER_MODE_BANNER}\n\n${reply}` : reply;
+
+  // Outbound keeps a length, not the text: every reply is reconstructible from the code,
+  // and storing them again would double the log for nothing.
+  logInteraction({ dir: "out", sender, flow, chars: String(full || "").length });
+  return full;
 }
 
 async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", state = {}) {
@@ -1394,7 +1560,7 @@ const server = http.createServer((req, res) => {
     // ?board= is gone with the two fixed boards, but old links still carry it; ignoring
     // an unknown parameter beats a 400 for something that no longer means anything.
     const fromDate = url.searchParams.get("date") || todayIso();
-    const post = makeWeekly(loadEvents(EVENTS_FILE), fromDate);
+    const post = makeWeekly(loadEvents(EVENTS_FILE), fromDate, { linkFor: shortLink });
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end(post);
     return;
@@ -1418,6 +1584,40 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // The FOMO short link. Counts the visit, then either forwards to the submitter's own
+  // URL or — far more often, since most events give a name or a phone rather than a link
+  // — shows the event on a page of ours.
+  if (req.method === "GET" && url.pathname.startsWith("/e/")) {
+    const slug = decodeURIComponent(url.pathname.slice("/e/".length));
+    const event = loadEvents(EVENTS_FILE).find((e) => e.slug && e.slug === slug);
+    if (!event) {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("האירוע לא נמצא");
+      return;
+    }
+
+    logClick({
+      slug,
+      eventId: event.id,
+      userAgent: req.headers["user-agent"],
+      referer: req.headers.referer,
+      // Fly terminates TLS, so the visitor's address arrives in the forwarded header.
+      ip: (req.headers["fly-client-ip"] || req.socket.remoteAddress || ""),
+    });
+
+    const destination = destinationFor(event);
+    if (destination) {
+      // no-store or a cached redirect means every later visit goes uncounted.
+      res.writeHead(302, { Location: destination, "Cache-Control": "no-store" });
+      res.end();
+      return;
+    }
+
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    res.end(eventLandingPage(event));
+    return;
+  }
+
   if (req.method === "GET" && req.url === "/health") {
     res.writeHead(200, { "Content-Type": "text/plain" });
     res.end("ok");
@@ -1436,6 +1636,8 @@ if (require.main === module) {
   setInterval(sendPendingReminder, PENDING_REMINDER_INTERVAL_MS).unref();
   setInterval(expireIdleSessions, IDLE_SWEEP_INTERVAL_MS).unref();
   setInterval(sendDueBoards, BOARD_CHECK_INTERVAL_MS).unref();
+  // Keeps the click and interaction logs from growing without bound on a small volume.
+  setInterval(() => pruneOlderThan(LOG_RETENTION_DAYS), LOG_PRUNE_INTERVAL_MS).unref();
 }
 
 module.exports = {
@@ -1451,6 +1653,10 @@ module.exports = {
   get adminMode() { return adminMode; },
   get lastActivity() { return lastActivity; },
   rememberNotice,
+  // Exported so the routes can be exercised against a real listener in tests.
+  server,
+  shortLink,
+  destinationFor,
   // Pure, so the schedule and the choice list can be tested without sending anything.
   isDue,
   slotsDueAt,

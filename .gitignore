@@ -7,6 +7,9 @@ test-board.csv
 test-contact.csv
 test-roll.csv
 test-bye.csv
+test-links.csv
+clicks.jsonl
+interactions.jsonl
 dbg-events.csv
 dbg-state.json
 test-state.json

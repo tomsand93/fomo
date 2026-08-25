@@ -18,7 +18,7 @@ const TEST_FLYER_DIR = path.join(__dirname, "test-flyers");
 process.env.FLYER_DIR = TEST_FLYER_DIR;
 fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
 
-const { routeMessage, slotsDueAt, publishDayOptions, goodbyeText, sendGoodbyes, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
+const { routeMessage, slotsDueAt, destinationFor, shortLink, publishDayOptions, goodbyeText, sendGoodbyes, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -918,6 +918,82 @@ async function demo() {
     throw new Error("the goodbye should mention the bot answers questions");
   }
   fs.unlinkSync(byeFile);
+
+  // --- Phase 4: short links, click counting, interaction log ---
+  const clicks = require("./clicks-store");
+
+  // Slugs must be unique across a realistic volume, and the collision loop must be
+  // bounded: an unbounded retry on a saturated alphabet hangs the process.
+  const generated = new Set();
+  for (let i = 0; i < 5000; i += 1) {
+    const slug = eventsStore.makeSlug(generated);
+    if (generated.has(slug)) throw new Error("makeSlug must not return a slug already taken");
+    generated.add(slug);
+  }
+  // Forced total collision: every attempt returns the same value, so the guard has to
+  // fall back rather than spin forever.
+  const saturated = new Set(["zzzz"]);
+  const forced = eventsStore.makeSlug(saturated, () => "zzzz");
+  if (forced === "zzzz") throw new Error("makeSlug must not return a taken slug even under collision");
+  // The alphabet must exclude characters that misread on a phone screen.
+  for (const ch of "01OlI") {
+    if (eventsStore.SLUG_ALPHABET.includes(ch)) {
+      throw new Error(`the slug alphabet must not contain the ambiguous character ${ch}`);
+    }
+  }
+
+  // contact_link is almost never a bare URL in practice: of the events in production
+  // only one is, the rest being names, phone numbers or prices. The URL is extracted
+  // when there is one, and there is no destination when there is not.
+  if (destinationFor({ contact_link: "לפרטים: https://example.com/x" }) !== "https://example.com/x") {
+    throw new Error("a URL embedded in surrounding words must still be extracted");
+  }
+  if (destinationFor({ contact_link: "מאיה 0526550622" }) !== "") {
+    throw new Error("a phone number is not a destination to redirect to");
+  }
+  if (destinationFor({ contact_link: "" }) !== "") {
+    throw new Error("an empty contact must not produce a destination");
+  }
+
+  // Bot filtering. WhatsApp fetches every link the moment it appears in a message, so
+  // an unfiltered count would be mostly crawlers.
+  if (!clicks.looksLikeBot("WhatsApp/2.23.20.0")) throw new Error("WhatsApp's fetcher must count as a bot");
+  if (!clicks.looksLikeBot("facebookexternalhit/1.1")) throw new Error("preview crawlers must count as bots");
+  if (clicks.looksLikeBot("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0)")) {
+    throw new Error("a real phone browser must not be filtered out as a bot");
+  }
+  // Addresses are hashed, never stored raw.
+  const hashed = clicks.hashIp("203.0.113.9");
+  if (!hashed || hashed.includes("203.0.113.9")) throw new Error("the visitor address must be hashed");
+  if (clicks.hashIp("203.0.113.9") !== hashed) throw new Error("the same address must hash consistently");
+  if (clicks.hashIp("203.0.113.10") === hashed) throw new Error("different addresses must hash differently");
+
+  // The route itself, against a real listener: this is the first route with logic
+  // worth testing, and a 302 to the wrong place is invisible in a unit test.
+  const linkFile = path.join(__dirname, "test-links.csv");
+  if (fs.existsSync(linkFile)) fs.unlinkSync(linkFile);
+  fs.writeFileSync(linkFile, eventsStore.CSV_HEADERS.join(",") + "\n", "utf8");
+  const urlId = eventsStore.appendEvent(
+    linkFile,
+    { event_name: "עם קישור", date: "2026-09-20", start_time: "21:00", end_time: "",
+      location: "סילביה", category: "מוזיקה", price: "כניסה חופשית", organizer: "",
+      contact_link: "לפרטים: https://example.com/tickets", contact_person: "מאיה",
+      description: "תיאור" },
+    "Twilio WhatsApp", "whatsapp:+972500009900", []
+  );
+  const plainId = eventsStore.appendEvent(
+    linkFile,
+    { event_name: "בלי קישור", date: "2026-09-21", start_time: "20:00", end_time: "",
+      location: "וואדי", category: "תרבות", price: "75 ש״ח", organizer: "",
+      contact_link: "מאיה 0526550622", contact_person: "מאיה", description: "תיאור שני" },
+    "Twilio WhatsApp", "whatsapp:+972500009900", []
+  );
+  const linkRows = eventsStore.loadEvents(linkFile);
+  const urlRow = linkRows.find((e) => e.id === String(urlId));
+  const plainRow = linkRows.find((e) => e.id === String(plainId));
+  if (!urlRow.slug || !plainRow.slug) throw new Error("appendEvent must assign a slug");
+  if (urlRow.slug === plainRow.slug) throw new Error("two events must not share a slug");
+  fs.unlinkSync(linkFile);
 
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
