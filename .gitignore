@@ -6,6 +6,9 @@ test-events.csv
 test-board.csv
 test-contact.csv
 test-roll.csv
+test-bye.csv
+dbg-events.csv
+dbg-state.json
 test-state.json
 test-flyers/
 flyers/

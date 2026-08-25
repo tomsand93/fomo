@@ -18,7 +18,7 @@ const TEST_FLYER_DIR = path.join(__dirname, "test-flyers");
 process.env.FLYER_DIR = TEST_FLYER_DIR;
 fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
 
-const { routeMessage, slotsDueAt, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
+const { routeMessage, slotsDueAt, publishDayOptions, goodbyeText, sendGoodbyes, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -78,6 +78,25 @@ async function demo() {
   if (!fs.existsSync(TEST_EVENTS_FILE)) throw new Error("event should be appended to csv");
   const csvContent = fs.readFileSync(TEST_EVENTS_FILE, "utf8");
   if (!csvContent.includes("מסיבת בדיקה")) throw new Error("csv should contain the submitted event");
+
+  // A completed submission now ends by asking which day the group message should go
+  // out, so the submitter is mid-question rather than idle.
+  if (!submitReply.includes("ללוח השבועי")) {
+    throw new Error("the receipt should say the event is already on the weekly board");
+  }
+  if (!submitReply.includes("שואל את הבוט")) {
+    throw new Error("the receipt should say the event is discoverable by asking the bot");
+  }
+  if (!awaitingPublishChoice.has(sender)) {
+    throw new Error("a completed submission should ask which day to publish");
+  }
+  const dayChosen = await routeMessage(sender, "1"); // on the day of the event
+  if (!dayChosen.includes("נשלח אותו להודעה היומית")) {
+    throw new Error("choosing a publish day should confirm the day");
+  }
+  if (awaitingPublishChoice.has(sender)) {
+    throw new Error("the publish-day question should close once answered");
+  }
 
   // Regression test: right after a submission completes, a non-menu follow-up should
   // acknowledge the situation instead of silently resetting with no context.
@@ -486,6 +505,10 @@ async function demo() {
   if (!receipt.includes("20.9")) throw new Error("receipt should echo the parsed date so a wrong one is visible");
   if (!receipt.includes("18:00")) throw new Error("receipt should echo the start time");
 
+  // The receipt now ends with the publish-day question, so answer it before testing
+  // what happens to a stray message afterwards.
+  await routeMessage(amendSender, "1");
+
   // A correction must reach Stav, not be discarded as a duplicate submission.
   const correction = await routeMessage(amendSender, "תאמת שזה מחר");
   if (correction.includes("אין צורך לשלוח שוב")) {
@@ -509,6 +532,7 @@ async function demo() {
     amendSender,
     'שם האירוע: בדיקת שאלה\nתאריך: 2026-09-21\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/1'
   );
+  await routeMessage(amendSender, "1"); // close the publish-day question first
   const question = await routeMessage(amendSender, "מתי זה יפורסם?");
   if (!question.includes("כבר נשלח לבדיקה")) {
     throw new Error("a question after submission should be acknowledged, not forwarded as an amendment");
@@ -749,6 +773,151 @@ async function demo() {
   if (slotsAt(5, 11, 50) !== "12:00") throw new Error("Friday must have the midday slot");
   if (slotsAt(6, 11, 50) !== "12:00") throw new Error("Saturday must have the midday slot");
   if (slotsAt(6, 17, 50) !== "18:00") throw new Error("Saturday must also have the evening slot");
+
+  // --- Phase 3: publish-day choice, approval flow, goodbye ---
+
+  // Options whose day has already passed are dropped, not offered and rejected, and
+  // the survivors are renumbered so the keys are always contiguous.
+  const near = publishDayOptions("2026-08-27", "2026-08-25"); // two days out
+  if (near.some((o) => o.label === "שבוע לפני")) {
+    throw new Error('"a week before" must not be offered for an event two days away');
+  }
+  const far = publishDayOptions("2026-09-04", "2026-08-25"); // ten days out
+  if (!far.some((o) => o.label === "שבוע לפני")) {
+    throw new Error('"a week before" must be offered for an event ten days away');
+  }
+  for (const options of [near, far]) {
+    options.forEach((option, i) => {
+      if (option.key !== String(i + 1)) {
+        throw new Error(`option keys must be contiguous 1..n, got ${option.key} at index ${i}`);
+      }
+    });
+    if (options[options.length - 1].date !== null) {
+      throw new Error('the last option must be the free-form "another date"');
+    }
+    // A date the submitter cannot act on is worse than one fewer choice.
+    for (const option of options) {
+      if (option.date !== null && option.date < "2026-08-25") {
+        throw new Error(`a publish day in the past must never be offered: ${option.date}`);
+      }
+    }
+  }
+  // For an event tomorrow, "day before" and "as soon as possible" are the same day;
+  // offering the same date twice looks broken.
+  const tomorrowOptions = publishDayOptions("2026-08-26", "2026-08-25");
+  const dates = tomorrowOptions.filter((o) => o.date).map((o) => o.date);
+  if (dates.length !== new Set(dates).size) {
+    throw new Error("publish-day options must not offer the same date twice");
+  }
+
+  // ORDERING REGRESSION: the choice handler must sit above the recentlyCompleted
+  // branch. A bare "2" answering the question would otherwise be read as a stray
+  // follow-up and forwarded to Stav as a correction to the event.
+  const choiceSender = "whatsapp:+972500009111";
+  await routeMessage(choiceSender, "2");
+  await routeMessage(
+    choiceSender,
+    'שם האירוע: בדיקת בחירה\nתאריך: 2026-09-25\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/9'
+  );
+  if (!awaitingPublishChoice.has(choiceSender)) {
+    throw new Error("the publish-day question should be open after a submission");
+  }
+  const numericAnswer = await routeMessage(choiceSender, "2");
+  if (numericAnswer.includes("העברנו")) {
+    throw new Error("a numeric answer to the publish-day question must not be forwarded as an amendment");
+  }
+  if (!numericAnswer.includes("נשלח אותו להודעה היומית")) {
+    throw new Error("a numeric answer should be read as the chosen day");
+  }
+  const chosenRow = eventsStore.loadEvents(TEST_EVENTS_FILE)
+    .find((e) => e.event_name === "בדיקת בחירה");
+  if (chosenRow.daily_days !== "2026-09-24") {
+    throw new Error(`"day before" should record the day before the event, got ${chosenRow.daily_days}`);
+  }
+
+  // The sharper form of the same hazard: an answer that is NOT a menu digit. "2" would
+  // survive a mis-ordering by falling through to menu option 2, but a typed date has no
+  // such luck — below recentlyCompleted it is forwarded to Stav as a correction and the
+  // submitter's answer is lost.
+  const dateAnswerSender = "whatsapp:+972500009555";
+  await routeMessage(dateAnswerSender, "2");
+  await routeMessage(
+    dateAnswerSender,
+    'שם האירוע: בדיקת סדר\nתאריך: 2026-09-28\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/6'
+  );
+  const lastKey = String(awaitingPublishChoice.get(dateAnswerSender).options.length);
+  await routeMessage(dateAnswerSender, lastKey); // choose "another date"
+  const typedDate = await routeMessage(dateAnswerSender, "2026-09-27");
+  if (typedDate.includes("העברנו")) {
+    throw new Error("a typed date answering the question must not be forwarded as an amendment");
+  }
+  if (!typedDate.includes("נשלח אותו להודעה היומית")) {
+    throw new Error("a typed date should be recorded as the chosen day");
+  }
+
+  // "Another date" asks for a date and validates it rather than spending an LLM call.
+  const otherSender = "whatsapp:+972500009222";
+  await routeMessage(otherSender, "2");
+  await routeMessage(
+    otherSender,
+    'שם האירוע: בדיקת תאריך\nתאריך: 2026-09-26\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/8'
+  );
+  const otherKey = String(awaitingPublishChoice.get(otherSender).options.length);
+  const askedDate = await routeMessage(otherSender, otherKey);
+  if (!askedDate.includes("איזה תאריך")) throw new Error('"another date" should ask for a date');
+  if (!(await routeMessage(otherSender, "לא תאריך")).includes("איזה תאריך")) {
+    throw new Error("an unparseable date should re-ask, not crash or accept");
+  }
+  if (!(await routeMessage(otherSender, "2020-01-01")).includes("כבר עבר")) {
+    throw new Error("a past date should be refused");
+  }
+  const acceptedDate = await routeMessage(otherSender, "2026-09-24");
+  if (!acceptedDate.includes("נשלח אותו להודעה היומית")) {
+    throw new Error("a valid future date should be accepted");
+  }
+  if (awaitingPublishChoice.has(otherSender)) {
+    throw new Error("the question should close once a date is given");
+  }
+
+  // Cancelling mid-question must clear it, not strand the sender.
+  const cancelSender = "whatsapp:+972500009333";
+  await routeMessage(cancelSender, "2");
+  await routeMessage(
+    cancelSender,
+    'שם האירוע: בדיקת ביטול\nתאריך: 2026-09-27\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/7'
+  );
+  await routeMessage(cancelSender, "ביטול");
+  if (awaitingPublishChoice.has(cancelSender)) {
+    throw new Error('"ביטול" must clear an open publish-day question');
+  }
+
+  // Both maps must persist: the gap between asking and answering spans hours and a
+  // Fly suspend.
+  const persisted = JSON.parse(fs.readFileSync(TEST_STATE_FILE, "utf8"));
+  if (!("awaitingPublishChoice" in persisted) || !("awaitingDailyChoice" in persisted)) {
+    throw new Error("both publish-choice maps must be persisted across a restart");
+  }
+
+  // The goodbye fires once per published event whose date has passed, and marks the
+  // row so a daily sweep cannot send it again.
+  const byeFile = path.join(__dirname, "test-bye.csv");
+  if (fs.existsSync(byeFile)) fs.unlinkSync(byeFile);
+  fs.writeFileSync(byeFile, eventsStore.CSV_HEADERS.join(",") + "\n", "utf8");
+  const byeId = eventsStore.appendEvent(
+    byeFile,
+    { event_name: "אירוע שעבר", date: "2026-08-20", start_time: "20:00", end_time: "",
+      location: "חיפה", category: "מוזיקה", price: "", organizer: "", contact_link: "",
+      contact_person: "", description: "" },
+    "Twilio WhatsApp", "whatsapp:+972500009444", []
+  );
+  eventsStore.updateEvent(byeFile, byeId, { status: "published" });
+  if (!goodbyeText().includes("שפרסמתם")) {
+    throw new Error("the goodbye should thank the publisher");
+  }
+  if (!goodbyeText().includes("לברר על אירועים")) {
+    throw new Error("the goodbye should mention the bot answers questions");
+  }
+  fs.unlinkSync(byeFile);
 
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);

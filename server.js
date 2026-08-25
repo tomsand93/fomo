@@ -33,6 +33,10 @@ let activeInquiries = new Set(); // senders currently in the "ask about events" 
 let activeInquiryHistories = new Map(); // sender -> [{ role, content }] conversation so far in inquiry mode
 let recentlyCompleted = new Set(); // senders whose last action was a completed submission, for a softer follow-up
 let lastSubmittedEventId = new Map(); // sender -> id of their most recent submission, so a follow-up correction can be attached to it
+// Both survive a restart on purpose: the gap between asking which day to publish and
+// getting an answer is hours, and Fly suspends this machine in between.
+let awaitingPublishChoice = new Map(); // sender -> { eventId, options, expectingDate }
+let awaitingDailyChoice = new Map(); // sender -> { eventId, options, expectingDate }, asked after approval
 let undeliveredAdminNotices = new Set(); // event ids whose review notice never reached the admin, surfaced on her next message
 let askedForClarification = new Set(); // senders already asked a clarifying question this submission, so we never ask twice
 let incompleteAttempts = new Map(); // sender -> consecutive turns still missing required fields, so a draft can't loop forever
@@ -57,6 +61,8 @@ function loadState() {
     activeInquiryHistories = new Map(raw.activeInquiryHistories || []);
     recentlyCompleted = new Set(raw.recentlyCompleted || []);
     lastSubmittedEventId = new Map(raw.lastSubmittedEventId || []);
+    awaitingPublishChoice = new Map(raw.awaitingPublishChoice || []);
+    awaitingDailyChoice = new Map(raw.awaitingDailyChoice || []);
     sentBoards = new Set(raw.sentBoards || []);
     pendingBoards = new Map(raw.pendingBoards || []);
     undeliveredAdminNotices = new Set(raw.undeliveredAdminNotices || []);
@@ -83,6 +89,8 @@ function writeStateNow() {
     // Bounded like noticeSidToEventId: only a recent submission can still be amended,
     // and this map is never cleared per-sender (clearSession deliberately keeps it).
     lastSubmittedEventId: [...lastSubmittedEventId.entries()].slice(-50),
+    awaitingPublishChoice: [...awaitingPublishChoice.entries()].slice(-50),
+    awaitingDailyChoice: [...awaitingDailyChoice.entries()].slice(-50),
     // Only the last few send-windows matter; older keys can never fire again.
     sentBoards: [...sentBoards].slice(-20),
     pendingBoards: [...pendingBoards.entries()].slice(-10),
@@ -302,7 +310,29 @@ function expirePastEvents(events, today = todayIso()) {
     });
   }
   sweepPastFlyers(events, today);
+  sendGoodbyes(events, today);
   return stale;
+}
+
+// Once an event is behind them, thank the publisher and remind them the bot is also
+// there to answer questions. Marked in notes rather than a new column: notes is
+// already the free-form audit field, and this only needs to be idempotent.
+const GOODBYE_NOTE = "נשלח תודה";
+
+function sendGoodbyes(events, today = todayIso()) {
+  for (const event of events) {
+    if (event.status !== "published") continue;
+    if (!event.date || event.date >= today) continue;
+    if (!event.submitter) continue;
+    if ((event.notes || "").includes(GOODBYE_NOTE)) continue;
+
+    // Marked before sending, not after: a send that throws must not leave this
+    // event eligible again tomorrow and every day after.
+    storeUpdateEvent(EVENTS_FILE, event.id, {
+      notes: `${event.notes} | ${GOODBYE_NOTE}`.trim(),
+    });
+    notifySubmitter(event.submitter, goodbyeText());
+  }
 }
 
 // A flyer is only useful while its event is still ahead, and these are megabyte-scale
@@ -356,6 +386,8 @@ function clearSession(sender) {
   activeInquiries.delete(sender);
   activeInquiryHistories.delete(sender);
   recentlyCompleted.delete(sender);
+  awaitingPublishChoice.delete(sender);
+  awaitingDailyChoice.delete(sender);
 }
 
 // A conversation that goes quiet is abandoned, not paused. Without this a half-finished
@@ -368,7 +400,9 @@ function hasSessionState(sender) {
   return (
     activeSubmissions.has(sender) ||
     activeInquiries.has(sender) ||
-    recentlyCompleted.has(sender)
+    recentlyCompleted.has(sender) ||
+    awaitingPublishChoice.has(sender) ||
+    awaitingDailyChoice.has(sender)
   );
 }
 
@@ -634,6 +668,34 @@ async function notifySubmitter(sender, text) {
   }
 }
 
+// Approval tells the submitter three things in order: it is live, it is already on
+// the board and discoverable, and — if they have not already chosen a day — which
+// day they would like it in the group message.
+//
+// This message is the one most likely to fall outside the submitter's 24h WhatsApp
+// window, since it arrives whenever Stav gets round to reviewing. If it never
+// lands, the event is still on the board; only the optional group slot is missed.
+async function notifyApproved(sender, id, event) {
+  const alreadyChose = Boolean(event.daily_days);
+  const lines = [`האירוע שלכם "${event.event_name}" אושר ויפורסם 🎉`];
+
+  if (alreadyChose) {
+    await notifySubmitter(sender, lines.join("\n"));
+    return;
+  }
+
+  if (!event.date || !isValidDate(event.date)) {
+    await notifySubmitter(sender, lines.join("\n"));
+    return;
+  }
+
+  const options = publishDayOptions(event.date);
+  awaitingDailyChoice.set(sender, { eventId: id, options, expectingDate: false });
+  saveState();
+  lines.push("", publishChoiceText(event, options));
+  await notifySubmitter(sender, lines.join("\n"));
+}
+
 const ADMIN_HELP_TEXT = `פקודות ניהול:
 הכי פשוט: ענו על הודעת האירוע עצמה עם "אשר" או "דחה"
 
@@ -790,7 +852,7 @@ async function handleAdminMessage(text, repliedSid = "") {
     }
     storeUpdateEvent(EVENTS_FILE, id, { status: "published", published_at: todayIso() });
     if (existing.submitter) {
-      await notifySubmitter(existing.submitter, `האירוע שלכם "${existing.event_name}" אושר ויפורסם 🎉`);
+      await notifyApproved(existing.submitter, id, existing);
     }
     // The API can't post into a normal WhatsApp group (channels.md), so send the finished
     // post for her to forward. An event happening today has missed its scheduled slot or
@@ -1019,7 +1081,18 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
   lastSubmittedEventId.set(sender, id);
   const flyer = persistFlyer(id, firstImage);
   await forwardEventToAdmin(id, event, sender, unresolved, flyer);
-  return formatSubmissionReceipt(event, flyer);
+  // The receipt confirms what was captured; the question that follows is the one
+  // decision the submitter still owns. Asked now, while they are still in the
+  // conversation — the same question after approval often lands outside WhatsApp's
+  // 24h window and is never seen.
+  const receipt = formatSubmissionReceipt(event, flyer);
+  if (event.date && isValidDate(event.date)) {
+    const options = publishDayOptions(event.date);
+    awaitingPublishChoice.set(sender, { eventId: id, options, expectingDate: false });
+    saveState();
+    return `${receipt}\n\n${publishChoiceText(event, options)}`;
+  }
+  return receipt;
 }
 
 // A bare "we got it" gave the submitter nothing to check against, so a misread date or
@@ -1041,6 +1114,112 @@ function formatSubmissionReceipt(event, flyer = "") {
     'משהו לא נכון? פשוט כתבו לנו כאן מה לתקן.',
   ];
   return lines.filter((line) => line !== null).join("\n");
+}
+
+// When the group message should go out. Options whose day has already passed are
+// dropped rather than offered and rejected — "a week before" is meaningless for an
+// event three days away — and the survivors are renumbered so the keys are always
+// 1..n with no gaps. The shape is deliberately {key, label, date}: a quick-reply
+// button carries exactly this, so switching from typed numbers to taps later is a
+// rendering change and nothing more.
+const OTHER_DATE_KEY = "אחר";
+
+function publishDayOptions(eventDate, today = todayIso()) {
+  const candidates = [
+    { label: "ביום האירוע", date: eventDate },
+    { label: "יום לפני", date: addDays(eventDate, -1) },
+    { label: "שבוע לפני", date: addDays(eventDate, -7) },
+    { label: "בהקדם האפשרי", date: today },
+  ].filter((option) => option.date >= today && option.date <= eventDate);
+
+  // Distinct dates only: for an event tomorrow, "day before" and "as soon as
+  // possible" are the same day, and offering it twice looks broken.
+  const seen = new Set();
+  const unique = candidates.filter((option) => {
+    if (seen.has(option.date)) return false;
+    seen.add(option.date);
+    return true;
+  });
+
+  const options = unique.map((option, i) => ({ ...option, key: String(i + 1) }));
+  options.push({ key: String(options.length + 1), label: "תאריך אחר", date: null });
+  return options;
+}
+
+function renderOptions(options) {
+  return options.map((option) => `${option.key}. ${option.label}`).join("\n");
+}
+
+const PUBLISH_CHOICE_INTRO = `רוצים שנפרסם אותו גם בהודעה היומית בקבוצה? באיזה יום?`;
+
+// Everything the submitter is told once their event is in: it is already on the
+// board, other people can find it by asking the bot, and here is the one decision
+// left. Requirement order matters — board first, then the question.
+function publishChoiceText(event, options) {
+  return [
+    "📋 האירוע נכנס אוטומטית ללוח השבועי שלנו,",
+    "וגם מי ששואל את הבוט על אירועים בעיר יגלה אותו.",
+    "",
+    PUBLISH_CHOICE_INTRO,
+    renderOptions(options),
+  ].join("\n");
+}
+
+const NO_DAILY_TEXT = "אין בעיה — האירוע יופיע בלוח השבועי בלבד.";
+const ASK_OTHER_DATE_TEXT = 'איזה תאריך? כתבו בפורמט YYYY-MM-DD (למשל 2026-09-14).';
+
+function goodbyeText() {
+  return [
+    "איזה כיף שפרסמתם אצלנו!",
+    "תהנו באירוע שלכם 🎉",
+    "לא לשכוח שאפשר גם לדבר עם הבוט שלנו ולברר על אירועים",
+  ].join("\n");
+}
+
+// Records the chosen day on the event and closes the question.
+function recordDailyDay(sender, pending, date, map) {
+  const event = storeFindEvent(EVENTS_FILE, pending.eventId);
+  if (event) {
+    const days = new Set((event.daily_days || "").split(",").filter(Boolean));
+    days.add(date);
+    storeUpdateEvent(EVENTS_FILE, pending.eventId, { daily_days: [...days].sort().join(",") });
+  }
+  map.delete(sender);
+  saveState();
+  const [, , month, day] = date.match(/^(\d{4})-(\d{2})-(\d{2})$/) || [];
+  const when = day ? `${Number(day)}.${Number(month)}` : date;
+  return `סגור — נשלח אותו להודעה היומית ב-${when}. 🙌`;
+}
+
+// Shared by both questions: the one asked right after submission and the one asked
+// again after Stav approves. Same options, same parsing, different map.
+function handleDayChoice(sender, trimmed, map) {
+  const pending = map.get(sender);
+
+  if (pending.expectingDate) {
+    if (!isValidDate(trimmed)) {
+      return ASK_OTHER_DATE_TEXT;
+    }
+    if (trimmed < todayIso()) {
+      return "התאריך הזה כבר עבר. כתבו תאריך מהיום והלאה.";
+    }
+    return recordDailyDay(sender, pending, trimmed, map);
+  }
+
+  const chosen = pending.options.find((option) => option.key === trimmed);
+  if (!chosen) {
+    // Not a menu key. Rather than scold, re-show the options — a submitter who
+    // typed a sentence here is answering the question, just not in the shape asked.
+    return `${PUBLISH_CHOICE_INTRO}\n${renderOptions(pending.options)}`;
+  }
+
+  if (chosen.date === null) {
+    map.set(sender, { ...pending, expectingDate: true });
+    saveState();
+    return ASK_OTHER_DATE_TEXT;
+  }
+
+  return recordDailyDay(sender, pending, chosen.date, map);
 }
 
 const ADMIN_MODE_KEYWORDS = new Set(["ניהול", "admin"]);
@@ -1109,6 +1288,17 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
 
   if (activeSubmissions.has(sender)) {
     return handleActiveSubmission(sender, text, mediaUrls);
+  }
+
+  // Must sit above the recentlyCompleted branch below: a bare "2" answering the
+  // publish-day question would otherwise be read as a stray follow-up and forwarded
+  // to Stav as a correction to the event.
+  if (awaitingPublishChoice.has(sender)) {
+    return handleDayChoice(sender, trimmed, awaitingPublishChoice);
+  }
+
+  if (awaitingDailyChoice.has(sender)) {
+    return handleDayChoice(sender, trimmed, awaitingDailyChoice);
   }
 
   if (activeInquiries.has(sender)) {
@@ -1261,9 +1451,14 @@ module.exports = {
   get adminMode() { return adminMode; },
   get lastActivity() { return lastActivity; },
   rememberNotice,
-  // Pure, so the schedule can be tested without sending anything.
+  // Pure, so the schedule and the choice list can be tested without sending anything.
   isDue,
   slotsDueAt,
+  publishDayOptions,
+  goodbyeText,
+  sendGoodbyes,
+  get awaitingPublishChoice() { return awaitingPublishChoice; },
+  get awaitingDailyChoice() { return awaitingDailyChoice; },
   DAILY_SLOTS,
   SEND_WINDOW_MINUTES,
   expireIdleSessions,
