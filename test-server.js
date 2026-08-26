@@ -1123,34 +1123,53 @@ async function demo() {
     throw new Error("without an approved template the choice must be sent as text");
   }
 
-  // Once approved, the same call sends a template instead, with the body and each
-  // label as positional variables.
-  interactive._setApprovedTemplates(new Map([["fomo_publish_day", "HXquick"]]));
+  // Once approved, the same call sends a template. The variables are supplied by the
+  // caller, NOT derived from the question: every approved template has literal text with
+  // {{1}} standing for a value inside it (Meta rejects a body that is only a parameter),
+  // so deriving them produced the sentence nested inside itself.
+  interactive._setApprovedTemplates(new Map([["fomo_publish_day_v2", "HXquick"]]));
   await interactive.sendChoice("whatsapp:+972500001111", {
-    text: "שאלה", options: threeOptions, template: "fomo_publish_day",
+    text: "שאלה", options: threeOptions, template: "fomo_publish_day_v2",
+    variables: { 1: "מסיבת קיץ" },
   });
   if (posted[1].ContentSid !== "HXquick") throw new Error("an approved template should be used");
   const vars = JSON.parse(posted[1].ContentVariables);
-  if (vars["1"] !== "שאלה" || vars["2"] !== "ביום האירוע") {
-    throw new Error("the body and option labels must be passed as positional variables");
+  if (vars["1"] !== "מסיבת קיץ") {
+    throw new Error("the caller's variables must be passed through unchanged");
+  }
+  if (vars["2"]) {
+    throw new Error("option labels must not be appended as variables — the buttons are fixed");
   }
 
-  // WhatsApp shows at most three quick replies. More than that needs a list template,
-  // and without one the choice stays text rather than being sent unrenderable.
+  // A template's buttons are fixed at approval time, so it can only be used when the
+  // option keys line up exactly. Five options do not, so this must stay text — otherwise
+  // someone taps "day before" and the bot records something else.
   await interactive.sendChoice("whatsapp:+972500001111", {
-    text: "שאלה", options: fiveOptions, template: "fomo_publish_day",
+    text: "שאלה", options: fiveOptions, template: "fomo_publish_day_v2",
+    variables: { 1: "מסיבת קיץ" },
   });
   if (posted[2].ContentSid) {
-    throw new Error("more than three options must not be sent as a quick-reply template");
+    throw new Error("an option list that does not match the template's buttons must stay text");
   }
-  interactive._setApprovedTemplates(new Map([
-    ["fomo_publish_day", "HXquick"], ["fomo_publish_day_list", "HXlist"],
-  ]));
+  // Same count, different keys: still a mismatch.
+  const wrongKeys = [
+    { key: "7", label: "א", date: "2026-09-20" },
+    { key: "8", label: "ב", date: "2026-09-19" },
+    { key: "9", label: "ג", date: null },
+  ];
   await interactive.sendChoice("whatsapp:+972500001111", {
-    text: "שאלה", options: fiveOptions, template: "fomo_publish_day",
+    text: "שאלה", options: wrongKeys, template: "fomo_publish_day_v2",
+    variables: { 1: "מסיבת קיץ" },
   });
-  if (posted[3].ContentSid !== "HXlist") {
-    throw new Error("more than three options should use the list template when approved");
+  if (posted[3].ContentSid) {
+    throw new Error("three options with the wrong keys must not use the template");
+  }
+  // The registry must describe the templates that actually exist.
+  if (interactive.templateButtonKeys("fomo_publish_day_v2").join() !== "1,2,3") {
+    throw new Error("fomo_publish_day_v2 buttons must be 1,2,3");
+  }
+  if (interactive.templateButtonKeys("fomo_review_event").length !== 3) {
+    throw new Error("fomo_review_event must declare its three buttons");
   }
 
   // A template failure must never cost the message.

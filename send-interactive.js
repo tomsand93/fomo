@@ -100,6 +100,22 @@ function approvedTemplateSid(name) {
   return approvedTemplates.get(name) || "";
 }
 
+// What each approved template's buttons actually send back, in order. Buttons are fixed
+// when Meta approves a template, so a template can only be used when the caller's
+// options line up with it exactly — otherwise the person taps "day before" and the bot
+// reads it as something else entirely. Kept here beside the send so the two cannot
+// drift apart silently.
+const TEMPLATE_BUTTON_KEYS = new Map([
+  ["fomo_publish_day_v2", ["1", "2", "3"]],
+  ["fomo_publish_day", ["1", "2", "3"]],
+  ["fomo_main_menu", ["1", "2", "4"]],
+  ["fomo_review_event", ["אשר", "דחה", "ממתינים"]],
+]);
+
+function templateButtonKeys(name) {
+  return TEMPLATE_BUTTON_KEYS.get(name) || [];
+}
+
 // The fallback, and the thing every test compares against: one numbered line per
 // option, in the same order the buttons would appear.
 function renderNumbered(text, options) {
@@ -107,11 +123,15 @@ function renderNumbered(text, options) {
   return list ? `${text}\n\n${list}` : text;
 }
 
-// Twilio substitutes {{1}}, {{2}}... positionally. The body text is the first
-// variable; each option contributes its label after that, in order.
-function buildVariables(text, options) {
-  const variables = { 1: text };
-  options.forEach((option, i) => { variables[i + 2] = option.label; });
+// Twilio substitutes {{1}}, {{2}}... positionally.
+//
+// The caller supplies these, because only the caller knows what its template's body
+// says. An earlier version derived them here — passing the whole question as {{1}} and
+// each option label after it — which assumed a body of bare "{{1}}". Meta rejects that
+// shape ("only have parameters"), so every approved template has literal text with the
+// variables standing for values inside it, and the derived version produced sentences
+// nested inside themselves.
+function buildVariables(variables = {}) {
   return JSON.stringify(variables);
 }
 
@@ -126,20 +146,31 @@ async function sendContentTemplate(to, contentSid, variables) {
 // A choice, however it ends up being rendered. `template` names a Content template;
 // when it is missing, unapproved, or the send fails, the caller still gets a numbered
 // list rather than an error.
-async function sendChoice(to, { text, options = [], template = "" }) {
+// `variables` are the template's own {{1}}, {{2}}... values — the caller knows what its
+// body says, so it supplies them. `text` is only ever the fallback wording, which is why
+// the two are separate: the template renders its own sentence, the fallback renders the
+// full question plus a numbered list.
+async function sendChoice(to, { text, options = [], template = "", variables = {} }) {
   const numbered = renderNumbered(text, options);
   if (!template || !options.length) return sendWhatsAppText(to, numbered);
 
-  // More options than WhatsApp will show as buttons is not an error, just a different
-  // template; without one registered it stays text.
-  const wanted = options.length > MAX_QUICK_REPLY_BUTTONS ? `${template}_list` : template;
+  // A template's buttons are fixed at approval time, so it can only be used when the
+  // options match it exactly. A shorter list (dates already past) or a longer one would
+  // show the wrong choices, and the numbered fallback is correct in every case.
+  const buttons = templateButtonKeys(template);
+  const matches = buttons.length === options.length
+    && buttons.every((key, i) => key === options[i].key);
+  if (options.length > MAX_QUICK_REPLY_BUTTONS || !matches) {
+    return sendWhatsAppText(to, numbered);
+  }
 
   try {
     await ensureTemplates();
-    const sid = approvedTemplateSid(wanted);
+    const sid = approvedTemplateSid(template);
     if (!sid) return sendWhatsAppText(to, numbered);
-    return await sendContentTemplate(to, sid, buildVariables(text, options));
+    return await sendContentTemplate(to, sid, buildVariables(variables));
   } catch (err) {
+    const wanted = template;
     // Never lose a message to a template problem.
     console.error(`content send failed for ${wanted}, falling back to text:`, err.message);
     return sendWhatsAppText(to, numbered);
@@ -155,6 +186,8 @@ module.exports = {
   renderNumbered,
   buildVariables,
   approvedTemplateSid,
+  templateButtonKeys,
+  TEMPLATE_BUTTON_KEYS,
   refreshTemplates,
   ensureTemplates,
   MAX_QUICK_REPLY_BUTTONS,

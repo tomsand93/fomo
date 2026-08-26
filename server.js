@@ -184,7 +184,7 @@ const SEND_WINDOW_MINUTES = 15;
 // The Content template this bot expects for the publish-day question. Registering it
 // and getting Meta to approve it is a Twilio task, not a code one; until that happens
 // the name resolves to nothing and the question renders as a numbered list.
-const PUBLISH_DAY_TEMPLATE = "fomo_publish_day";
+const PUBLISH_DAY_TEMPLATE = "fomo_publish_day_v2";
 const LOG_RETENTION_DAYS = 90;
 const LOG_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // Both are persisted: sentBoards was previously in-memory only, so a restart inside the
@@ -816,7 +816,16 @@ async function notifyApproved(sender, id, event) {
   if (process.env.NODE_ENV === "test") return;
   const prompt = `${lines.join("\n")}\n\n${publishChoicePrompt()}`;
   try {
-    await sendChoice(sender, { text: prompt, options, template: PUBLISH_DAY_TEMPLATE });
+    // The template's body already says "your event X was approved… which day?", so its
+    // only variable is the name. `text` is the fallback wording, used when the option
+    // list does not match the template's fixed buttons — which is most of the time, since
+    // publishDayOptions returns up to six.
+    await sendChoice(sender, {
+      text: prompt,
+      options,
+      template: PUBLISH_DAY_TEMPLATE,
+      variables: { 1: event.event_name },
+    });
   } catch (err) {
     console.error("failed to send the approval notice:", err);
   }
