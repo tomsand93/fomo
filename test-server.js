@@ -937,6 +937,15 @@ async function demo() {
     throw new Error("the location prompt must say the venue name and address are wanted");
   }
 
+  // The review buttons go as a second message because a template carries only its own
+  // approved body — putting the buttons on the preview would mean approving an event
+  // without seeing what the group gets. Their payloads are the commands themselves, so
+  // a tap reaches the router looking exactly like Stav typing the word.
+  const reviewButtons = require("./send-interactive").templateButtonKeys("fomo_review_event");
+  if (reviewButtons.join() !== "אשר,דחה,ממתינים") {
+    throw new Error(`review buttons must send the commands themselves, got ${reviewButtons}`);
+  }
+
   // Declining is an answer, not a failure to answer. Before this option existed, a
   // submitter who only wanted the weekly board had no way to say so: a non-matching
   // reply just re-asked, and ignoring it let the question expire silently.

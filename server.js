@@ -15,7 +15,7 @@ const { sendWhatsApp, getMessageStatus } = require("./send-whatsapp");
 const { fetchMediaAsDataUrl } = require("./fetch-media");
 const { saveFlyer, flyerPath, contentTypeFor, deleteFlyer } = require("./flyer-store");
 const { logClick, logInteraction, clickStats, pruneOlderThan } = require("./clicks-store");
-const { sendChoice, renderNumbered } = require("./send-interactive");
+const { sendChoice, renderNumbered, approvedTemplateSid } = require("./send-interactive");
 
 const PORT = Number(process.env.PORT || 3000);
 const EVENTS_FILE = process.env.EVENTS_FILE || "events.csv";
@@ -734,6 +734,45 @@ function flyerUrl(name) {
   return `${PUBLIC_BASE_URL.replace(/\/$/, "")}/flyer/${encodeURIComponent(name)}`;
 }
 
+// A button tap is not a reply, so WhatsApp may not send OriginalRepliedMessageSid with
+// it. That would leave a tapped "אשר" with nothing to resolve against. This is NOT the
+// old "most recent event" fallback: it is the single event whose buttons were sent last
+// and not yet acted on, cleared the moment anything resolves it, so it cannot drift onto
+// an unrelated event the way the old guess did.
+let lastButtonEventId = "";
+
+const REVIEW_TEMPLATE = "fomo_review_event";
+// The template's buttons send these back as ButtonPayload. handleTwilio normalises that
+// into the message text, so a tap arrives looking exactly like her typing the word —
+// which is why the ids are the commands themselves rather than digits.
+const REVIEW_BUTTON_OPTIONS = [
+  { key: "אשר", label: "אשר ופרסם" },
+  { key: "דחה", label: "דחה" },
+  { key: "ממתינים", label: "הצג ממתינים" },
+];
+
+// Sent right after the preview, so she can tap instead of typing "אשר 12". Silent when
+// no template is approved — the preview already carries typed instructions, and a
+// second message repeating them would just be noise.
+async function sendReviewButtons(id, eventName) {
+  if (!approvedTemplateSid(REVIEW_TEMPLATE)) return;
+  try {
+    const result = await sendChoice(ADMIN_SENDER, {
+      // text is the fallback wording; it is only used if the template send fails.
+      text: `אירוע #${id} ממתין לאישור.`,
+      options: REVIEW_BUTTON_OPTIONS,
+      template: REVIEW_TEMPLATE,
+      variables: { 1: eventName },
+    });
+    // Re-bind to this message: a bare "אשר" resolves through the sid of whatever she
+    // replied to, and from here on that is the buttons, not the preview above it.
+    if (result && result.sid) rememberNotice(result.sid, id);
+    lastButtonEventId = String(id);
+  } catch (err) {
+    console.error(`failed to send review buttons for event #${id}:`, err);
+  }
+}
+
 async function forwardEventToAdmin(id, event, sender, unresolved = [], flyer = "") {
   if (process.env.NODE_ENV === "test") return;
   try {
@@ -748,6 +787,14 @@ async function forwardEventToAdmin(id, event, sender, unresolved = [], flyer = "
       flyerUrl(flyer)
     );
     rememberNotice(result.sid, id);
+
+    // The previews and the buttons cannot share a message: a template message carries
+    // only its own approved body, so putting the buttons on it would mean approving an
+    // event without seeing what the group gets. They go as a second, short message
+    // instead — and the notice id is re-bound to it, because that is the one she taps
+    // or replies to. Falls back to nothing extra when no template is approved: the
+    // first message already told her how to approve by typing.
+    await sendReviewButtons(id, stored.event_name);
     // Assume undelivered until proven otherwise, so a crash mid-check fails safe (the event
     // still gets surfaced on Stav's next message) rather than silently disappearing.
     undeliveredAdminNotices.add(String(id));
@@ -933,10 +980,12 @@ const ADMIN_COMMAND_RE = /^(אשר|דחה)(?:\s*#?(\d+))?\s*(.*)$/;
 // A bare command used to fall back to the most recently notified event, which silently
 // rejected #8 when Stav replied "דחה" to a reminder listing #3 and #5, and rejected #10
 // when she typed "2" meaning the menu's "publish an event". An unresolvable command now
-// asks which event instead of picking one.
+// asks which event instead of picking one — except for lastButtonEventId, which is a
+// single named event rather than a guess (see its declaration).
 function resolveEventId(explicitId, repliedSid) {
   if (explicitId) return String(explicitId);
   if (repliedSid && noticeSidToEventId.has(repliedSid)) return noticeSidToEventId.get(repliedSid);
+  if (lastButtonEventId) return lastButtonEventId;
   return "";
 }
 
@@ -1030,6 +1079,9 @@ async function handleAdminMessage(text, repliedSid = "") {
 
   // Acting on an event means it was seen; stop flagging it as a missed notice.
   if (undeliveredAdminNotices.delete(String(id))) saveState();
+  // Consumed: the buttons have done their job, and leaving this set would let the next
+  // bare command land on an event nobody was looking at.
+  if (lastButtonEventId === String(id)) lastButtonEventId = "";
 
   if (action === "אשר") {
     if (existing.status === "published") {
