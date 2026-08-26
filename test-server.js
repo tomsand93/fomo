@@ -18,7 +18,7 @@ const TEST_FLYER_DIR = path.join(__dirname, "test-flyers");
 process.env.FLYER_DIR = TEST_FLYER_DIR;
 fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
 
-const { routeMessage, slotsDueAt, destinationFor, shortLink, formatEventForReview, publishDayOptions, goodbyeText, sendGoodbyes, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
+const { routeMessage, slotsDueAt, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, publishDayOptions, goodbyeText, sendGoodbyes, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -71,7 +71,7 @@ async function demo() {
   // Dated relative to today: past-dated submissions now expire themselves, so a hardcoded
   // date silently turns this into an expiry test the moment it slips into the past.
   const futureDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  const eventText = `שם האירוע: מסיבת בדיקה\nתאריך: ${futureDate}\nשעה: 21:00\nמיקום: חיפה\nקטגוריה: מסיבה\nקישור: https://example.com`;
+  const eventText = `שם האירוע: מסיבת בדיקה\nתאריך: ${futureDate}\nשעה: 21:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מסיבה\nקישור: https://example.com`;
   const submitReply = await routeMessage(sender, eventText);
   if (!submitReply.includes("קיבלנו את האירוע")) throw new Error("complete event should be accepted");
   if (activeSubmissions.has(sender)) throw new Error("active submission should be cleared after submission");
@@ -412,7 +412,7 @@ async function demo() {
   // (#3, #5) that could no longer be published whatever she decided.
   const pastEvent = {
     id: "", status: "submitted", event_name: "אירוע שעבר", date: "2020-01-01",
-    start_time: "20:00", location: "חיפה", category: "מסיבה", contact_link: "https://e.com",
+    start_time: "20:00", location: "בר בזל, מסדה 12, חיפה", category: "מסיבה", contact_link: "https://e.com",
   };
   const pastId = eventsStore.appendEvent(TEST_EVENTS_FILE, pastEvent, "test", "whatsapp:+972500000088", []);
 
@@ -467,7 +467,7 @@ async function demo() {
   const { missingFields: mf } = require("./server");
   const freeBase = {
     event_name: "ג'אם", date: "2099-08-14", start_time: "12:00",
-    location: "חיפה", category: "מוזיקה חיה", contact_link: "",
+    location: "בר בזל, מסדה 12, חיפה", category: "מוזיקה חיה", contact_link: "",
   };
   const wantsLink = (price) => mf({ ...freeBase, price }).some((f) => f.includes("קישור"));
 
@@ -482,7 +482,9 @@ async function demo() {
   if (!wantsLink("")) throw new Error("an unpriced event must still require a link");
   // The exemption is scoped to contact_link; everything else stays required.
   const stillMissing = mf({ ...freeBase, price: "כניסה חופשית", event_name: "", location: "" });
-  if (!stillMissing.includes("שם האירוע") || !stillMissing.includes("מיקום")) {
+  // The location label now spells out what is wanted ("venue name and address"), so
+  // match the prefix rather than the whole string.
+  if (!stillMissing.includes("שם האירוע") || !stillMissing.some((m) => m.startsWith("מיקום"))) {
     throw new Error("the free-entry exemption must not relax the other required fields");
   }
 
@@ -496,7 +498,7 @@ async function demo() {
   await routeMessage(amendSender, "2");
   const receipt = await routeMessage(
     amendSender,
-    'שם האירוע: לילה לבן\nתאריך: 2026-09-20\nשעה: 18:00\nמיקום: חיפה\nקטגוריה: תרבות\nקישור: https://haifa.muni.il/x'
+    'שם האירוע: לילה לבן\nתאריך: 2026-09-20\nשעה: 18:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: תרבות\nקישור: https://haifa.muni.il/x'
   );
 
   // The receipt must echo the captured fields: a bare "we got it" gave the submitter
@@ -530,7 +532,7 @@ async function demo() {
   await routeMessage(amendSender, "2");
   await routeMessage(
     amendSender,
-    'שם האירוע: בדיקת שאלה\nתאריך: 2026-09-21\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/1'
+    'שם האירוע: בדיקת שאלה\nתאריך: 2026-09-21\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/1'
   );
   await routeMessage(amendSender, "1"); // close the publish-day question first
   const question = await routeMessage(amendSender, "מתי זה יפורסם?");
@@ -545,7 +547,7 @@ async function demo() {
   const before = eventsStore.loadEvents(TEST_EVENTS_FILE).length;
   const mlId = eventsStore.appendEvent(
     TEST_EVENTS_FILE,
-    { event_name: "רב-שורות", date: "2026-09-22", start_time: "21:00", end_time: "", location: "חיפה", category: "מוזיקה", price: "", organizer: "", contact_link: "https://x.co/2", description: multiline },
+    { event_name: "רב-שורות", date: "2026-09-22", start_time: "21:00", end_time: "", location: "בר בזל, מסדה 12, חיפה", category: "מוזיקה", price: "", organizer: "", contact_link: "https://x.co/2", description: multiline },
     "Twilio WhatsApp",
     "whatsapp:+972500008888",
     []
@@ -699,7 +701,7 @@ async function demo() {
   const cpId = eventsStore.appendEvent(
     cpFile,
     { event_name: "עם איש קשר", date: "2026-09-22", start_time: "20:00", end_time: "",
-      location: "חיפה", category: "מוזיקה", price: "", organizer: "",
+      location: "בר בזל, מסדה 12, חיפה", category: "מוזיקה", price: "", organizer: "",
       contact_link: "https://x.co/2", contact_person: "רינה", description: "" },
     "Twilio WhatsApp",
     "whatsapp:+972500001234",
@@ -749,7 +751,7 @@ async function demo() {
   for (const [name, date] of [["אתמול", "2026-08-22"], ["מחרתיים", "2026-08-26"]]) {
     const rid = eventsStore.appendEvent(
       rollFile,
-      { event_name: name, date, start_time: "20:00", end_time: "", location: "חיפה",
+      { event_name: name, date, start_time: "20:00", end_time: "", location: "בר בזל, מסדה 12, חיפה",
         category: "מוזיקה", price: "", organizer: "", contact_link: "", contact_person: "",
         description: "" },
       "Twilio WhatsApp", "whatsapp:+972500004321", []
@@ -823,7 +825,7 @@ async function demo() {
   await routeMessage(choiceSender, "2");
   await routeMessage(
     choiceSender,
-    'שם האירוע: בדיקת בחירה\nתאריך: 2026-09-25\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/9'
+    'שם האירוע: בדיקת בחירה\nתאריך: 2026-09-25\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/9'
   );
   if (!awaitingPublishChoice.has(choiceSender)) {
     throw new Error("the publish-day question should be open after a submission");
@@ -849,7 +851,7 @@ async function demo() {
   await routeMessage(dateAnswerSender, "2");
   await routeMessage(
     dateAnswerSender,
-    'שם האירוע: בדיקת סדר\nתאריך: 2026-09-28\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/6'
+    'שם האירוע: בדיקת סדר\nתאריך: 2026-09-28\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/6'
   );
   // Pick by intent, not position: the option list gained a decline entry at the end.
   const lastKey = awaitingPublishChoice.get(dateAnswerSender).options
@@ -884,8 +886,13 @@ async function demo() {
   if (!notice.includes("📍 סילביה, החלוץ 27 · 🎟️ 70 ₪")) {
     throw new Error("the review notice must contain the short board rendering");
   }
-  if (!notice.includes("📅 20.10 · 🕗 21:00-23:00")) {
+  // The long rendering drops the date (the daily message has it in the heading) and
+  // puts time and entrance on one line, which is what distinguishes it from the short.
+  if (!notice.includes("🕗 21:00-23:00 · 🎟️ 70 ₪")) {
     throw new Error("the review notice must contain the long daily rendering");
+  }
+  if (notice.includes("📅 20.10")) {
+    throw new Error("the daily preview must not repeat the date — the heading carries it");
   }
   if (!notice.includes("👤 מאיה")) {
     throw new Error("the long preview must show the contact person");
@@ -906,6 +913,30 @@ async function demo() {
     throw new Error(`the review notice must fit in one message, got ${longDescription.length}`);
   }
 
+  // "Haifa" is not somewhere you can turn up to. A bare city is treated as missing so
+  // the submitter is asked for the venue and street, which is what Stav needs to
+  // publish — and the label says so rather than just repeating "location".
+  const vagueBase = {
+    event_name: "x", date: "2026-12-12", start_time: "20:00",
+    category: "מוזיקה", price: "כניסה חופשית",
+  };
+  for (const vague of ["חיפה", "Haifa", "בחיפה"]) {
+    const missing = serverMissingFields({ ...vagueBase, location: vague });
+    if (!missing.some((m) => m.startsWith("מיקום"))) {
+      throw new Error(`a bare city (${vague}) must be treated as a missing location`);
+    }
+  }
+  for (const real of ["בר בזל, מסדה 12, חיפה", "סילביה החלוץ 27", "ALF BAR, דרך יפו 44"]) {
+    const missing = serverMissingFields({ ...vagueBase, location: real });
+    if (missing.some((m) => m.startsWith("מיקום"))) {
+      throw new Error(`a real venue and address must be accepted: ${real}`);
+    }
+  }
+  if (!serverMissingFields({ ...vagueBase, location: "חיפה" })
+    .some((m) => m.includes("הכתובת"))) {
+    throw new Error("the location prompt must say the venue name and address are wanted");
+  }
+
   // Declining is an answer, not a failure to answer. Before this option existed, a
   // submitter who only wanted the weekly board had no way to say so: a non-matching
   // reply just re-asked, and ignoring it let the question expire silently.
@@ -913,7 +944,7 @@ async function demo() {
   await routeMessage(declineSender, "2");
   await routeMessage(
     declineSender,
-    'שם האירוע: בדיקת סירוב\nתאריך: 2026-09-29\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/4'
+    'שם האירוע: בדיקת סירוב\nתאריך: 2026-09-29\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/4'
   );
   const declineKey = awaitingPublishChoice.get(declineSender).options
     .find((o) => o.date === "decline").key;
@@ -937,7 +968,7 @@ async function demo() {
   await routeMessage(otherSender, "2");
   await routeMessage(
     otherSender,
-    'שם האירוע: בדיקת תאריך\nתאריך: 2026-09-26\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/8'
+    'שם האירוע: בדיקת תאריך\nתאריך: 2026-09-26\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/8'
   );
   const otherKey = awaitingPublishChoice.get(otherSender).options
     .find((o) => o.date === null).key;
@@ -962,7 +993,7 @@ async function demo() {
   await routeMessage(cancelSender, "2");
   await routeMessage(
     cancelSender,
-    'שם האירוע: בדיקת ביטול\nתאריך: 2026-09-27\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/7'
+    'שם האירוע: בדיקת ביטול\nתאריך: 2026-09-27\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/7'
   );
   await routeMessage(cancelSender, "ביטול");
   if (awaitingPublishChoice.has(cancelSender)) {
@@ -984,7 +1015,7 @@ async function demo() {
   const byeId = eventsStore.appendEvent(
     byeFile,
     { event_name: "אירוע שעבר", date: "2026-08-20", start_time: "20:00", end_time: "",
-      location: "חיפה", category: "מוזיקה", price: "", organizer: "", contact_link: "",
+      location: "בר בזל, מסדה 12, חיפה", category: "מוזיקה", price: "", organizer: "", contact_link: "",
       contact_person: "", description: "" },
     "Twilio WhatsApp", "whatsapp:+972500009444", []
   );
@@ -1192,7 +1223,7 @@ async function demo() {
   await routeMessage(tapSender, "2");
   await routeMessage(
     tapSender,
-    'שם האירוע: בדיקת כפתור\nתאריך: 2026-10-05\nשעה: 20:00\nמיקום: חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/5'
+    'שם האירוע: בדיקת כפתור\nתאריך: 2026-10-05\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/5'
   );
   if (!awaitingPublishChoice.has(tapSender)) {
     throw new Error("the publish-day question should be open before testing a tap");

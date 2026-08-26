@@ -90,25 +90,33 @@ function formatShort(event, { linkFor = defaultLinkFor } = {}) {
 // LONG: the full pitch. Returns the flyer separately rather than as a text line —
 // Twilio carries it as MediaUrl on the same message, so the caller never has to
 // re-derive it.
-function formatLong(event, { linkFor = defaultLinkFor, flyerUrl = () => "" } = {}) {
-  const when = [];
-  if (event.date) when.push(`📅 ${shortDate(event.date)}`);
-  if (event.start_time) {
-    when.push(`🕗 ${event.start_time}${event.end_time ? `-${event.end_time}` : ""}`);
-  }
-
+//
+// No date line: both the daily message and the weekly board carry the date in a
+// heading above the event, so repeating it per event was noise. `withDate` puts it
+// back for the one case that has no heading — a single event forwarded on its own,
+// where dropping it would lose the date entirely.
+//
+// Time and entrance share a line: they are the two things someone checks together
+// when deciding whether they can go.
+function formatLong(event, { linkFor = defaultLinkFor, flyerUrl = () => "", withDate = false } = {}) {
   const head = [`${iconFor(event)} ${event.event_name}`];
   if (event.category) head.push(`· ${event.category}`);
 
-  const description = usableDescription(event);
+  const when = [];
+  if (withDate && event.date) when.push(`📅 ${shortDate(event.date)}`);
+  if (event.start_time) {
+    when.push(`🕗 ${event.start_time}${event.end_time ? `-${event.end_time}` : ""}`);
+  }
   const entrance = entranceLabel(event);
+  if (entrance) when.push(entrance);
+
+  const description = usableDescription(event);
   const link = linkFor(event);
 
   const lines = [
     head.join(" "),
     when.length ? when.join(" · ") : "",
     event.location ? `📍 ${event.location}` : "",
-    entrance,
     description,
     event.contact_person ? `👤 ${event.contact_person}` : "",
     link ? `🔗 ${link}` : "",

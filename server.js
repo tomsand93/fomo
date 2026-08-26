@@ -255,7 +255,7 @@ const MAX_SLOT_FLYERS = 3;
 async function sendSlotFlyers(events, localDate) {
   const flyered = digestFlyerEvents(events, localDate).slice(0, MAX_SLOT_FLYERS);
   for (const event of flyered) {
-    const { text, mediaUrl } = formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) });
+    const { text, mediaUrl } = formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), withDate: true });
     if (!mediaUrl) continue;
     try {
       await sendWhatsApp(ADMIN_SENDER, text, mediaUrl);
@@ -496,11 +496,26 @@ function isValidDate(value) {
   return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
 
+// "Haifa" is not somewhere you can turn up to. A usable location names the venue and
+// enough of an address to find it, so require either a street number or a comma
+// separating venue from address — which is how every good submission already reads
+// ("ALF BAR, Yafo 44, Haifa"). Deliberately loose: the point is to catch a bare city,
+// not to police formatting, and anything rejected here is asked for rather than lost.
+const VAGUE_LOCATION_RE = /^\s*(חיפה|haifa|בחיפה|העיר|בעיר)\s*$/i;
+
+function isUsableLocation(value) {
+  const text = String(value || "").trim();
+  if (!text) return true; // emptiness is missingFields' job
+  if (VAGUE_LOCATION_RE.test(text)) return false;
+  return text.includes(",") || /\d/.test(text) || text.split(/\s+/).length >= 2;
+}
+
 function fieldIsValid(key, value) {
   if (!value) return true; // emptiness is handled by missingFields, not here
   if (key === "date") return isValidDate(value);
   if (key === "start_time" || key === "end_time") return TIME_RE.test(value);
   if (key === "contact_link") return CONTACT_LINK_RE.test(value.trim());
+  if (key === "location") return isUsableLocation(value);
   return true;
 }
 
@@ -520,7 +535,7 @@ function missingFields(event) {
     ["event_name", "שם האירוע"],
     ["date", "תאריך"],
     ["start_time", "שעה"],
-    ["location", "מיקום"],
+    ["location", "מיקום (שם המקום והכתובת)"],
     ["category", "קטגוריה"],
   ];
   if (!isFreeEntry(event)) required.push(["contact_link", "קישור / איש קשר"]);
@@ -760,12 +775,12 @@ async function forwardAmendmentToAdmin(id, text, sender) {
 // A ready-to-forward post for the group. Same LONG rendering the daily message uses,
 // so the group sees one consistent format however an event reaches it.
 function formatPublishedPost(event) {
-  return formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) }).text;
+  return formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), withDate: true }).text;
 }
 
 async function sendPublishedPost(id, event) {
   if (process.env.NODE_ENV === "test") return;
-  const { text, mediaUrl } = formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) });
+  const { text, mediaUrl } = formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), withDate: true });
   if (event.flyer && !mediaUrl) {
     console.error(`event #${id} has a flyer but PUBLIC_BASE_URL is unset; sending text only`);
   }
@@ -1720,6 +1735,7 @@ module.exports = {
   shortLink,
   destinationFor,
   formatEventForReview,
+  missingFields,
   // Pure, so the schedule and the choice list can be tested without sending anything.
   isDue,
   slotsDueAt,
