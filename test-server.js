@@ -990,7 +990,7 @@ async function demo() {
   // sequences, and a client that does not know the pair renders nothing at all — which
   // is how a price line reached Stav looking unlabelled, as if the payment had moved.
   // Single code points degrade to a recognisable glyph instead of vanishing.
-  for (const file of ["server.js", "format-event.js", "make-weekly.js", "make-digest.js"]) {
+  for (const file of ["server.js", "format-event.js", "make-weekly.js", "make-digest.js", "send-reminder.js"]) {
     const source = fs.readFileSync(path.join(__dirname, file), "utf8");
     const fragile = [...source.matchAll(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]\u{FE0F}/gu)];
     if (fragile.length) {

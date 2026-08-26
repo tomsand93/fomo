@@ -2,6 +2,7 @@
   "name": "fomo-haifa",
   "private": true,
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test-server.js && node test-reminders.js"
   }
 }

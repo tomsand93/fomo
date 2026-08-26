@@ -28,7 +28,9 @@ function eventsToText(events) {
   return events
     .map((event, i) => {
       const parts = [
-        `${i + 1}. ${event.event_name}`,
+        // The id, not the position, is what a reminder is recorded against - the list
+        // is re-filtered every turn, so "#2" means a different event tomorrow.
+        `${i + 1}. [מזהה ${event.id}] ${event.event_name}`,
         `תאריך: ${event.date}`,
         `שעה: ${event.start_time}`,
         `מיקום: ${event.location}`,
@@ -55,11 +57,16 @@ function buildSystemPrompt(events, todayIso) {
 - ענה בטון טבעי, קליל וידידותי, כמו הודעת וואטסאפ, לא רשימה טכנית.
 - תשובה קצרה וממוקדת, בעברית בלבד.
 
-מה אתה יכול ומה לא — אל תבטיח דברים שאינך יכול לעשות:
-- אינך יכול לשלוח תזכורות, התראות או הודעות יזומות בעתיד. אל תציע זאת ואל תשאל "רוצים שאזכיר לכם?".
+תזכורות — אתה כן יכול:
+- אתה יכול לשלוח תזכורת לאירוע מסוים, כשעתיים-שלוש לפני שהוא מתחיל.
+- אם המשתמש מבקש תזכורת לאירוע ("תזכיר לי", "אפשר תזכורת?"), הוסף בסוף התשובה שורה נפרדת בפורמט המדויק: [[REMIND:<מזהה>]] — כאשר <מזהה> הוא מספר האירוע ברשימה למטה.
+- אל תכתוב את הסימון הזה בשום מצב אחר, ואל תזכיר אותו בטקסט. הוא נמחק לפני שהמשתמש רואה את ההודעה.
+- אם לא ברור לאיזה אירוע הכוונה, שאל קודם לאיזה אירוע — ואל תוסיף את הסימון.
+- אשר בקצרה שהתזכורת תישלח לפני האירוע. אל תבטיח שעה מדויקת.
+מה אתה לא יכול — אל תבטיח דברים שאינך יכול לעשות:
 - אינך יכול לשמור העדפות, לרשום משתמשים לאירוע, להזמין או לרכוש כרטיסים.
 - אינך יכול ליצור קשר עם המארגנים בשם המשתמש.
-- אם מבקשים משהו כזה, אמור בפשטות שזה לא אפשרי כרגע והצע את מה שכן אפשר: לשמור את התאריך, להשתמש בקישור של האירוע, או לחזור לשאול כאן קרוב לתאריך.
+- אם מבקשים משהו כזה, אמור בפשטות שזה לא אפשרי כרגע והצע את מה שכן אפשר: לשמור את התאריך, להשתמש בקישור של האירוע, או לבקש תזכורת לאירוע.
 
 עברית תקנית — חשוב:
 - אתה כותב עברית כשפת אם, לא מתרגם מאנגלית. אל תבנה משפטים לפי תחביר אנגלי.
@@ -95,4 +102,20 @@ async function answerInquiry(history, events, todayIso = new Date().toISOString(
   return content.trim();
 }
 
-module.exports = { answerInquiry };
+// The model signals a reminder opt-in with a sentinel line rather than a second LLM
+// call: one round trip, and the marker is stripped before anyone sees it. A sentinel
+// the model invents in the wrong place costs nothing - the server checks the id against
+// the events actually shown, and an unknown id is ignored.
+const REMINDER_MARKER_RE = /\[\[REMIND:\s*([^\]\s]+)\s*\]\]/g;
+
+function extractReminderRequest(answer) {
+  const ids = [];
+  let match;
+  REMINDER_MARKER_RE.lastIndex = 0;
+  while ((match = REMINDER_MARKER_RE.exec(answer)) !== null) ids.push(match[1]);
+  // Strip the marker and any blank line it leaves behind.
+  const text = answer.replace(REMINDER_MARKER_RE, "").replace(/\n{3,}/g, "\n\n").trim();
+  return { text, eventIds: ids };
+}
+
+module.exports = { answerInquiry, extractReminderRequest };

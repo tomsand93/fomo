@@ -4,7 +4,7 @@ const path = require("path");
 const crypto = require("crypto");
 const { URLSearchParams } = require("url");
 const { loadEvents, makeDigest, digestFlyerEvents } = require("./make-digest");
-const { israelClock, todayIso, addDays, shortDate } = require("./clock");
+const { israelClock, todayIso, addDays, shortDate, isReminderDue, isReminderMissed } = require("./clock");
 const { isFreeEntry, formatShort, formatLong } = require("./format-event");
 const { makeWeekly } = require("./make-weekly");
 const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent } = require("./events-store");
@@ -16,6 +16,8 @@ const { fetchMediaAsDataUrl } = require("./fetch-media");
 const { saveFlyer, flyerPath, contentTypeFor, deleteFlyer } = require("./flyer-store");
 const { logClick, logInteraction, clickStats, pruneOlderThan } = require("./clicks-store");
 const { sendChoice, renderNumbered, approvedTemplateSid, ensureTemplates } = require("./send-interactive");
+const remindersStore = require("./reminders-store");
+const { deliverReminder, REMINDER_TEMPLATE } = require("./send-reminder");
 
 const PORT = Number(process.env.PORT || 3000);
 const EVENTS_FILE = process.env.EVENTS_FILE || "events.csv";
@@ -411,6 +413,159 @@ async function sendPendingReminder() {
     await sendWhatsApp(ADMIN_SENDER, lines.join("\n"));
   } catch (err) {
     console.error("failed to send pending reminder:", err);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Event reminders for users, opted into during the inquiry flow.
+// ---------------------------------------------------------------------------
+
+// Records what the inquiry model marked, and returns the line confirming it.
+//
+// The id is checked against the events actually shown this turn: the model is asked to
+// echo an id from that list, and anything else - a hallucinated id, an event that has
+// since been unpublished - is dropped rather than recorded against nothing. The user is
+// only told a reminder is set when a row was really written.
+function recordReminderOptIns(sender, eventIds = [], events = []) {
+  if (!eventIds.length) return "";
+  const byId = new Map(events.map((event) => [String(event.id), event]));
+  const confirmed = [];
+
+  for (const id of eventIds) {
+    const event = byId.get(String(id));
+    if (!event) {
+      console.error(`inquiry asked for a reminder for unknown event ${id}`);
+      continue;
+    }
+    // An event already inside its own reminder window (or past it) can never fire, so
+    // promising one would be a lie told at the moment of opting in.
+    if (isReminderMissed(event.date, event.start_time)) {
+      confirmed.push({ event, tooLate: true });
+      continue;
+    }
+    const { added, already } = remindersStore.addReminder({
+      sender,
+      eventId: event.id,
+      eventName: event.event_name,
+      eventDate: event.date,
+      eventTime: event.start_time,
+    });
+    if (added || already) confirmed.push({ event, already });
+  }
+
+  if (!confirmed.length) return "";
+  return confirmed
+    .map(({ event, already, tooLate }) => {
+      if (tooLate) return `🔔 ${event.event_name} מתחיל כבר בקרוב, אז לא אספיק לשלוח תזכורת מראש.`;
+      if (already) return `🔔 כבר רשמתי לכם תזכורת ל${event.event_name}.`;
+      return `🔔 סגור! אשלח תזכורת לפני ${event.event_name}.`;
+    })
+    .join("\n");
+}
+
+// Fires reminders whose event starts in 2-3 hours.
+//
+// Not a fixed daily slot like PENDING_REMINDER_SLOT: that pattern answers "is it 09:00
+// yet", and a reminder has to answer "is THIS event 2-3h away", which differs per event.
+// What is reused is the important half - reading the clock on every tick instead of
+// setInterval(fn, 24h), which never survives Fly suspending the machine.
+//
+// The window is wider than the tick interval, so a machine asleep for one tick still
+// catches the reminder on the next. A machine asleep through the whole window misses it;
+// that reminder is closed out as failed rather than left pending forever.
+//
+// `deliver` is injectable rather than guarded by NODE_ENV like the other slot senders:
+// the delivery rules (window open vs template, verify, never silently drop) are the
+// whole point of the feature, so the suite has to exercise them rather than skip them.
+async function sendDueEventReminders(now = new Date(), deliver = deliverReminder) {
+  let pending;
+  try {
+    pending = remindersStore.pendingReminders();
+  } catch (err) {
+    console.error("failed to read pending reminders:", err);
+    return;
+  }
+  if (!pending.length) return;
+
+  for (const reminder of pending) {
+    const due = isReminderDue(reminder.eventDate, reminder.eventTime, now);
+    if (!due) {
+      // Past its window and never sent - the machine was asleep through it. Close it
+      // out so it cannot fire at a nonsensical time later, and say so in the log.
+      if (isReminderMissed(reminder.eventDate, reminder.eventTime, now)) {
+        remindersStore.markReminder(
+          reminder.sender, reminder.eventId, remindersStore.STATUS_FAILED, "window passed unsent"
+        );
+        console.error(
+          `reminder for event #${reminder.eventId} to ${reminder.sender} missed its window`
+        );
+      }
+      continue;
+    }
+
+    // Claim it before sending. An append here means a crash mid-send can at worst lose
+    // one reminder, never send it twice - and "fires once" is the guarantee that
+    // matters most to someone being messaged unprompted.
+    remindersStore.markReminder(
+      reminder.sender, reminder.eventId, remindersStore.STATUS_SENT, "sending"
+    );
+
+    const event = loadEvents(EVENTS_FILE).find((e) => String(e.id) === String(reminder.eventId));
+    // An event pulled after opt-in should not produce a reminder to turn up to it.
+    if (!event || event.status !== "published") {
+      remindersStore.markReminder(
+        reminder.sender, reminder.eventId, remindersStore.STATUS_CANCELLED, "event no longer published"
+      );
+      continue;
+    }
+
+    try {
+      const result = await deliver({
+        to: reminder.sender,
+        eventName: event.event_name,
+        startTime: event.start_time,
+        location: event.location,
+        lastInboundMs: lastActivity.get(reminder.sender) || 0,
+      });
+      if (result.ok) {
+        remindersStore.markReminder(
+          reminder.sender, reminder.eventId, remindersStore.STATUS_SENT, `${result.via} ${result.status}`
+        );
+        continue;
+      }
+      // Never silently dropped: recorded as failed and surfaced to the admin, because
+      // the user was told this message was coming.
+      remindersStore.markReminder(
+        reminder.sender, reminder.eventId, remindersStore.STATUS_FAILED, `${result.reason}: ${result.detail}`
+      );
+      console.error(
+        `reminder for event #${reminder.eventId} to ${reminder.sender} failed (${result.reason}: ${result.detail})`
+      );
+      await notifyAdminOfFailedReminder(event, reminder, result);
+    } catch (err) {
+      remindersStore.markReminder(
+        reminder.sender, reminder.eventId, remindersStore.STATUS_FAILED, err.message
+      );
+      console.error(`reminder for event #${reminder.eventId} threw:`, err);
+    }
+  }
+}
+
+// A failed reminder is a broken promise, so it goes where someone can see it. Sent to
+// the admin, whose window is usually open and who is already the channel for every
+// other delivery failure in this file.
+async function notifyAdminOfFailedReminder(event, reminder, result) {
+  if (process.env.NODE_ENV === "test") return;
+  const reason = result.reason === "no-template"
+    ? `התבנית ${REMINDER_TEMPLATE} עדיין לא מאושרת, וחלון 24 השעות סגור`
+    : `${result.reason}: ${result.detail}`;
+  try {
+    await sendWhatsApp(
+      ADMIN_SENDER,
+      `🚨 תזכורת לא נשלחה\nאירוע #${event.id} ${event.event_name}\nנמען: ${reminder.sender}\nסיבה: ${reason}`
+    );
+  } catch (err) {
+    console.error("failed to tell the admin about a failed reminder:", err);
   }
 }
 
@@ -1697,13 +1852,20 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
     history.push({ role: "user", content: text });
 
     const events = upcomingPublishedEvents(loadEvents(EVENTS_FILE));
-    const answer = await answerInquiryModule.answerInquiry(history, events);
+    const raw = await answerInquiryModule.answerInquiry(history, events);
+    // The model marks a reminder opt-in inline; strip the marker and act on it, so the
+    // user only ever sees prose.
+    const { text: answer, eventIds } = answerInquiryModule.extractReminderRequest(raw);
+    const confirmation = recordReminderOptIns(sender, eventIds, events);
 
     history.push({ role: "assistant", content: answer });
     activeInquiryHistories.set(sender, history.slice(-MAX_INQUIRY_HISTORY));
     saveState();
 
-    return isFirstExchange ? `${answer}\n\n(כתבו "ביטול" כדי לחזור לתפריט)` : answer;
+    const withConfirmation = confirmation ? `${answer}\n\n${confirmation}` : answer;
+    return isFirstExchange
+      ? `${withConfirmation}\n\n(כתבו "ביטול" כדי לחזור לתפריט)`
+      : withConfirmation;
   }
 
   if (recentlyCompleted.has(sender)) {
@@ -1852,12 +2014,21 @@ if (require.main === module) {
   setInterval(sendDuePendingReminder, BOARD_CHECK_INTERVAL_MS).unref();
   setInterval(expireIdleSessions, IDLE_SWEEP_INTERVAL_MS).unref();
   setInterval(sendDueBoards, BOARD_CHECK_INTERVAL_MS).unref();
+  // Same 5-minute tick as the boards: the 1h reminder window is far wider, so a
+  // missed tick still catches it, and reading the clock each time is what survives
+  // Fly suspending the machine.
+  setInterval(sendDueEventReminders, BOARD_CHECK_INTERVAL_MS).unref();
   // Keeps the click and interaction logs from growing without bound on a small volume.
-  setInterval(() => pruneOlderThan(LOG_RETENTION_DAYS), LOG_PRUNE_INTERVAL_MS).unref();
+  setInterval(() => {
+    pruneOlderThan(LOG_RETENTION_DAYS);
+    remindersStore.pruneOlderThan(LOG_RETENTION_DAYS);
+  }, LOG_PRUNE_INTERVAL_MS).unref();
 }
 
 module.exports = {
   routeMessage,
+  recordReminderOptIns,
+  sendDueEventReminders,
   upcomingPublishedEvents,
   get activeSubmissions() { return activeSubmissions; },
   get activeSubmissionImages() { return activeSubmissionImages; },
