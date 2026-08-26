@@ -66,6 +66,7 @@ function loadState() {
     awaitingPublishChoice = new Map(raw.awaitingPublishChoice || []);
     awaitingDailyChoice = new Map(raw.awaitingDailyChoice || []);
     sentBoards = new Set(raw.sentBoards || []);
+    sentReminders = new Set(raw.sentReminders || []);
     pendingBoards = new Map(raw.pendingBoards || []);
     undeliveredAdminNotices = new Set(raw.undeliveredAdminNotices || []);
     askedForClarification = new Set(raw.askedForClarification || []);
@@ -95,6 +96,7 @@ function writeStateNow() {
     awaitingDailyChoice: [...awaitingDailyChoice.entries()].slice(-50),
     // Only the last few send-windows matter; older keys can never fire again.
     sentBoards: [...sentBoards].slice(-20),
+    sentReminders: [...sentReminders].slice(-14),
     pendingBoards: [...pendingBoards.entries()].slice(-10),
     undeliveredAdminNotices: [...undeliveredAdminNotices],
     askedForClarification: [...askedForClarification],
@@ -192,6 +194,7 @@ const LOG_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // suspends this machine when idle (auto_stop_machines), making restarts routine.
 let sentBoards = new Set(); // `${date}:${slot}` already sent, so a restart can't double-post
 let pendingBoards = new Map(); // `${date}:${slot}` -> post text that Twilio accepted but never delivered
+let sentReminders = new Set(); // `${date}` already reminded, so a restart can't send twice
 
 // Matching an exact hour could not express a 17:50 send, and matching an exact minute
 // would miss whenever the interval tick landed a minute off. A window does both.
@@ -300,7 +303,6 @@ async function flushPendingBoards() {
   saveState();
 }
 
-const PENDING_REMINDER_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 // An event whose date has passed can't be published, so asking Stav to decide about it is
 // busywork - she was being nagged daily about #3 and #5 with no useful action available.
@@ -362,6 +364,25 @@ function sweepPastFlyers(events, today = todayIso()) {
 
 // Events don't chase themselves: without a nudge a submission can sit unreviewed until its
 // date passes (as #3 and #5 did). Re-send the pending list once a day until it's empty.
+// Morning, Israel local: early enough that Stav can clear the queue before the 18:00
+// slot goes out, late enough not to be a 6am buzz.
+const PENDING_REMINDER_SLOT = { sendHour: 9, sendMinute: 0 };
+// Fires at a fixed local time rather than 24h after boot.
+//
+// setInterval(fn, 24h) only fires if the process survives a full day, and this one
+// never does: every deploy restarts the timer, and Fly suspends the machine whenever
+// it is idle. In three weeks of running it fired exactly once, which is why event #16
+// sat unreviewed for days — the nudge that exists to catch precisely that never ran.
+async function sendDuePendingReminder(now = new Date()) {
+  if (process.env.NODE_ENV === "test") return;
+  const local = israelClock(now);
+  if (!isDue(local, PENDING_REMINDER_SLOT)) return;
+  if (sentReminders.has(local.date)) return;
+  sentReminders.add(local.date);
+  saveState();
+  await sendPendingReminder();
+}
+
 async function sendPendingReminder() {
   if (process.env.NODE_ENV === "test") return;
   expirePastEvents(loadEvents(EVENTS_FILE));
@@ -1821,7 +1842,7 @@ loadState();
 if (require.main === module) {
   server.listen(PORT, () => console.log(`listening on ${PORT}`));
   setInterval(sweepStaleRateLimitEntries, RATE_LIMIT_SWEEP_INTERVAL_MS).unref();
-  setInterval(sendPendingReminder, PENDING_REMINDER_INTERVAL_MS).unref();
+  setInterval(sendDuePendingReminder, BOARD_CHECK_INTERVAL_MS).unref();
   setInterval(expireIdleSessions, IDLE_SWEEP_INTERVAL_MS).unref();
   setInterval(sendDueBoards, BOARD_CHECK_INTERVAL_MS).unref();
   // Keeps the click and interaction logs from growing without bound on a small volume.
@@ -1850,6 +1871,7 @@ module.exports = {
   // Pure, so the schedule and the choice list can be tested without sending anything.
   isDue,
   slotsDueAt,
+  PENDING_REMINDER_SLOT,
   publishDayOptions,
   goodbyeText,
   sendGoodbyes,

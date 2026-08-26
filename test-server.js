@@ -18,7 +18,7 @@ const TEST_FLYER_DIR = path.join(__dirname, "test-flyers");
 process.env.FLYER_DIR = TEST_FLYER_DIR;
 fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
 
-const { routeMessage, slotsDueAt, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, buttonReplyFor, publishDayOptions, goodbyeText, sendGoodbyes, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
+const { routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, buttonReplyFor, publishDayOptions, goodbyeText, sendGoodbyes, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -967,6 +967,23 @@ async function demo() {
   }
   if (buttonReplyFor("") || buttonReplyFor(null)) {
     throw new Error("an empty reply must not be sent as buttons");
+  }
+
+  // The pending reminder fires at a fixed Israel-local time, not 24h after boot.
+  // setInterval(fn, 24h) only fires if the process survives a whole day, and this one
+  // never does — every deploy restarts the timer and Fly suspends the machine when
+  // idle. It fired once in three weeks, which is why event #16 sat unreviewed.
+  const remindAt = (hour, minute) =>
+    isDue({ day: 1, hour, minute }, PENDING_REMINDER_SLOT);
+  if (remindAt(8, 59)) throw new Error("the reminder must not fire before its slot");
+  if (!remindAt(9, 0)) throw new Error("the reminder must fire at its slot");
+  if (!remindAt(9, 14)) throw new Error("a machine waking late must still remind");
+  if (remindAt(9, 15)) throw new Error("past the window the reminder must skip, not fire late");
+  if (remindAt(18, 0)) throw new Error("the reminder must not fire at the board slot");
+  // Persisted, or a restart inside the window sends it twice.
+  const remState = JSON.parse(fs.readFileSync(TEST_STATE_FILE, "utf8"));
+  if (!("sentReminders" in remState)) {
+    throw new Error("sentReminders must be persisted so a restart cannot double-send");
   }
 
   // Declining is an answer, not a failure to answer. Before this option existed, a
