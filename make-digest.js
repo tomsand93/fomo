@@ -1,5 +1,5 @@
 const { loadEvents } = require("./events-store");
-const { shortDate, todayIso } = require("./clock");
+const { longDate, todayIso } = require("./clock");
 const { formatLong } = require("./format-event");
 
 // The daily message carries the LONG form: the full pitch for events happening today,
@@ -15,11 +15,16 @@ function makeDigest(events, targetDate, options = {}) {
     )
     .sort((a, b) => a.start_time.localeCompare(b.start_time));
 
-  const lines = ["מה עושים היום בחיפה? 🎈", "", `📅 ${shortDate(targetDate)}`, ""];
+  const title = "מה עושים היום בחיפה? 🎈";
 
+  // No events means no date line: Stav asked not to announce a day there is nothing
+  // for. The title and the sentence stay, so she can still see the bot ran and simply
+  // has nothing to forward - silence would be indistinguishable from a crash.
   if (!publishable.length) {
-    return [...lines, "אין אירועים מוכנים לפרסום היום."].join("\n");
+    return [title, "", "אין אירועים מוכנים לפרסום היום."].join("\n");
   }
+
+  const lines = [title, "", `📅 ${longDate(targetDate)}`, ""];
 
   for (const event of publishable) {
     lines.push(formatLong(event, options).text, "");

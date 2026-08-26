@@ -1,5 +1,5 @@
 const { loadEvents } = require("./events-store");
-const { dayOfWeek, addDays, shortDate, todayIso, DAY_NAMES } = require("./clock");
+const { dayOfWeek, addDays, shortDate, longDate, todayIso, DAY_NAMES } = require("./clock");
 const { formatShort } = require("./format-event");
 
 // One rolling board, rebuilt every day, instead of two fixed ones. The old midweek
@@ -31,22 +31,32 @@ function makeWeekly(events, fromDate = todayIso(), options = {}) {
     bucket.sort((a, b) => a.start_time.localeCompare(b.start_time));
   }
 
-  const range = dates.length === 1
-    ? shortDate(dates[0])
-    : `${shortDate(dates[0])}-${shortDate(dates[dates.length - 1])}`;
-  const lines = [boardTitle(dates), "", `📅 ${range}`, ""];
-
   const total = [...byDate.values()].reduce((sum, bucket) => sum + bucket.length, 0);
+
+  // No events means no date line, as in the digest: do not announce days there is
+  // nothing for. The title and the sentence stay so the send is still a visible
+  // "I ran and found nothing" rather than silence.
   if (!total) {
-    return [...lines, "אין אירועים מאושרים לימים האלה עדיין."].join("\n");
+    return [boardTitle(dates), "", "אין אירועים מאושרים לימים האלה עדיין."].join("\n");
   }
+
+  // The range spans days that have events, not the whole window: with the empty days
+  // skipped below, a header reading 26.8-29.8 over a board whose last entry is the
+  // 28th promises a day that is not there.
+  const withEvents = dates.filter((date) => byDate.get(date).length);
+  const range = withEvents.length === 1
+    ? longDate(withEvents[0])
+    : `${longDate(withEvents[0])} - ${longDate(withEvents[withEvents.length - 1])}`;
+  const lines = [boardTitle(dates), "", `📅 ${range}`, ""];
 
   for (const date of dates) {
     const bucket = byDate.get(date);
     // Days with nothing approved are skipped rather than printed empty: a board full of
     // "אין אירועים" reads as a dead city, which is the opposite of the point.
     if (!bucket.length) continue;
-    lines.push(`— יום ${DAY_NAMES[dayOfWeek(date)]} ${shortDate(date)} —`);
+    // With only one day left in the window, the range header already names it and a
+    // day header would repeat the same words two lines apart.
+    if (withEvents.length > 1) lines.push(`— ${longDate(date)} —`);
     for (const event of bucket) lines.push(formatShort(event, options));
     lines.push("");
   }

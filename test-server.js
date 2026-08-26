@@ -631,6 +631,50 @@ async function demo() {
   if (makeDigest(boardEvents, "2026-09-20").includes("המלצה חמה")) {
     throw new Error("the daily digest must not carry the standing recommendation any more");
   }
+
+  // Stav, 26 Aug 2026: "dates need to appear with a day name" — "26.8" alone makes her
+  // work out which day it is before she can decide whether to forward the board.
+  if (!board.includes("יום")) {
+    throw new Error("every date on the board must carry its day name");
+  }
+  if (/📅 \d/.test(board)) {
+    throw new Error("the board's date header must lead with a day name, not a bare number");
+  }
+  if (/📅 \d/.test(makeDigest(boardEvents, "2026-09-20"))) {
+    throw new Error("the digest's date header must lead with a day name, not a bare number");
+  }
+
+  // The same message, second half: "if there's no event, no need to write the day."
+  // An empty board keeps its title and its sentence, so Stav can still tell the bot
+  // ran, but must not announce a date it has nothing for.
+  const emptyDigest = makeDigest([], "2026-09-20");
+  const emptyBoard = makeWeekly([], "2026-09-20");
+  for (const [name, text] of [["digest", emptyDigest], ["board", emptyBoard]]) {
+    if (text.includes("📅")) {
+      throw new Error(`an empty ${name} must not print a date header`);
+    }
+    if (!text.includes("אין אירועים")) {
+      throw new Error(`an empty ${name} must still say there is nothing, not go silent`);
+    }
+  }
+
+  // The range must end on the last day that actually has an event: with empty days
+  // skipped, a header running to Saturday over a board ending Friday promises a day
+  // that is not on it.
+  const rangeEvents = [
+    { status: "published", event_name: "א", date: "2026-09-20", start_time: "20:00", location: "חיפה", category: "מסיבה" },
+    { status: "published", event_name: "ב", date: "2026-09-22", start_time: "21:00", location: "חיפה", category: "מוזיקה" },
+  ];
+  const ranged = makeWeekly(rangeEvents, "2026-09-20");
+  if (ranged.includes("26.9") || ranged.includes("25.9")) {
+    throw new Error("the range must stop at the last day with an event, not run to the window's end");
+  }
+  // One day left in the window needs no per-day header: the range already names it.
+  const single = makeWeekly([rangeEvents[0]], "2026-09-20");
+  if (single.includes("—")) {
+    throw new Error("a board with one day must not repeat that day as a separate header");
+  }
+
   fs.unlinkSync(boardFile);
 
   // --- Phase 1: shared formatter, Israel clock, contact_person ---

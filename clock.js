@@ -66,6 +66,16 @@ function shortDate(isoDate) {
 
 const DAY_NAMES = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת"];
 
+// "יום רביעי 26.8" - the one way a date is written for a reader.
+//
+// Stav asked for the day name on every date: "26.8" alone makes her work out which
+// day that is before she can decide whether to forward it. The board's per-day
+// headers already read this way, so this is what makes the digest and the board
+// agree rather than each formatting dates their own way.
+function longDate(isoDate) {
+  return `יום ${DAY_NAMES[dayOfWeek(isoDate)]} ${shortDate(isoDate)}`;
+}
+
 // How far ahead of an event its reminder goes out. A window, not an instant: the check
 // runs every few minutes, so an exact match would miss whenever a tick landed a minute
 // off â€” the same reason isDue() uses a window rather than an exact minute.
@@ -122,6 +132,7 @@ module.exports = {
   dayOfWeek,
   addDays,
   shortDate,
+  longDate,
   DAY_NAMES,
   REMINDER_LEAD_MAX_MINUTES,
   REMINDER_LEAD_MIN_MINUTES,
