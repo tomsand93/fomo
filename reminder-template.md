@@ -69,9 +69,24 @@ Each of these caused a real rejection on this account:
 
 ## After approval
 
-Nothing to deploy. `send-interactive.js` refreshes approved templates hourly and
-`approvedTemplateSid("fomo_event_reminder")` starts returning a SID, so out-of-window
-reminders begin sending on their own.
+Turn the feature on — it ships gated off, so that deploying the code and making a
+promise to users are separate acts:
+
+```
+fly secrets set REMINDERS_ENABLED=1 -a fomo-qe2gha
+```
+
+No redeploy is needed beyond that. `send-interactive.js` refreshes approved templates
+hourly and `approvedTemplateSid("fomo_event_reminder")` starts returning a SID, so
+out-of-window reminders begin sending on their own.
+
+To turn it back off, `fly secrets unset REMINDERS_ENABLED -a fomo-qe2gha`. Reminders
+already opted into stay recorded and stop firing; they resume if it is switched on
+again, rather than being closed out as failed.
+
+**While it is off:** the bot does not offer reminders and does not record them, so no
+user is ever promised something that will not arrive. That is the deliberate default —
+an unset variable means "promise nothing", never "promise and hope".
 
 ## Verifying on production (the definition of done)
 

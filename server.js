@@ -428,6 +428,11 @@ async function sendPendingReminder() {
 // only told a reminder is set when a row was really written.
 function recordReminderOptIns(sender, eventIds = [], events = []) {
   if (!eventIds.length) return "";
+  // Gated independently of the prompt. The prompt is the model's instruction and the
+  // model can ignore it; this is the one that decides whether a promise is recorded.
+  // Both read the same env var, so they can never disagree about whether the feature
+  // is on.
+  if (!answerInquiryModule.remindersEnabled()) return "";
   const byId = new Map(events.map((event) => [String(event.id), event]));
   const confirmed = [];
 
@@ -478,6 +483,11 @@ function recordReminderOptIns(sender, eventIds = [], events = []) {
 // the delivery rules (window open vs template, verify, never silently drop) are the
 // whole point of the feature, so the suite has to exercise them rather than skip them.
 async function sendDueEventReminders(now = new Date(), deliver = deliverReminder) {
+  // Reminders already recorded stay recorded, but nothing fires while the feature is
+  // off - switching it off must stop sends, not just stop new opt-ins. They are left
+  // pending rather than failed, so turning the flag back on resumes them.
+  if (!answerInquiryModule.remindersEnabled()) return;
+
   let pending;
   try {
     pending = remindersStore.pendingReminders();

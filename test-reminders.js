@@ -2,6 +2,9 @@ const fs = require("fs");
 const path = require("path");
 
 process.env.NODE_ENV = "test";
+// The feature ships gated off; these tests exist to verify it when it is on.
+// The gate itself is tested explicitly at the end.
+process.env.REMINDERS_ENABLED = "1";
 
 // Own data files, like test-server.js: a test run must never touch the real volume.
 const TEST_EVENTS_FILE = path.join(__dirname, "test-reminder-events.csv");
@@ -233,6 +236,37 @@ async function run() {
     "asking again says it is already set",
     server3.recordReminderOptIns(SENDER, ["7"], events).includes("כבר")
   );
+
+  console.log("the REMINDERS_ENABLED gate");
+  // This is what stands between a user and a promise the bot cannot keep while the
+  // template is unapproved, so it is tested in both directions.
+  const inquiry = require("./answer-inquiry");
+
+  process.env.REMINDERS_ENABLED = "";
+  check("unset means off", inquiry.remindersEnabled(), false);
+  check("no opt-in is recorded while off", server3.recordReminderOptIns(SENDER, ["8"], events), "");
+  checkTrue("and nothing was written", !store3.pendingReminders().some((r) => r.eventId === "8"));
+
+  // A reminder recorded while on must not fire while off - and must survive to fire
+  // later, so it is left pending rather than closed out.
+  const before = store3.pendingReminders().length;
+  const sentWhileOff = [];
+  await server3.sendDueEventReminders(at("14:00"), async (p) => {
+    sentWhileOff.push(p);
+    return { ok: true, via: "text", sid: "SMx", status: "delivered" };
+  });
+  check("nothing fires while off", sentWhileOff.length, 0);
+  check("and pending reminders are untouched", store3.pendingReminders().length, before);
+
+  for (const on of ["1", "true", "yes", "ON"]) {
+    process.env.REMINDERS_ENABLED = on;
+    check(`"${on}" turns it on`, inquiry.remindersEnabled(), true);
+  }
+  for (const off of ["0", "false", "no", "", "maybe"]) {
+    process.env.REMINDERS_ENABLED = off;
+    check(`"${off}" leaves it off`, inquiry.remindersEnabled(), false);
+  }
+  process.env.REMINDERS_ENABLED = "1";
 
   for (const file of [TEST_EVENTS_FILE, TEST_REMINDERS_FILE, TEST_STATE_FILE]) {
     if (fs.existsSync(file)) fs.unlinkSync(file);

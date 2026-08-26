@@ -44,6 +44,31 @@ function eventsToText(events) {
     .join("\n");
 }
 
+// The reminder feature is gated, because the copy below makes a promise the bot can
+// only keep once the Content template is approved by Meta. Deploying the code and
+// switching the feature on are therefore separate acts: set REMINDERS_ENABLED=1
+// (fly secrets set) the moment the template lands, with no redeploy.
+//
+// Off is the default deliberately. An unset variable in a fresh environment must
+// mean "do not promise anything", never "promise and hope".
+function remindersEnabled() {
+  return /^(1|true|yes|on)$/i.test(String(process.env.REMINDERS_ENABLED || ""));
+}
+
+const REMINDER_RULES_ON = `תזכורות — אתה כן יכול:
+- אתה יכול לשלוח תזכורת לאירוע מסוים, כשעתיים-שלוש לפני שהוא מתחיל.
+- אם המשתמש מבקש תזכורת לאירוע ("תזכיר לי", "אפשר תזכורת?"), הוסף בסוף התשובה שורה נפרדת בפורמט המדויק: [[REMIND:<מזהה>]] — כאשר <מזהה> הוא מספר האירוע ברשימה למטה.
+- אל תכתוב את הסימון הזה בשום מצב אחר, ואל תזכיר אותו בטקסט. הוא נמחק לפני שהמשתמש רואה את ההודעה.
+- אם לא ברור לאיזה אירוע הכוונה, שאל קודם לאיזה אירוע — ואל תוסיף את הסימון.
+- אשר בקצרה שהתזכורת תישלח לפני האירוע. אל תבטיח שעה מדויקת.`;
+
+const REMINDER_RULES_OFF = `תזכורות:
+- אינך יכול לשלוח תזכורות או הודעות יזומות. אל תציע זאת ואל תשאל "רוצים שאזכיר לכם?".`;
+
+function reminderRules() {
+  return remindersEnabled() ? REMINDER_RULES_ON : REMINDER_RULES_OFF;
+}
+
 function buildSystemPrompt(events, todayIso) {
   return `אתה סוכן וואטסאפ ידידותי שעונה על שאלות לגבי אירועי תרבות בחיפה, בהתבסס אך ורק על רשימת האירועים שסופקה למטה.
 היום התאריך הוא ${todayIso} (פורמט YYYY-MM-DD).
@@ -57,12 +82,8 @@ function buildSystemPrompt(events, todayIso) {
 - ענה בטון טבעי, קליל וידידותי, כמו הודעת וואטסאפ, לא רשימה טכנית.
 - תשובה קצרה וממוקדת, בעברית בלבד.
 
-תזכורות — אתה כן יכול:
-- אתה יכול לשלוח תזכורת לאירוע מסוים, כשעתיים-שלוש לפני שהוא מתחיל.
-- אם המשתמש מבקש תזכורת לאירוע ("תזכיר לי", "אפשר תזכורת?"), הוסף בסוף התשובה שורה נפרדת בפורמט המדויק: [[REMIND:<מזהה>]] — כאשר <מזהה> הוא מספר האירוע ברשימה למטה.
-- אל תכתוב את הסימון הזה בשום מצב אחר, ואל תזכיר אותו בטקסט. הוא נמחק לפני שהמשתמש רואה את ההודעה.
-- אם לא ברור לאיזה אירוע הכוונה, שאל קודם לאיזה אירוע — ואל תוסיף את הסימון.
-- אשר בקצרה שהתזכורת תישלח לפני האירוע. אל תבטיח שעה מדויקת.
+${reminderRules()}
+
 מה אתה לא יכול — אל תבטיח דברים שאינך יכול לעשות:
 - אינך יכול לשמור העדפות, לרשום משתמשים לאירוע, להזמין או לרכוש כרטיסים.
 - אינך יכול ליצור קשר עם המארגנים בשם המשתמש.
@@ -118,4 +139,4 @@ function extractReminderRequest(answer) {
   return { text, eventIds: ids };
 }
 
-module.exports = { answerInquiry, extractReminderRequest };
+module.exports = { answerInquiry, extractReminderRequest, remindersEnabled };

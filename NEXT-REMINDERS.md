@@ -2,11 +2,17 @@
 
 ## Status (2026-08-26): built, one manual step left
 
-Implemented and tested. The **only** remaining step is submitting the Content
-template to Meta — see `reminder-template.md` for the exact body to paste and the
-production verification steps. Until it is approved, reminders that fall outside
-the recipient's 24h window are recorded as `failed` and reported to the admin
-rather than silently dropped; that is the intended safe state, not a bug.
+Implemented and tested, and **shipped gated off** behind `REMINDERS_ENABLED`
+(unset = off). The code can deploy to production safely: while the flag is off
+the bot neither offers nor records reminders, so nobody is promised anything.
+
+The **only** remaining step is submitting the Content template to Meta — see
+`reminder-template.md` for the exact body to paste, the `fly secrets set` command
+that turns the feature on afterwards, and the production verification steps.
+
+Why the gate exists: a reminder promised but not delivered is worse than none, and
+until the template is approved every out-of-window reminder would fail. Deploying
+the code and making that promise to users are therefore separate acts.
 
 New files: `reminders-store.js`, `send-reminder.js`, `test-reminders.js`,
 `reminder-template.md`. Run everything with `npm test`.
