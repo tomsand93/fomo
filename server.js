@@ -1213,9 +1213,64 @@ async function handleTwilio(req, res, body) {
     reply = "מצטערים, קרתה תקלה. נסו שוב בעוד רגע.";
   }
 
+  // A TwiML reply is one plain-text node — it cannot carry buttons however many
+  // templates are approved. When the reply is a choice we have an approved template
+  // for, send it over the API instead and acknowledge the webhook with an empty
+  // response. Everything else stays TwiML, which keeps the risky path narrow: the
+  // webhook's own response is still the delivery mechanism for almost every message,
+  // and only the handful of button-eligible replies depend on a second call.
+  //
+  // Safe because the sender just messaged us, so their 24h window is open by
+  // definition and a free-form template send is allowed without extra approval.
+  const asButtons = buttonReplyFor(reply);
+  if (asButtons) {
+    try {
+      await sendChoice(sender, asButtons);
+      res.writeHead(200, { "Content-Type": "text/xml; charset=utf-8" });
+      res.end(EMPTY_TWIML);
+      return;
+    } catch (err) {
+      // Falling through costs nothing: the text below is the same wording the buttons
+      // would have carried, so a failed send degrades to what the bot always sent.
+      console.error("button reply failed, falling back to TwiML:", err);
+    }
+  }
+
   res.writeHead(200, { "Content-Type": "text/xml; charset=utf-8" });
   res.end(twiml(reply));
 }
+
+const EMPTY_TWIML = '<?xml version="1.0" encoding="UTF-8"?><Response></Response>';
+
+// Recognises the replies that have an approved button template, by matching the text
+// the router already produced rather than threading a flag through 58 return
+// statements. Returns null for everything else, which is most replies.
+function buttonReplyFor(reply) {
+  if (typeof reply !== "string" || !reply) return null;
+
+  // The menu, whether it was reached by "cancel", an unrecognised message, or the
+  // customer-mode banner being prefixed to it.
+  if (reply.includes("1. לברר בנוגע לאירועים") && reply.includes("4. שירות לקוחות")) {
+    return {
+      text: reply,
+      options: MAIN_MENU_BUTTON_OPTIONS,
+      template: MAIN_MENU_TEMPLATE,
+      variables: {},
+    };
+  }
+
+  return null;
+}
+
+const MAIN_MENU_TEMPLATE = "fomo_main_menu";
+// Three of the four menu entries; WhatsApp allows no more. The price list is the one
+// left off, and the template body tells people to type 3 for it — it is the least-used
+// of the four and the only one that is purely informational.
+const MAIN_MENU_BUTTON_OPTIONS = [
+  { key: "1", label: "לברר על אירועים" },
+  { key: "2", label: "לפרסם אירוע" },
+  { key: "4", label: "שירות לקוחות" },
+];
 
 const MENU_KEYWORDS = new Set(["תפריט", "/menu", "menu"]);
 const CANCEL_KEYWORDS = new Set(["ביטול", "/cancel", "cancel"]);
@@ -1774,7 +1829,6 @@ if (require.main === module) {
 }
 
 module.exports = {
-  missingFields,
   routeMessage,
   upcomingPublishedEvents,
   get activeSubmissions() { return activeSubmissions; },
@@ -1792,6 +1846,7 @@ module.exports = {
   destinationFor,
   formatEventForReview,
   missingFields,
+  buttonReplyFor,
   // Pure, so the schedule and the choice list can be tested without sending anything.
   isDue,
   slotsDueAt,

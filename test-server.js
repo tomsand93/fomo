@@ -18,7 +18,7 @@ const TEST_FLYER_DIR = path.join(__dirname, "test-flyers");
 process.env.FLYER_DIR = TEST_FLYER_DIR;
 fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
 
-const { routeMessage, slotsDueAt, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, publishDayOptions, goodbyeText, sendGoodbyes, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
+const { routeMessage, slotsDueAt, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, buttonReplyFor, publishDayOptions, goodbyeText, sendGoodbyes, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -944,6 +944,29 @@ async function demo() {
   const reviewButtons = require("./send-interactive").templateButtonKeys("fomo_review_event");
   if (reviewButtons.join() !== "אשר,דחה,ממתינים") {
     throw new Error(`review buttons must send the commands themselves, got ${reviewButtons}`);
+  }
+
+  // A TwiML reply cannot carry buttons, so the menu is recognised and re-sent over the
+  // API instead. Recognition is by the text the router already produced, which is why
+  // it must survive the customer-mode banner being prefixed to it.
+  const menuText = await routeMessage("whatsapp:+972500003131", "asdf");
+  const asButtons = buttonReplyFor(menuText);
+  if (!asButtons) throw new Error("the menu reply must be recognised as a button reply");
+  if (asButtons.template !== "fomo_main_menu") {
+    throw new Error("the menu must use the main-menu template");
+  }
+  // The keys must match the approved template's buttons exactly, or sendChoice drops
+  // to text and the whole change is a no-op.
+  const menuKeys = require("./send-interactive").templateButtonKeys("fomo_main_menu");
+  if (menuKeys.join() !== asButtons.options.map((o) => o.key).join()) {
+    throw new Error("menu option keys must match the template's buttons exactly");
+  }
+  // Anything that is not a recognised choice stays TwiML.
+  if (buttonReplyFor("קיבלנו את האירוע. הוא נכנס לבדיקה.")) {
+    throw new Error("an ordinary reply must not be sent as buttons");
+  }
+  if (buttonReplyFor("") || buttonReplyFor(null)) {
+    throw new Error("an empty reply must not be sent as buttons");
   }
 
   // Declining is an answer, not a failure to answer. Before this option existed, a
