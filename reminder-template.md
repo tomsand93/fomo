@@ -1,4 +1,20 @@
-# The reminder template — submit this to Meta
+# The reminder template
+
+**Submitted 2026-08-26.** SID `HXb923d6001e23f6daa32169998e2900e9`, category
+`UTILITY`. Created and submitted with `node submit-reminder-template.js`, which reads
+the body out of `send-reminder.js` so it cannot drift from what the code sends.
+
+Check where it stands:
+
+```
+node submit-reminder-template.js     # re-run: reports status, never duplicates
+```
+
+The rest of this file is why the template looks the way it does — worth reading before
+changing the wording, since each constraint below came from a real rejection.
+
+---
+
 
 The reminder feature is built and tested, but **out-of-window reminders cannot be
 delivered until this template is approved**. Until then they are recorded as failed and
