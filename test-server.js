@@ -662,15 +662,15 @@ async function demo() {
   // The two entrance emojis, and the third state: an unstated price shows neither.
   // Inferring "free" from silence would put a factual error in front of the group.
   const freeShort = fmt.formatShort(freeEvent);
-  if (!freeShort.includes("🆓") || freeShort.includes("🎟️")) {
-    throw new Error("a free event must show 🆓 and not 🎟️");
+  if (!freeShort.includes("🆓") || freeShort.includes("🎫")) {
+    throw new Error("a free event must show 🆓 and not 🎫");
   }
   const paidShort = fmt.formatShort(paidEvent);
-  if (!paidShort.includes("🎟️") || paidShort.includes("🆓")) {
-    throw new Error("a paid event must show 🎟️ and not 🆓");
+  if (!paidShort.includes("🎫") || paidShort.includes("🆓")) {
+    throw new Error("a paid event must show 🎫 and not 🆓");
   }
   const noPriceShort = fmt.formatShort(noPriceEvent);
-  if (noPriceShort.includes("🆓") || noPriceShort.includes("🎟️")) {
+  if (noPriceShort.includes("🆓") || noPriceShort.includes("🎫")) {
     throw new Error("an event with no stated price must show neither entrance emoji");
   }
 
@@ -883,12 +883,12 @@ async function demo() {
   }
   // The SHORT line joins with " · "; the LONG block has its own date line. Both being
   // present is what proves two distinct renderings, not one repeated.
-  if (!notice.includes("📍 סילביה, החלוץ 27 · 🎟️ 70 ₪")) {
+  if (!notice.includes("📍 סילביה, החלוץ 27 · 🎫 70 ₪")) {
     throw new Error("the review notice must contain the short board rendering");
   }
   // The long rendering drops the date (the daily message has it in the heading) and
   // puts time and entrance on one line, which is what distinguishes it from the short.
-  if (!notice.includes("🕗 21:00-23:00 · 🎟️ 70 ₪")) {
+  if (!notice.includes("🕗 21:00-23:00 · 🎫 70 ₪")) {
     throw new Error("the review notice must contain the long daily rendering");
   }
   if (notice.includes("📅 20.10")) {
@@ -984,6 +984,18 @@ async function demo() {
   const remState = JSON.parse(fs.readFileSync(TEST_STATE_FILE, "utf8"));
   if (!("sentReminders" in remState)) {
     throw new Error("sentReminders must be persisted so a restart cannot double-send");
+  }
+
+  // No emoji may carry a variation selector (U+FE0F). Those are two-code-point
+  // sequences, and a client that does not know the pair renders nothing at all — which
+  // is how a price line reached Stav looking unlabelled, as if the payment had moved.
+  // Single code points degrade to a recognisable glyph instead of vanishing.
+  for (const file of ["server.js", "format-event.js", "make-weekly.js", "make-digest.js"]) {
+    const source = fs.readFileSync(path.join(__dirname, file), "utf8");
+    const fragile = [...source.matchAll(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]\u{FE0F}/gu)];
+    if (fragile.length) {
+      throw new Error(`${file} uses emoji with a variation selector: ${fragile.map((m) => m[0]).join(" ")}`);
+    }
   }
 
   // Declining is an answer, not a failure to answer. Before this option existed, a

@@ -584,7 +584,7 @@ function formatEventForReview(id, event, sender, unresolved = []) {
   // Surface anything the submitter couldn't clear up, so Stav reviews with the same
   // doubt the extractor had rather than trusting a silently guessed value.
   const uncertaintyNote = unresolved.length
-    ? `⚠️ לא הובהר: ${unresolved.join(" | ")}`
+    ? `⚠ לא הובהר: ${unresolved.join(" | ")}`
     : "";
 
   const links = { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) };
@@ -692,7 +692,7 @@ function eventLandingPage(event) {
     ["📅", event.date ? shortDate(event.date) : ""],
     ["🕗", event.start_time ? `${event.start_time}${event.end_time ? `-${event.end_time}` : ""}` : ""],
     ["📍", event.location],
-    [isFreeEntry(event) ? "🆓" : "🎟️", isFreeEntry(event) ? "כניסה חופשית" : event.price],
+    [isFreeEntry(event) ? "🆓" : "🎫", isFreeEntry(event) ? "כניסה חופשית" : event.price],
     ["👤", event.contact_person],
     ["📞", destinationFor(event) ? "" : event.contact_link],
   ]
@@ -838,7 +838,7 @@ async function forwardEventToAdmin(id, event, sender, unresolved = [], flyer = "
 async function forwardAmendmentToAdmin(id, text, sender) {
   if (process.env.NODE_ENV === "test") return;
   try {
-    await sendWhatsApp(ADMIN_SENDER, `✏️ תוספת לאירוע #${id}\nמאת: ${sender}\n\n${text}`);
+    await sendWhatsApp(ADMIN_SENDER, `✏ תוספת לאירוע #${id}\nמאת: ${sender}\n\n${text}`);
   } catch (err) {
     console.error(`failed to forward amendment for event #${id}:`, err);
   }
@@ -1029,7 +1029,7 @@ function missedNoticesBanner(events) {
   const lines = stillPending
     .map((e) => `#${e.id} ${e.event_name} — ${e.date} ${e.start_time}`)
     .join("\n");
-  return `⚠️ אירועים שההודעה עליהם לא הגיעה אליך:\n${lines}\n\n`;
+  return `⚠ אירועים שההודעה עליהם לא הגיעה אליך:\n${lines}\n\n`;
 }
 
 // "Views" rather than "clicks" on purpose: WhatsApp and every preview crawler fetch a
@@ -1436,7 +1436,7 @@ function formatSubmissionReceipt(event, flyer = "") {
     event.location ? `📍 ${event.location}` : null,
     event.price ? `💸 ${event.price}` : null,
     event.contact_link ? `🔗 ${event.contact_link}` : null,
-    flyer ? "🖼️ הפלייר צורף" : null,
+    flyer ? "📷 הפלייר צורף" : null,
     "",
     'משהו לא נכון? פשוט כתבו לנו כאן מה לתקן.',
   ];

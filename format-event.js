@@ -20,8 +20,13 @@ const CATEGORY_ICONS = {
 const DEFAULT_ICON = "🎈";
 
 // The two entrance emojis. Free needs no words; a price does.
+//
+// Single code points only, no variation selectors. "🎫" is U+1F39F followed by
+// U+FE0F, and a client that does not know the pair renders nothing at all — which is
+// how a price line arrived looking unlabelled, as if the payment were in the wrong
+// place. U+1F3AB is one code point and degrades to a recognisable glyph instead.
 const FREE_ICON = "🆓";
-const PAID_ICON = "🎟️";
+const PAID_ICON = "🎫";
 
 // Matches how submitters actually write "free" — moved here byte-identical from
 // server.js, because each alternative was added for a real submission.
@@ -54,7 +59,10 @@ function entranceBadge(event) {
 
 // The extractor sometimes echoes the raw submission into description; that guard
 // predates this module and is kept because it still fires.
-function usableDescription(event, limit = 200) {
+// 400 rather than 200: Stav asked for a fuller description in the daily message, and
+// her own example runs to about 250 characters. Still bounded, because the long form
+// shares a message with the board on the daily slot.
+function usableDescription(event, limit = 400) {
   const text = (event.description || "").trim();
   if (!text || text.includes("שם האירוע:")) return "";
   if (text.length <= limit) return text;
