@@ -259,6 +259,65 @@ async function run() {
     server3.recordReminderOptIns(SENDER, ["7"], events).includes("כבר")
   );
 
+  console.log("never twice, and a reply keeps its context");
+  // Two requirements from Tom: send only once, and let the user answer.
+  fs.unlinkSync(TEST_REMINDERS_FILE);
+  delete require.cache[require.resolve("./reminders-store")];
+  delete require.cache[require.resolve("./server")];
+  const store4 = require("./reminders-store");
+  const server4 = require("./server");
+  const REPLIER = "whatsapp:+972500000055";
+  store4.addReminder({ sender: REPLIER, eventId: "7", eventName: "מסיבה", eventDate: EVENT_DATE, eventTime: "20:00" });
+
+  const fired = [];
+  const countingDeliver = async (p) => {
+    fired.push(p);
+    return { ok: true, via: "template", sid: `SM${fired.length}`, status: "delivered" };
+  };
+  // The tick runs every 5 minutes and the window is a full hour, so the same reminder
+  // is examined a dozen times. It must send on exactly one of them.
+  for (const minute of ["14:00", "14:05", "14:10", "14:20", "14:40", "14:55"]) {
+    await server4.sendDueEventReminders(at(minute), countingDeliver);
+  }
+  check("a reminder fires once across the whole window", fired.length, 1);
+
+  // Overlapping ticks: delivery polls Twilio for seconds, so a slow send can still be
+  // in flight when the next tick begins.
+  fs.unlinkSync(TEST_REMINDERS_FILE);
+  delete require.cache[require.resolve("./reminders-store")];
+  delete require.cache[require.resolve("./server")];
+  const store5 = require("./reminders-store");
+  const server5 = require("./server");
+  store5.addReminder({ sender: REPLIER, eventId: "7", eventName: "מסיבה", eventDate: EVENT_DATE, eventTime: "20:00" });
+  const slowFired = [];
+  const slowDeliver = async (p) => {
+    slowFired.push(p);
+    await new Promise((r) => setTimeout(r, 50));
+    return { ok: true, via: "template", sid: "SM1", status: "delivered" };
+  };
+  await Promise.all([
+    server5.sendDueEventReminders(at("14:05"), slowDeliver),
+    server5.sendDueEventReminders(at("14:05"), slowDeliver),
+  ]);
+  check("overlapping ticks cannot double-send", slowFired.length, 1);
+
+  // The reply. It arrives hours later with no session left, so without this it lands
+  // on the main menu — a robotic answer to a thank-you.
+  checkTrue("the sender is remembered after a reminder", server5.recentlyReminded.has(REPLIER));
+  const warm = await server5.routeMessage(REPLIER, "תודה");
+  checkTrue("a thank-you gets a warm reply", warm.includes("בכיף"));
+  checkTrue("and the reply names the event", warm.includes("מסיבה"));
+  checkTrue("not the menu", !warm.includes("מה תרצו"));
+  // Answered once: a later "תודה" has no reminder behind it.
+  const secondThanks = await server5.routeMessage(REPLIER, "תודה");
+  checkTrue("a second thank-you falls through to the menu", secondThanks.includes("מה תרצו"));
+
+  // A real question must never be swallowed as a pleasantry.
+  store5.addReminder({ sender: REPLIER, eventId: "8", eventName: "הופעה", eventDate: EVENT_DATE, eventTime: "23:00" });
+  await server5.sendDueEventReminders(at("17:00"), countingDeliver);
+  const question = server5.replyToReminder(REPLIER, "תודה אבל מה השעה המדויקת?");
+  check("a question containing thanks is not treated as thanks", question, "");
+
   console.log("the REMINDERS_ENABLED gate");
   // This is what stands between a user and a promise the bot cannot keep while the
   // template is unapproved, so it is tested in both directions.

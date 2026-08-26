@@ -50,6 +50,10 @@ let noticeSidToEventId = new Map(); // Twilio message sid of a review notice -> 
 // which hat she's wearing instead. Anyone who isn't the admin is always a customer.
 let adminMode = new Map(); // ADMIN_SENDER -> "admin" | "customer"
 let lastActivity = new Map(); // sender -> ms timestamp of last inbound message, for idle expiry
+// sender -> { eventId, eventName, at } of the reminder they were last sent. Persisted
+// like everything else here: the reply comes minutes to hours later, and Fly suspends
+// this machine in between, so an in-memory note would be gone before it is read.
+let recentlyReminded = new Map();
 const llmCallTimestamps = new Map(); // sender -> array of ms timestamps of recent LLM calls
 const RATE_LIMIT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -77,6 +81,7 @@ function loadState() {
     noticeSidToEventId = new Map(raw.noticeSidToEventId || []);
     adminMode = new Map(raw.adminMode || []);
     lastActivity = new Map(raw.lastActivity || []);
+    recentlyReminded = new Map(raw.recentlyReminded || []);
   } catch (err) {
     if (err.code !== "ENOENT") console.error("failed to load state:", err);
   }
@@ -109,6 +114,8 @@ function writeStateNow() {
     noticeSidToEventId: [...noticeSidToEventId].slice(-50),
     adminMode: [...adminMode.entries()],
     lastActivity: [...lastActivity.entries()],
+    // Bounded: only a recent reminder can still be replied to.
+    recentlyReminded: [...recentlyReminded.entries()].slice(-50),
   };
   try {
     fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
@@ -541,6 +548,15 @@ async function sendDueEventReminders(now = new Date(), deliver = deliverReminder
         remindersStore.markReminder(
           reminder.sender, reminder.eventId, remindersStore.STATUS_SENT, `${result.via} ${result.status}`
         );
+        // A reminder arrives unprompted, hours after the conversation that asked for it
+        // ended, so the session is long gone. Remember which event it named, or a reply
+        // of "תודה" lands on the main menu with nothing to connect it to.
+        recentlyReminded.set(reminder.sender, {
+          eventId: reminder.eventId,
+          eventName: event.event_name,
+          at: Date.now(),
+        });
+        saveState();
         continue;
       }
       // Never silently dropped: recorded as failed and surfaced to the admin, because
@@ -559,6 +575,40 @@ async function sendDueEventReminders(now = new Date(), deliver = deliverReminder
       console.error(`reminder for event #${reminder.eventId} threw:`, err);
     }
   }
+}
+
+// How long a reminder stays answerable. Long enough to cover the event itself and a
+// reply the morning after; short enough that next week's "תודה" is not attached to it.
+const REMINDER_REPLY_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+// Thanks, in the forms people actually send. Deliberately not a general intent model:
+// this only has to recognise a closing pleasantry, and anything it does not recognise
+// falls through to the menu exactly as before.
+// The heart is written ❤ with an optional variation selector rather than pasted:
+// the pasted form is a two-code-point sequence, which the repo forbids on sight, and
+// writing it this way matches a heart sent with or without the selector.
+const THANKS_RE = /^(תודה|תודה רבה|יאללה|מעולה|מגניב|סבבה|אחלה|\u{1F44D}|\u{1F64F}|\u2764\uFE0F?|thanks|thank you|thx|ty|ok|okay|great|cool|nice)[\s!.…]*$/iu;
+
+// A reminder arrives out of the blue, hours after the conversation that asked for it,
+// so by the time someone replies their session has long expired and the reply lands on
+// the main menu — a robotic non-sequitur to "thanks".
+//
+// Returns the reply, or "" to let the caller fall through to the menu untouched.
+function replyToReminder(sender, trimmed) {
+  const last = recentlyReminded.get(sender);
+  if (!last) return "";
+  if (Date.now() - last.at > REMINDER_REPLY_WINDOW_MS) {
+    recentlyReminded.delete(sender);
+    saveState();
+    return "";
+  }
+  if (!THANKS_RE.test(trimmed)) return "";
+
+  // Answered once. A second "תודה" is a new message with no reminder behind it, and
+  // should reach the menu like anything else.
+  recentlyReminded.delete(sender);
+  saveState();
+  return `בכיף! תהנו ב${last.eventName} 🎈`;
 }
 
 // A failed reminder is a broken promise, so it goes where someone can see it. Sent to
@@ -1980,6 +2030,13 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
         const reply = await handleActiveSubmission(sender, text, mediaUrls);
         return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
       }
+      // Answering a reminder we sent unprompted. Checked here, after the menu keys and
+      // the submission sniffer, so it only ever catches what would have fallen through
+      // to the menu anyway.
+      {
+        const reply = replyToReminder(sender, trimmed);
+        if (reply) return reply;
+      }
       return MENU_TEXT;
   }
 }
@@ -2101,6 +2158,8 @@ module.exports = {
   routeMessage,
   recordReminderOptIns,
   sendDueEventReminders,
+  replyToReminder,
+  get recentlyReminded() { return recentlyReminded; },
   upcomingPublishedEvents,
   get activeSubmissions() { return activeSubmissions; },
   get activeSubmissionImages() { return activeSubmissionImages; },
