@@ -67,6 +67,7 @@ function loadState() {
     awaitingDailyChoice = new Map(raw.awaitingDailyChoice || []);
     sentBoards = new Set(raw.sentBoards || []);
     sentReminders = new Set(raw.sentReminders || []);
+    lastButtonEventId = raw.lastButtonEventId || "";
     pendingBoards = new Map(raw.pendingBoards || []);
     undeliveredAdminNotices = new Set(raw.undeliveredAdminNotices || []);
     askedForClarification = new Set(raw.askedForClarification || []);
@@ -97,6 +98,7 @@ function writeStateNow() {
     // Only the last few send-windows matter; older keys can never fire again.
     sentBoards: [...sentBoards].slice(-20),
     sentReminders: [...sentReminders].slice(-14),
+    lastButtonEventId,
     pendingBoards: [...pendingBoards.entries()].slice(-10),
     undeliveredAdminNotices: [...undeliveredAdminNotices],
     askedForClarification: [...askedForClarification],
@@ -195,6 +197,11 @@ const LOG_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 let sentBoards = new Set(); // `${date}:${slot}` already sent, so a restart can't double-post
 let pendingBoards = new Map(); // `${date}:${slot}` -> post text that Twilio accepted but never delivered
 let sentReminders = new Set(); // `${date}` already reminded, so a restart can't send twice
+// The event whose review buttons were sent last and not yet acted on. Persisted, because
+// Fly suspends this machine between messages: in memory it was gone by the time Stav
+// tapped, and a bare "אשר" from a button then had nothing to resolve against — which is
+// exactly the "which event do you mean?" she hit.
+let lastButtonEventId = "";
 
 // Matching an exact hour could not express a 17:50 send, and matching an exact minute
 // would miss whenever the interval tick landed a minute off. A window does both.
@@ -760,7 +767,6 @@ function flyerUrl(name) {
 // old "most recent event" fallback: it is the single event whose buttons were sent last
 // and not yet acted on, cleared the moment anything resolves it, so it cannot drift onto
 // an unrelated event the way the old guess did.
-let lastButtonEventId = "";
 
 const REVIEW_TEMPLATE = "fomo_review_event";
 // The template's buttons send these back as ButtonPayload. handleTwilio normalises that
@@ -793,6 +799,7 @@ async function sendReviewButtons(id, eventName) {
     // replied to, and from here on that is the buttons, not the preview above it.
     if (result && result.sid) rememberNotice(result.sid, id);
     lastButtonEventId = String(id);
+    saveState();
   } catch (err) {
     console.error(`failed to send review buttons for event #${id}:`, err);
   }
@@ -1106,7 +1113,7 @@ async function handleAdminMessage(text, repliedSid = "") {
   if (undeliveredAdminNotices.delete(String(id))) saveState();
   // Consumed: the buttons have done their job, and leaving this set would let the next
   // bare command land on an event nobody was looking at.
-  if (lastButtonEventId === String(id)) lastButtonEventId = "";
+  if (lastButtonEventId === String(id)) { lastButtonEventId = ""; saveState(); }
 
   if (action === "אשר") {
     if (existing.status === "published") {

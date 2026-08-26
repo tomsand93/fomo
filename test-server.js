@@ -998,6 +998,22 @@ async function demo() {
     }
   }
 
+  // The event a review button refers to must survive a restart. Fly suspends this
+  // machine between messages, so an in-memory value was already gone by the time Stav
+  // tapped — a bare "אשר" from a button then resolved to nothing and she was asked
+  // which event she meant.
+  const btnState = JSON.parse(fs.readFileSync(TEST_STATE_FILE, "utf8"));
+  if (!("lastButtonEventId" in btnState)) {
+    throw new Error("lastButtonEventId must be persisted, or a tapped button loses its event");
+  }
+
+  // The inquiry bot must not offer what it cannot do. It told a user it would send a
+  // reminder, then admitted in the next message that it could not.
+  const inquiryPrompt = fs.readFileSync(path.join(__dirname, "answer-inquiry.js"), "utf8");
+  if (!inquiryPrompt.includes("תזכורות")) {
+    throw new Error("the inquiry prompt must tell the model it cannot send reminders");
+  }
+
   // Declining is an answer, not a failure to answer. Before this option existed, a
   // submitter who only wanted the weekly board had no way to say so: a non-matching
   // reply just re-asked, and ignoring it let the question expire silently.
