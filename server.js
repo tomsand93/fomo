@@ -15,7 +15,7 @@ const { sendWhatsApp, getMessageStatus } = require("./send-whatsapp");
 const { fetchMediaAsDataUrl } = require("./fetch-media");
 const { saveFlyer, flyerPath, contentTypeFor, deleteFlyer } = require("./flyer-store");
 const { logClick, logInteraction, clickStats, pruneOlderThan } = require("./clicks-store");
-const { sendChoice, renderNumbered, approvedTemplateSid } = require("./send-interactive");
+const { sendChoice, renderNumbered, approvedTemplateSid, ensureTemplates } = require("./send-interactive");
 
 const PORT = Number(process.env.PORT || 3000);
 const EVENTS_FILE = process.env.EVENTS_FILE || "events.csv";
@@ -755,8 +755,12 @@ const REVIEW_BUTTON_OPTIONS = [
 // no template is approved — the preview already carries typed instructions, and a
 // second message repeating them would just be noise.
 async function sendReviewButtons(id, eventName) {
-  if (!approvedTemplateSid(REVIEW_TEMPLATE)) return;
   try {
+    // Populate the cache before asking it anything. It fills lazily, so on a freshly
+    // started machine — which Fly gives us constantly, since it suspends when idle —
+    // the first review of the day would otherwise see an empty map and skip silently.
+    await ensureTemplates();
+    if (!approvedTemplateSid(REVIEW_TEMPLATE)) return;
     const result = await sendChoice(ADMIN_SENDER, {
       // text is the fallback wording; it is only used if the template send fails.
       text: `אירוע #${id} ממתין לאישור.`,
