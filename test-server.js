@@ -18,7 +18,7 @@ const TEST_FLYER_DIR = path.join(__dirname, "test-flyers");
 process.env.FLYER_DIR = TEST_FLYER_DIR;
 fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
 
-const { routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, buttonReplyFor, publishDayOptions, goodbyeText, sendGoodbyes, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
+const { routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, publishDayOptions, goodbyeText, sendGoodbyes, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -119,7 +119,12 @@ async function demo() {
   // Regression test: partial info followed by a correction should merge, not loop back to the menu.
   await routeMessage(sender, "2");
   const partialReply = await routeMessage(sender, "מסיבת שאול 60, ביום שישי בערב");
-  if (!partialReply.includes("חסרים עדיין פרטים")) throw new Error("partial event should ask for missing fields, not reset");
+  // Asks a question about what is missing, rather than resetting to the menu. Matched on
+  // "?" plus the exit hint: the wording is now per-field, so pinning the exact sentence
+  // would break every time a field's question is reworded.
+  if (!partialReply.includes("?") || !partialReply.includes("ביטול")) {
+    throw new Error("partial event should ask for missing fields, not reset");
+  }
   if (!activeSubmissions.has(sender)) throw new Error("active submission should persist across a follow-up message");
 
   const followUpReply = await routeMessage(sender, "זה יהיה בקרן, חיפה. הקישור: https://example.com/shaul60");
@@ -406,7 +411,9 @@ async function demo() {
   const stillActive = await routeMessage(activeSender, "מסיבה בחיפה");
   if (!activeSubmissions.has(activeSender)) throw new Error("a fresh session must not be expired");
   if (stillActive.includes("מה תרצו לעשות")) throw new Error("an active draft should not be reset to the menu");
-  if (!stillActive.includes("חסרים עדיין פרטים")) throw new Error("an incomplete draft should ask for the missing fields");
+  if (!stillActive.includes("?") || !stillActive.includes("ביטול")) {
+    throw new Error("an incomplete draft should ask for the missing fields");
+  }
 
   // Past-dated submissions close themselves: Stav was being nagged daily about events
   // (#3, #5) that could no longer be published whatever she decided.
@@ -630,6 +637,79 @@ async function demo() {
   }
   if (makeDigest(boardEvents, "2026-09-20").includes("המלצה חמה")) {
     throw new Error("the daily digest must not carry the standing recommendation any more");
+  }
+
+  // Stav, 26 Aug 2026: the bot asked submitters to type YYYY-MM-DD. Nobody writes a date
+  // backwards, and anything else was rejected by re-showing the same prompt with no hint
+  // why. Day comes first now, and the separators people actually use are accepted.
+  const DATE_TODAY = "2026-08-26";
+  for (const [input, expected] of [
+    ["14-09-26", "2026-09-14"],   // the format now asked for
+    ["14/09/26", "2026-09-14"],
+    ["14.9.26", "2026-09-14"],
+    ["14/9/2026", "2026-09-14"],
+    ["3-9-26", "2026-09-03"],
+    ["2026-09-14", "2026-09-14"], // ISO still parses: buttons and careful typists
+    ["14/9", "2026-09-14"],       // no year -> this year
+    ["1/1", "2027-01-01"],        // no year, already past -> next year
+  ]) {
+    if (parseUserDate(input, DATE_TODAY) !== expected) {
+      throw new Error(`"${input}" should parse to ${expected}, got "${parseUserDate(input, DATE_TODAY)}"`);
+    }
+  }
+  // A date that does not exist must be refused, never coerced into a real one.
+  for (const rubbish of ["31/2/26", "99/99/26", "hello", "", "9", "0/9/26"]) {
+    if (parseUserDate(rubbish, DATE_TODAY) !== "") {
+      throw new Error(`"${rubbish}" is not a date and must be rejected`);
+    }
+  }
+  // The prompt must ask for the order the parser now leads with, or the two drift and
+  // submitters are told to type something the parser does not favour.
+  if (!ASK_OTHER_DATE_TEXT.includes("DD-MM")) {
+    throw new Error("the date prompt must ask for DD-MM, not an ISO date");
+  }
+  if (ASK_OTHER_DATE_TEXT.includes("YYYY")) {
+    throw new Error("the date prompt must not ask a person to write the year first");
+  }
+  // The example in the prompt must itself parse, or we are teaching a format we reject.
+  const example = (ASK_OTHER_DATE_TEXT.match(/(\d{1,2}-\d{1,2}-\d{2,4})/) || [])[1];
+  if (!example || !parseUserDate(example, DATE_TODAY)) {
+    throw new Error("the example date in the prompt must be one the parser accepts");
+  }
+
+  // Stav, 26 Aug 2026: ask a specific question ("please enter the location") rather than
+  // naming a field. A label tells the submitter which column is empty; a question tells
+  // them what to type.
+  const LOCATION_LABEL = "מיקום (שם המקום והכתובת)";
+  const onlyLocation = missingFieldsPrompt([LOCATION_LABEL]);
+  if (!onlyLocation.includes("?")) {
+    throw new Error("a single missing field must be asked as a question");
+  }
+  if (onlyLocation.startsWith("חסרים")) {
+    throw new Error("a single missing field must not be phrased as a list of gaps");
+  }
+  if (!onlyLocation.includes("מיקום")) {
+    throw new Error("the location question must actually name the location");
+  }
+  // Several gaps stay a list: six separate questions in one message is worse than labels.
+  const manyMissing = missingFieldsPrompt([LOCATION_LABEL, "שעה", "קטגוריה"]);
+  if (!manyMissing.includes("•")) {
+    throw new Error("several missing fields should be listed, not run together");
+  }
+  for (const label of ["מיקום", "שעה", "סוג האירוע"]) {
+    if (!manyMissing.includes(label)) {
+      throw new Error(`the multi-field prompt must still cover ${label}`);
+    }
+  }
+  // Every required field needs a question, or a submitter hits a bare label again.
+  for (const label of serverMissingFields({})) {
+    if (!missingFieldsPrompt([label]).includes("?")) {
+      throw new Error(`required field "${label}" has no question of its own`);
+    }
+  }
+  // The way out must survive the rewording.
+  if (!onlyLocation.includes("ביטול") || !manyMissing.includes("ביטול")) {
+    throw new Error("the prompt must always offer the way out");
   }
 
   // Stav, 26 Aug 2026: "dates need to appear with a day name" — "26.8" alone makes her

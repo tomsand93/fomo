@@ -689,6 +689,42 @@ function isValidDate(value) {
   return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
 }
 
+// Turns what a person types into the ISO date everything downstream stores.
+//
+// Asking for YYYY-MM-DD put the burden on the submitter to write a date backwards, and
+// anything else — "14/9", "14-09-26", the way dates are actually written here — was
+// rejected by re-showing the same prompt, with no hint as to why. Day always comes
+// first: that is how dates are read in Israel, and it is the order we now ask for.
+//
+// A missing year means the next occurrence, not year 0026: someone writing "14/9" in
+// December means next September.
+function parseUserDate(value, today = todayIso()) {
+  const text = String(value || "").trim();
+  if (isValidDate(text)) return text; // already ISO, from a button or a careful typist
+
+  const match = text.match(/^(\d{1,2})[./-](\d{1,2})(?:[./-](\d{2}|\d{4}))?$/);
+  if (!match) return "";
+
+  const day = Number(match[1]);
+  const month = Number(match[2]);
+  if (day < 1 || day > 31 || month < 1 || month > 12) return "";
+
+  let year;
+  if (match[3]) {
+    year = Number(match[3]);
+    if (year < 100) year += 2000; // "26" is 2026, not 1926
+  } else {
+    // No year given: this year, or next if that date has already passed.
+    year = Number(today.slice(0, 4));
+    const candidate = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+    if (candidate < today) year += 1;
+  }
+
+  const iso = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+  // Rejects 31/2 and friends: the round-trip only survives a real calendar date.
+  return isValidDate(iso) ? iso : "";
+}
+
 // "Haifa" is not somewhere you can turn up to. A usable location names the venue and
 // enough of an address to find it, so require either a street number or a comma
 // separating venue from address — which is how every good submission already reads
@@ -736,6 +772,31 @@ function missingFields(event) {
   return required
     .filter(([key]) => !event[key] || !fieldIsValid(key, event[key]))
     .map(([, label]) => label);
+}
+
+// The same gaps as missingFields, phrased as something a person can answer.
+//
+// A label ("מיקום (שם המקום והכתובת)") names a database column and leaves the
+// submitter to work out what to type; Stav asked for a plain question instead. Keyed
+// off the same list, so a field can never be required without also having a question.
+const FIELD_QUESTIONS = new Map([
+  ["שם האירוע", "מה שם האירוע?"],
+  ["תאריך", "באיזה תאריך האירוע?"],
+  ["שעה", "באיזו שעה האירוע מתחיל?"],
+  ["מיקום (שם המקום והכתובת)", "מה המיקום של האירוע? (שם המקום והכתובת)"],
+  ["קטגוריה", "מה סוג האירוע? (מוזיקה, מסיבה, קולנוע וכו')"],
+  ["קישור / איש קשר", "מה הקישור או מספר הטלפון לפרטים?"],
+]);
+
+// One missing field gets a direct question. Several get a short list, because six
+// separate questions in one message is worse than the labels were.
+function missingFieldsPrompt(missing) {
+  if (missing.length === 1) {
+    const question = FIELD_QUESTIONS.get(missing[0]);
+    if (question) return `${question}\n(או "ביטול" כדי לצאת)`;
+  }
+  const questions = missing.map((label) => FIELD_QUESTIONS.get(label) || label);
+  return `כדי להמשיך חסרים עוד כמה פרטים:\n${questions.map((q) => `• ${q}`).join("\n")}\n\n(או "ביטול" כדי לצאת)`;
 }
 
 function appendEvent(event, source, sender) {
@@ -1535,7 +1596,7 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
     saveState();
 
     if (attempts < MAX_INCOMPLETE_ATTEMPTS) {
-      return `חסרים עדיין פרטים: ${missing.join(", ")}\nשלחו את הפרטים החסרים, או "ביטול" כדי לצאת.`;
+      return missingFieldsPrompt(missing);
     }
 
     const unresolvedMissing = [`חסרים פרטים שלא הצלחנו לקבל: ${missing.join(", ")}`];
@@ -1678,7 +1739,7 @@ function publishChoiceText(event, options) {
 }
 
 const NO_DAILY_TEXT = "אין בעיה — האירוע יופיע בלוח השבועי בלבד.";
-const ASK_OTHER_DATE_TEXT = 'איזה תאריך? כתבו בפורמט YYYY-MM-DD (למשל 2026-09-14).';
+const ASK_OTHER_DATE_TEXT = 'איזה תאריך? כתבו בפורמט DD-MM-YY (למשל 14-09-26).';
 
 function goodbyeText() {
   return [
@@ -1709,13 +1770,14 @@ function handleDayChoice(sender, trimmed, map) {
   const pending = map.get(sender);
 
   if (pending.expectingDate) {
-    if (!isValidDate(trimmed)) {
+    const date = parseUserDate(trimmed);
+    if (!date) {
       return ASK_OTHER_DATE_TEXT;
     }
-    if (trimmed < todayIso()) {
+    if (date < todayIso()) {
       return "התאריך הזה כבר עבר. כתבו תאריך מהיום והלאה.";
     }
-    return recordDailyDay(sender, pending, trimmed, map);
+    return recordDailyDay(sender, pending, date, map);
   }
 
   const chosen = pending.options.find((option) => option.key === trimmed);
@@ -2055,6 +2117,9 @@ module.exports = {
   destinationFor,
   formatEventForReview,
   missingFields,
+  missingFieldsPrompt,
+  parseUserDate,
+  ASK_OTHER_DATE_TEXT,
   buttonReplyFor,
   // Pure, so the schedule and the choice list can be tested without sending anything.
   isDue,
