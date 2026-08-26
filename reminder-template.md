@@ -1,16 +1,28 @@
 # The reminder template
 
-**Submitted 2026-08-26.** SID `HXb923d6001e23f6daa32169998e2900e9`, category
-`UTILITY`. Created and submitted with `node submit-reminder-template.js`, which reads
-the body out of `send-reminder.js` so it cannot drift from what the code sends.
+**Two templates exist, and the code prefers whichever is Utility.** Submitted 2026-08-26.
 
-Check where it stands:
+| Name | SID | Category | Status |
+|---|---|---|---|
+| `fomo_event_reminder_v3` | `HXf63478d58a6cf6702cf4e018611500da` | UTILITY | preferred |
+| `fomo_event_reminder` | `HXb923d6001e23f6daa32169998e2900e9` | MARKETING | approved, fallback |
+
+The friendly wording below was approved but **re-categorised MARKETING** by Meta, which
+is throttled and suppressed for users opted out of marketing — so some reminders would
+silently never arrive. v3 is the transactional rewrite submitted as UTILITY with
+category change refused:
 
 ```
-node submit-reminder-template.js     # re-run: reports status, never duplicates
+ביקשת תזכורת ל{{1}}. האירוע מתחיל היום בשעה {{2}}, נתראה.
 ```
 
-The rest of this file is why the template looks the way it does — worth reading before
+> *"You asked for a reminder for {{1}}. The event starts today at {{2}}, see you."*
+
+`reminderTemplateSid()` in `send-reminder.js` walks `REMINDER_TEMPLATES` in order and
+uses the first Meta has approved, so the Marketing one is only ever a fallback — a
+throttled reminder still beats none.
+
+The rest of this file is why the templates look the way they do — worth reading before
 changing the wording, since each constraint below came from a real rejection.
 
 ---
@@ -79,6 +91,16 @@ Each of these caused a real rejection on this account:
 - list-picker is not eligible on this account
 - too many variables for the body length is rejected — 2 variables at this length is
   comfortably within it (this is why location was dropped)
+- **a variable may not sit at the start or end of the body**, and trailing punctuation
+  does not count as text. `…מתחיל היום ב-{{2}}.` was rejected outright with
+  `subCode=2388299, "Variables can't be at the start or end of the template"`. The
+  closing clause after the last variable is load-bearing, not styling.
+- **Meta re-categorises freely unless you forbid it.** The friendly template was
+  submitted as UTILITY and approved as MARKETING — a greeting and a sign-off read as
+  promotional. Marketing messages are throttled, count against per-user marketing
+  limits, and are suppressed entirely for anyone opted out of marketing, so a reminder
+  sent that way can silently never arrive. Pass `allow_category_change: false` to make
+  Meta reject rather than reclassify.
 - emoji must be single code points, no variation selectors: 👋 is U+1F44B and 🎈 is
   U+1F388, both one code point. A pair like U+1F39F+U+FE0F renders as nothing on
   clients that do not know it, which is how a price line once arrived unlabelled.

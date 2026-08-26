@@ -40,7 +40,37 @@ const UNDELIVERED_STATUSES = new Set(["undelivered", "failed"]);
 // it makes the sentence long, and fewer variables is a safer approval shape. No buttons:
 // button titles cannot contain variables, and a reminder has nothing to ask - adding
 // buttons would only risk rejection and pin sendChoice's fixed-key matching to it.
-const REMINDER_TEMPLATE = "fomo_event_reminder";
+// Two approved templates, tried in order, because the category matters more than the
+// wording. Meta re-categorised the friendly version as MARKETING despite the request
+// for UTILITY: the greeting and sign-off that make it warm are the same things that
+// make it read as a promotion. Marketing messages are throttled, count against a
+// recipient's marketing limits, and are suppressed outright for anyone who opted out
+// of marketing - so a reminder sent as Marketing can silently never arrive, which is
+// precisely what this module exists to prevent.
+//
+// v3 is the transactional rewrite, submitted as UTILITY with category change refused:
+//
+//   ביקשת תזכורת ל{{1}}. האירוע מתחיל היום בשעה {{2}}, נתראה.
+//   "You asked for a reminder for {{1}}. The event starts today at {{2}}, see you."
+//
+// v2 was the same idea but ended "...ב-{{2}}." and was rejected: a variable may not
+// sit at the start or end of a body, and a trailing period does not count as text.
+// Hence the closing clause after the last variable - it is load-bearing, not styling.
+//
+// v3 is preferred when approved. The friendly one stays as a fallback because a
+// throttled reminder still beats no reminder, and it is already approved.
+const REMINDER_TEMPLATES = ["fomo_event_reminder_v3", "fomo_event_reminder"];
+// Kept for the admin failure notice and for tests, which name the template directly.
+const REMINDER_TEMPLATE = REMINDER_TEMPLATES[0];
+
+// The first of the two that Meta has actually approved, or "" if neither is.
+function reminderTemplateSid() {
+  for (const name of REMINDER_TEMPLATES) {
+    const sid = approvedTemplateSid(name);
+    if (sid) return { sid, name };
+  }
+  return { sid: "", name: "" };
+}
 
 // Was this recipient's 24h window open at `now`?
 //
@@ -77,7 +107,8 @@ async function deliverReminder({ to, eventName, startTime, lastInboundMs = 0, no
     } else {
       via = "template";
       await ensureTemplates();
-      const sid = approvedTemplateSid(REMINDER_TEMPLATE);
+      const { sid, name } = reminderTemplateSid();
+      if (name) via = `template:${name}`;
       if (!sid) {
         // Deliberately not falling back to text: see the header. Text here would be
         // accepted and dropped, and the user was promised this message.
@@ -85,7 +116,7 @@ async function deliverReminder({ to, eventName, startTime, lastInboundMs = 0, no
           ok: false,
           via,
           reason: "no-template",
-          detail: `${REMINDER_TEMPLATE} is not approved and the 24h window is closed`,
+          detail: `neither ${REMINDER_TEMPLATES.join(" nor ")} is approved, and the 24h window is closed`,
         };
       }
       result = await postForm({
@@ -124,6 +155,8 @@ async function deliverReminder({ to, eventName, startTime, lastInboundMs = 0, no
 
 module.exports = {
   REMINDER_TEMPLATE,
+  REMINDER_TEMPLATES,
+  reminderTemplateSid,
   WINDOW_MS,
   WINDOW_SAFETY_MS,
   windowIsOpen,

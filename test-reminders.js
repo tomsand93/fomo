@@ -118,6 +118,28 @@ async function run() {
     docBody[1].replace(/\{\{\d\}\}/g, "").trim().length > 10
   );
 
+  console.log("template preference");
+  // Category beats wording: the friendly template was approved as MARKETING, which is
+  // throttled and suppressed for anyone opted out of marketing, so the transactional
+  // UTILITY one must win whenever it is available.
+  const interactive = require("./send-interactive");
+  const { reminderTemplateSid, REMINDER_TEMPLATES } = require("./send-reminder");
+  check("v3 is preferred", REMINDER_TEMPLATES[0], "fomo_event_reminder_v3");
+
+  interactive._setApprovedTemplates(new Map([
+    ["fomo_event_reminder", "HXmarketing"],
+    ["fomo_event_reminder_v3", "HXutility"],
+  ]));
+  check("the utility template wins when both are approved",
+    reminderTemplateSid(), { sid: "HXutility", name: "fomo_event_reminder_v3" });
+
+  interactive._setApprovedTemplates(new Map([["fomo_event_reminder", "HXmarketing"]]));
+  check("the marketing one is used when it is all there is",
+    reminderTemplateSid(), { sid: "HXmarketing", name: "fomo_event_reminder" });
+
+  interactive._setApprovedTemplates(new Map());
+  check("neither approved means no sid", reminderTemplateSid(), { sid: "", name: "" });
+
   console.log("the 24h window check");
   const now = Date.now();
   check("a message an hour ago leaves it open", windowIsOpen(now - 60 * 60 * 1000, now), true);
