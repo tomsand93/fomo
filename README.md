@@ -12,6 +12,9 @@ Collect Haifa culture event messages, structure them, validate them, and publish
   - submission channel: users send events to the WhatsApp bot
   - billboard channel: one daily organized digest is published
 - Users submit events by WhatsApp message.
+- Incoming messages are routed by classified intent, not by text length: a request for
+  recommendations reaches the inquiry flow and is answered on the first reply, a flyer
+  reaches the submission flow, and anything ambiguous is asked about rather than guessed.
 - Chosen intake: WhatsApp number/bot.
 - The system extracts event details into `events.csv`.
 - Events are reviewed by Stav during MVP.

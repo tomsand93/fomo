@@ -17,14 +17,18 @@ When a user sends any first message, reply with a menu:
 ```text
 היי! מה תרצו לעשות?
 
-1. לפרסם אירוע
-2. לראות מחירון פרסום
-3. שירות לקוחות
+1. לברר בנוגע לאירועים
+2. לפרסם אירוע
+3. לראות מחירון פרסום
+4. שירות לקוחות
 ```
+
+The menu is the fallback, not the automatic first reply: a message whose intent is clear
+is acted on directly. See "Routing a first message" in `conversation-flow.md`.
 
 ## Publish Event Flow
 
-If the user chooses `1`:
+If the user chooses `2`:
 
 ```text
 שלחו את פרטי האירוע בפורמט חופשי.
@@ -61,16 +65,8 @@ If all required fields exist:
 הוא נכנס לבדיקה לפני פרסום.
 ```
 
-If details are missing, reply with all missing fields at once:
-
-```text
-חסרים פרטים כדי להמשיך:
-- תאריך מדויק
-- שעת התחלה
-- פלייר / תמונה
-
-שלחו את הפרטים החסרים בהודעה אחת.
-```
+If details are missing, the gaps are asked as questions a person can answer. The wording
+lives in `missingFieldsPrompt` and `FIELD_QUESTIONS` in `server.js`.
 
 ## Technical MVP
 
