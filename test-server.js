@@ -1797,6 +1797,50 @@ async function demo() {
     throw new Error("an empty draft must not be appended to the CSV");
   }
 
+  // The escape hatch. Someone who ends up in a draft and pushes back is offered a way
+  // out rather than the same checklist a second time — Yarden's second message got a
+  // byte-identical repeat of the first reply.
+  const stuck = "whatsapp:+972500009783";
+  await routeMessage(stuck, "2");
+  await routeMessage(stuck, "בלה בלה");
+  const escapeOffer = await routeMessage(stuck, "מה אתם רוצים ממני?");
+  if (escapeOffer.includes("כדי להמשיך חסרים")) {
+    throw new Error("a question that adds no field must not repeat the checklist");
+  }
+  if (!escapeOffer.includes("לא התכוונתם לפרסם")) {
+    throw new Error("the escape hatch should offer a way out");
+  }
+  const leftFlow = await routeMessage(stuck, "1");
+  if (activeSubmissions.has(stuck)) throw new Error("choosing to leave should clear the draft");
+  if (!activeInquiries.has(stuck)) throw new Error("choosing 1 should reach the inquiry flow");
+  if (!leftFlow.includes("מה תרצו לדעת")) throw new Error("leaving should ask what they want to know");
+  await routeMessage(stuck, "ביטול");
+
+  // Choosing to stay keeps the draft, and the "2" is not absorbed into the event text.
+  const stays = "whatsapp:+972500009784";
+  await routeMessage(stays, "2");
+  await routeMessage(stays, "בלה בלה");
+  await routeMessage(stays, "מה אתם רוצים ממני?");
+  const stayed = await routeMessage(stays, "2");
+  if (!activeSubmissions.has(stays)) throw new Error("choosing 2 should keep the draft open");
+  if (!stayed.includes("שלחו את פרטי האירוע")) {
+    throw new Error("choosing to continue should invite the event details");
+  }
+  await routeMessage(stays, "ביטול");
+
+  // A genuine submitter answering slowly must never be pushed out. Each short reply adds
+  // a field, so the hatch cannot fire even though the replies are terse and one of them
+  // is phrased as a question.
+  const slow = "whatsapp:+972500009785";
+  await routeMessage(slow, "2");
+  await routeMessage(slow, "שם האירוע: ערב ג'אז");
+  const stillAsking = await routeMessage(slow, "תאריך: 2026-11-20");
+  if (stillAsking.includes("לא התכוונתם לפרסם")) {
+    throw new Error("a submitter who is adding fields must never be offered the exit");
+  }
+  if (!activeSubmissions.has(slow)) throw new Error("a progressing submission must stay open");
+  await routeMessage(slow, "ביטול");
+
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });

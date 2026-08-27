@@ -792,6 +792,18 @@ function looksLikeQuestion(text) {
   return QUESTION_MARKERS.test(text.trim());
 }
 
+// Pushback, as distinct from a question. "I'm interested in an event, not marketing one"
+// has no question mark and starts with no interrogative, but it is the clearest possible
+// signal that someone is in the wrong flow. Kept narrow and matched anywhere in the
+// message: these are phrases people reach for only once the bot has misunderstood them.
+// Note the final-letter variants: מפרסם and מפרסמת are different strings, and a prefix
+// written with a medial mem matches neither.
+const OBJECTION_MARKERS = /לא רוצה|לא מעוניינ|לא שלי|לא לפרסם|לא לשווק|לא מפרסמ?[םת]|לא מארגנ|לא הבנת|לא נכון|טעות|מעניין אותי/;
+
+function looksLikeObjection(text) {
+  return OBJECTION_MARKERS.test(text.trim());
+}
+
 // No menu appended: the flag is cleared as this is sent, so the next message falls through
 // to the menu on its own. Including it here printed the menu twice in a row.
 const FOLLOW_UP_AFTER_SUBMISSION_TEXT = "האירוע האחרון שלכם כבר נשלח לבדיקה, אין צורך לשלוח שוב.";
@@ -1711,6 +1723,16 @@ function isEssentiallyEmptyDraft(event, images = []) {
 
 const GAVE_UP_ON_DRAFT_TEXT = "לא הצלחנו לקלוט פרטי אירוע מההודעות האחרונות, אז לא שלחנו כלום לבדיקה.";
 
+// Offers the exit rather than taking it: someone genuinely mid-submission who phrased a
+// message oddly can carry on by simply answering, and nothing is discarded unless they
+// say so. Numbered to match the main menu, so "1" means here what it means there.
+const WRONG_FLOW_ESCAPE_TEXT = `נראה שאולי לא התכוונתם לפרסם אירוע.
+
+1. לברר בנוגע לאירועים
+2. להמשיך לפרסם את האירוע
+
+או פשוט המשיכו לכתוב את פרטי האירוע.`;
+
 // Asked when the classifier cannot tell a submission from a question. Worded as what the
 // person wants rather than what the bot does. Plain numbered text on purpose: sendChoice
 // falls back to exactly this when no template is approved, so a template would change
@@ -1737,6 +1759,22 @@ function startSubmission(sender) {
 
 async function handleActiveSubmission(sender, text, mediaUrls) {
   const trimmed = text.trim();
+
+  // Answering the escape offer. Above the append below, so the answer never becomes part
+  // of the event text — swallowing menu digits into the draft is the same class of bug
+  // this change exists to fix. Keyed off the flag rather than matching "1" unconditionally,
+  // because a bare "1" is a perfectly good answer to a question mid-draft.
+  if (offeredEscape.has(sender)) {
+    offeredEscape.delete(sender);
+    saveState();
+    if (trimmed === "1") {
+      startInquiry(sender);
+      return ASK_INQUIRY_TEXT;
+    }
+    // "2" carries no event detail of its own, so acknowledge it rather than appending it.
+    if (trimmed === "2") return ASK_EVENT_DETAILS_TEXT;
+    // Anything else: they carried on submitting, so fall through and process it normally.
+  }
 
   if (text.length > MAX_MESSAGE_LENGTH) {
     return MESSAGE_TOO_LONG_TEXT;
@@ -1778,6 +1816,9 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
   const previousEvent = alreadySentCount ? lastExtractedEvent.get(sender) || null : null;
 
   const correctionGuidance = buildCorrectionGuidance(EVENTS_FILE);
+  // Read before the set below overwrites it: the escape hatch needs to know whether this
+  // turn actually added anything.
+  const previousExtraction = lastExtractedEvent.get(sender) || null;
   const event = await extractEventModule.extractEvent(conversationText, undefined, newImages, previousEvent, correctionGuidance);
   imagesSentToModel.set(sender, images.length);
   lastExtractedEvent.set(sender, event);
@@ -1791,6 +1832,25 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
     const attempts = (incompleteAttempts.get(sender) || 0) + 1;
     incompleteAttempts.set(sender, attempts);
     saveState();
+
+    // Repeating the checklist at someone who is not submitting an event is the trap this
+    // whole change removes. Three conditions, all required:
+    //
+    // - the message added no identifying field. This is what protects the genuine
+    //   submitter: a bare "מחר" fills date, a bare venue name fills location, and either
+    //   raises the count, so the hatch cannot fire on someone answering slowly.
+    // - it reads as a question or an objection — the shape of someone who thinks they are
+    //   talking to something else.
+    // - it is not the first prompt. The first checklist is legitimate and usually
+    //   answered; only a repeat is the failure.
+    const addedNothing = countIdentifyingFields(event) <= (previousExtraction ? countIdentifyingFields(previousExtraction) : 0);
+    const soundsMisrouted = looksLikeQuestion(trimmed) || looksLikeObjection(trimmed);
+
+    if (attempts >= 2 && addedNothing && soundsMisrouted && !images.length) {
+      offeredEscape.add(sender);
+      saveState();
+      return WRONG_FLOW_ESCAPE_TEXT;
+    }
 
     if (attempts < MAX_INCOMPLETE_ATTEMPTS) {
       return missingFieldsPrompt(missing);
