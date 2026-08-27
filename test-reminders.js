@@ -33,7 +33,7 @@ function writeEvents(rows) {
 const clock = require("./clock");
 const remindersStore = require("./reminders-store");
 const { extractReminderRequest } = require("./answer-inquiry");
-const { windowIsOpen, reminderText } = require("./send-reminder");
+const { windowIsOpen, reminderText, REMINDER_TEMPLATES } = require("./send-reminder");
 
 function check(label, actual, expected) {
   const a = JSON.stringify(actual);
@@ -99,23 +99,42 @@ async function run() {
     sentence,
     "היי! 👋 עוד קצת ומתחיל מסיבת גג, ב-20:00. תהנו! 🎈"
   );
-  const docBody = fs.readFileSync(path.join(__dirname, "reminder-template.md"), "utf8")
-    .match(/```\n(היי![^\n]*)\n```/);
-  checkTrue("the submission doc still carries the body", Boolean(docBody));
+  // There are two approved bodies now, tried in the order REMINDER_TEMPLATES lists them:
+  // the v3 transactional rewrite (submitted as UTILITY) and the friendly original, kept
+  // as a fallback. Both are real send paths, so the doc has to carry both — pinning this
+  // to one wording broke as soon as v3 landed, and the check that matters is that no
+  // approved body drifts away from what the code sends, not which one comes first.
+  const templateDoc = fs.readFileSync(path.join(__dirname, "reminder-template.md"), "utf8");
+  // The file is CRLF, so match either ending and keep the \r out of the captured body.
+  const docBodies = [...templateDoc.matchAll(/```\r?\n([^\r\n`]*\{\{1\}\}[^\r\n]*)\r?\n```/g)].map((m) => m[1]);
+  checkTrue("the submission doc still carries a body per approved template", docBodies.length >= REMINDER_TEMPLATES.length);
+  // The friendly body is the one reminderText() renders inside the 24h window, so that
+  // one must match character for character.
+  const friendlyBody = docBodies.find((b) => b.startsWith("היי!"));
+  checkTrue("the doc still carries the free-text body", Boolean(friendlyBody));
   check(
     "and it matches what the code sends",
-    docBody[1].replace("{{1}}", "מסיבת גג").replace("{{2}}", "20:00"),
+    friendlyBody.replace("{{1}}", "מסיבת גג").replace("{{2}}", "20:00"),
     sentence
+  );
+  // v3 is a deliberate rewrite rather than the same sentence, so it is not compared to
+  // reminderText. What it must do is name the event and the time, in that order — a
+  // reminder that lost either one would still read as a sentence and still be wrong.
+  const v3Body = docBodies.find((b) => !b.startsWith("היי!"));
+  checkTrue("the doc carries the v3 body", Boolean(v3Body));
+  checkTrue(
+    "and v3 still names the event before the time",
+    Boolean(v3Body) && v3Body.indexOf("{{1}}") < v3Body.indexOf("{{2}}")
   );
   // The repo's guard: a variation selector makes an emoji vanish on some clients.
   checkTrue(
     "no emoji carries a variation selector",
-    !/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]\u{FE0F}/u.test(docBody[1])
+    !docBodies.some((b) => /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]\u{FE0F}/u.test(b))
   );
   // Meta rejects a body that is only parameters.
   checkTrue(
     "the body has literal text around its variables",
-    docBody[1].replace(/\{\{\d\}\}/g, "").trim().length > 10
+    docBodies.every((b) => b.replace(/\{\{\d\}\}/g, "").trim().length > 10)
   );
 
   console.log("template preference");
@@ -123,7 +142,7 @@ async function run() {
   // throttled and suppressed for anyone opted out of marketing, so the transactional
   // UTILITY one must win whenever it is available.
   const interactive = require("./send-interactive");
-  const { reminderTemplateSid, REMINDER_TEMPLATES } = require("./send-reminder");
+  const { reminderTemplateSid } = require("./send-reminder");
   check("v3 is preferred", REMINDER_TEMPLATES[0], "fomo_event_reminder_v3");
 
   interactive._setApprovedTemplates(new Map([
