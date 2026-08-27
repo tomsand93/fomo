@@ -2187,6 +2187,17 @@ const server = http.createServer((req, res) => {
 loadState();
 
 if (require.main === module) {
+  // handleTwilio skips signature verification under NODE_ENV=test, which is right for
+  // the suite and catastrophic anywhere else: without it, anyone who can reach the
+  // webhook can post From=<admin phone> and approve, reject or correct events. The two
+  // settings only ever coincide by mistake, so refuse to start rather than serve.
+  if (process.env.NODE_ENV === "test" && process.env.TWILIO_AUTH_TOKEN) {
+    console.error(
+      "refusing to start: NODE_ENV=test disables Twilio signature verification, " +
+      "but TWILIO_AUTH_TOKEN is set — this would accept forged webhooks as the admin."
+    );
+    process.exit(1);
+  }
   server.listen(PORT, () => console.log(`listening on ${PORT}`));
   setInterval(sweepStaleRateLimitEntries, RATE_LIMIT_SWEEP_INTERVAL_MS).unref();
   setInterval(sendDuePendingReminder, BOARD_CHECK_INTERVAL_MS).unref();
