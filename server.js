@@ -1685,6 +1685,32 @@ function hasUnambiguousSubmissionSignal(mediaUrls) {
 
 const LIKELY_EVENT_DETECTED_TEXT = "נראה ששיתפתם פרטים על אירוע — מעבדים את זה עכשיו. (כתבו \"ביטול\" כדי לחזור לתפריט)";
 
+// The fields that only appear when someone is genuinely describing an event.
+//
+// category and description are deliberately excluded: the extractor is told to infer a
+// category from almost any text and description is a free-text catch-all, so both come
+// back populated for a message that was never an event at all. Counting them would mean
+// the checks below never fire.
+const CORE_IDENTIFYING_FIELDS = ["event_name", "date", "start_time", "location", "contact_link"];
+// Two, not one: a real submitter a few turns in has a name and something else, while a
+// misrouted conversation yields at most one incidental field.
+const MIN_FIELDS_WORTH_FILING = 2;
+
+function countIdentifyingFields(event) {
+  return CORE_IDENTIFYING_FIELDS.filter(
+    (key) => event[key] && fieldIsValid(key, event[key])
+  ).length;
+}
+
+// Whether a draft has enough in it to be worth Stav's time.
+function isEssentiallyEmptyDraft(event, images = []) {
+  // A flyer is content in itself: Stav can read one the extractor could not.
+  if (images.length) return false;
+  return countIdentifyingFields(event) < MIN_FIELDS_WORTH_FILING;
+}
+
+const GAVE_UP_ON_DRAFT_TEXT = "לא הצלחנו לקלוט פרטי אירוע מההודעות האחרונות, אז לא שלחנו כלום לבדיקה.";
+
 // Asked when the classifier cannot tell a submission from a question. Worded as what the
 // person wants rather than what the bot does. Plain numbered text on purpose: sendChoice
 // falls back to exactly this when no template is approved, so a template would change
@@ -1768,6 +1794,17 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
 
     if (attempts < MAX_INCOMPLETE_ATTEMPTS) {
       return missingFieldsPrompt(missing);
+    }
+
+    // Three tries and still nothing that looks like an event: this was probably never a
+    // submission. Filing it anyway wrote junk into the review queue and — worse — told the
+    // sender "we received your event and forwarded it for review", which was untrue. One
+    // visitor got that in answer to "what is your purpose?". Hand them the menu instead;
+    // it is the honest reply and the only recoverable one.
+    if (isEssentiallyEmptyDraft(event, images)) {
+      clearSession(sender);
+      saveState();
+      return `${GAVE_UP_ON_DRAFT_TEXT}\n\n${MENU_TEXT}`;
     }
 
     const unresolvedMissing = [`חסרים פרטים שלא הצלחנו לקבל: ${missing.join(", ")}`];

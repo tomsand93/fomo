@@ -1777,6 +1777,26 @@ async function demo() {
     throw new Error("a failed classification should land on the menu");
   }
 
+  // An empty draft is abandoned, not filed. This is the tail of the same incident: after
+  // three turns that yielded nothing, the bot wrote the empty draft to the CSV, forwarded
+  // it to Stav and replied "we received your event and forwarded it for review".
+  const chatty = "whatsapp:+972500009782";
+  const rowsBeforeChatty = fs.readFileSync(TEST_EVENTS_FILE, "utf8").split("\n").length;
+  await routeMessage(chatty, "2");
+  await routeMessage(chatty, "בבקשה");
+  await routeMessage(chatty, "עוד משהו");
+  const limitReply = await routeMessage(chatty, "ועוד");
+  if (limitReply.includes("קיבלנו את האירוע והעברנו")) {
+    throw new Error("an empty draft must never produce a receipt claiming it was filed");
+  }
+  if (!limitReply.includes("מה תרצו לעשות")) {
+    throw new Error("giving up on an empty draft should return the sender to the menu");
+  }
+  if (activeSubmissions.has(chatty)) throw new Error("the abandoned draft must be cleared");
+  if (fs.readFileSync(TEST_EVENTS_FILE, "utf8").split("\n").length !== rowsBeforeChatty) {
+    throw new Error("an empty draft must not be appended to the CSV");
+  }
+
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
