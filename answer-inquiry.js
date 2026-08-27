@@ -84,6 +84,27 @@ function reminderRules() {
   return remindersEnabled() ? REMINDER_RULES_ON : REMINDER_RULES_OFF;
 }
 
+// A dump is worse than an answer. A competing bot replied to one broad question with
+// about twenty events in a row — unreadable, and nobody picks anything from it. Five is
+// enough to recognise something worth going to, and the offer to show more costs one
+// line.
+const MAX_EVENTS_PER_ANSWER = 5;
+
+// What the bot can actually offer, so a clarifying question proposes real choices
+// rather than inventing categories that have nothing on. Derived from the same list the
+// model is answering from, so the two cannot disagree.
+function availableOptions(events) {
+  const categories = [...new Set(events.map((e) => e.category).filter(Boolean))];
+  const dates = [...new Set(events.map((e) => e.date).filter(Boolean))].sort();
+  if (!categories.length && !dates.length) return "";
+  const lines = [];
+  if (categories.length) lines.push(`קטגוריות שיש בהן אירועים: ${categories.join(", ")}.`);
+  if (dates.length) {
+    lines.push(`תאריכים שיש בהם אירועים: ${dates.slice(0, 14).join(", ")}${dates.length > 14 ? " ועוד" : ""}.`);
+  }
+  return `\n${lines.join("\n")}\n`;
+}
+
 function buildSystemPrompt(events, todayIso) {
   return `אתה סוכן וואטסאפ ידידותי שעונה על שאלות לגבי אירועי תרבות בחיפה, בהתבסס אך ורק על רשימת האירועים שסופקה למטה.
 היום התאריך הוא ${todayIso} (פורמט YYYY-MM-DD).
@@ -95,7 +116,10 @@ function buildSystemPrompt(events, todayIso) {
 - לעולם אל תמסור מספרי טלפון של מי שפרסם אירוע, ואל תמסור מידע על אירועים שאינם מאושרים לפרסום.
 - אם אין אירועים מתאימים לשאלה, אמור זאת בנימוס בעברית.
 - זו שיחה מתמשכת: זכור מה נאמר בהודעות הקודמות וענה על שאלות המשך בהקשר שלהן.
-- אם השאלה כללית או לא ברורה, מותר לשאול שאלת הבהרה קצרה (למשל "לאיזה יום?").
+- שאלה רחבה ("מה יש?", "מה קורה החודש?", "יש משהו מעניין?") — אל תפרט אירועים. שאל שאלה קצרה אחת שתמקד, והצע אפשרויות אמיתיות מתוך הרשימה שלמטה: יום מסוים או סוג אירוע. שאלה אחת בלבד, לא כמה.
+- ברגע שהמשתמש מיקד (יום, תאריך או קטגוריה) — ענה מיד ואל תשאל שוב.
+- לכל היותר ${MAX_EVENTS_PER_ANSWER} אירועים בתשובה אחת. אם יש יותר, הצג את ${MAX_EVENTS_PER_ANSWER} הראשונים לפי תאריך וסיים בשאלה קצרה אם להראות עוד.
+- אל תחזור על אירוע שכבר הצגת בשיחה הזו, אלא אם ביקשו אותו במפורש.
 - אם המשתמש רוצה לפרסם אירוע, לראות מחירון או לפנות לשירות לקוחות, הסבר שיש לכתוב "ביטול" ולבחור באפשרות המתאימה בתפריט.
 - ענה בטון טבעי, קליל וידידותי, כמו הודעת וואטסאפ, לא רשימה טכנית.
 - תשובה קצרה וממוקדת, בעברית בלבד.
@@ -114,6 +138,7 @@ ${reminderRules()}
 - שים לב להתאמת מין ומספר: "אירוע אחד", "שני אירועים", "מסיבה אחת".
 - אל תתרגם מילולית ביטויים מאנגלית (למשל "אני מצטער אבל..." — עדיף פשוט "סליחה," או בלי התנצלות בכלל).
 
+${availableOptions(events)}
 רשימת האירועים:
 ${eventsToText(events)}`;
 }

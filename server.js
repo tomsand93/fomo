@@ -155,7 +155,9 @@ const RATE_LIMITED_TEXT = "שלחתם הרבה הודעות ברצף. חכו ד�
 const MEDIA_FETCH_FAILED_TEXT = "לא הצלחנו לקרוא את התמונה ששלחתם. נסו לשלוח אותה שוב, או המשיכו עם טקסט בלבד.";
 
 const MAX_INQUIRY_EVENTS = 50;
-const MAX_INQUIRY_HISTORY = 12;
+// Raised from 12 alongside the clarify-first change: asking before answering spends two
+// turns on what used to take one, so 12 was six exchanges and is now three questions.
+const MAX_INQUIRY_HISTORY = 20;
 
 function upcomingPublishedEvents(events, today = todayIso()) {
   return events

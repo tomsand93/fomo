@@ -639,11 +639,43 @@ async function demo() {
     throw new Error("the daily digest must not carry the standing recommendation any more");
   }
 
+  const inquiry = require("./answer-inquiry");
+
+  // --- Ask before dumping ---
+  //
+  // A competing bot answered one broad question with about twenty events in a row.
+  // The prompt must instruct a clarifying question first, cap how many events one
+  // answer lists, and offer the categories that actually have something on.
+  const askEvents = [
+    { id: "1", event_name: "מסיבה", date: "2026-09-01", start_time: "22:00", location: "חיפה", category: "מסיבה" },
+    { id: "2", event_name: "ג'אז", date: "2026-09-02", start_time: "21:00", location: "חיפה", category: "מוזיקה חיה" },
+    { id: "3", event_name: "סדנה", date: "2026-09-03", start_time: "10:00", location: "חיפה", category: "סדנה" },
+  ];
+  const askPrompt = inquiry.buildSystemPrompt(askEvents, "2026-08-27");
+  // The clarifying question must offer real options, not invented ones.
+  for (const category of ["מסיבה", "מוזיקה חיה", "סדנה"]) {
+    if (!askPrompt.includes(`קטגוריות שיש בהן אירועים`) || !askPrompt.includes(category)) {
+      throw new Error(`the prompt must offer ${category} as an available option`);
+    }
+  }
+  if (!askPrompt.includes("2026-09-01")) {
+    throw new Error("the prompt must list the dates that actually have events");
+  }
+  // A category with nothing on must not be offered.
+  if (askPrompt.includes("קטגוריות שיש בהן אירועים: ") && /קטגוריות שיש בהן אירועים:[^\n]*קולנוע/.test(askPrompt)) {
+    throw new Error("a category with no events must not be offered");
+  }
+  if (!/שאלה רחבה/.test(askPrompt)) {
+    throw new Error("the prompt must tell the model to clarify a broad question first");
+  }
+  if (!/לכל היותר \d+ אירועים/.test(askPrompt)) {
+    throw new Error("the prompt must cap how many events one answer lists");
+  }
+
   // --- Prompt injection and data leakage ---
   //
   // Event text is written by strangers and lands in the inquiry SYSTEM prompt, which is
   // the highest-trust position in the request. These lock the fencing in place.
-  const inquiry = require("./answer-inquiry");
   const leakyEvent = {
     id: "1",
     event_name: "מסיבה",
