@@ -18,7 +18,7 @@ const TEST_FLYER_DIR = path.join(__dirname, "test-flyers");
 process.env.FLYER_DIR = TEST_FLYER_DIR;
 fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
 
-const { routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, publishDayOptions, goodbyeText, sendGoodbyes, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
+const { routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, publishDayOptions, goodbyeText, goodbyeMessage, sendGoodbyes, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -1227,6 +1227,36 @@ async function demo() {
   if (!goodbyeText().includes("לברר על אירועים")) {
     throw new Error("the goodbye should mention the bot answers questions");
   }
+
+  // One message per PERSON, not per event. A publisher with five past events received
+  // the same text five times in a row on 26 Aug 2026 — each event deduped correctly on
+  // its own, but nobody deduped the person. Worst when a backlog is swept at once.
+  const manyEvents = [
+    { id: "1", event_name: "מעגל שירה", slug: "" },
+    { id: "2", event_name: "לייב בנולה סוקס", slug: "" },
+    { id: "4", event_name: "קוליארט", slug: "" },
+    { id: "6", event_name: "השועל והכרם", slug: "" },
+    { id: "14", event_name: "אימפרוב", slug: "" },
+  ];
+  const grouped = goodbyeMessage(manyEvents);
+  for (const e of manyEvents) {
+    if (!grouped.includes(e.event_name)) {
+      throw new Error(`a grouped goodbye must name every event, missing ${e.event_name}`);
+    }
+  }
+  // The single-event wording repeated verbatim is exactly what the bug looked like.
+  if (grouped.includes("תהנו באירוע שלכם")) {
+    throw new Error("a grouped goodbye must not reuse the single-event sentence");
+  }
+  if ((grouped.match(/שפרסמתם/g) || []).length !== 1) {
+    throw new Error("a grouped goodbye must thank once, not once per event");
+  }
+  // One event keeps the original message untouched.
+  const singleGoodbye = goodbyeMessage([{ id: "1", event_name: "מעגל שירה", slug: "" }]);
+  if (singleGoodbye !== goodbyeText()) {
+    throw new Error("a single past event should keep the original goodbye wording");
+  }
+
   fs.unlinkSync(byeFile);
 
   // --- Phase 4: short links, click counting, interaction log ---

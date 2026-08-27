@@ -337,7 +337,12 @@ function expirePastEvents(events, today = todayIso()) {
     });
   }
   sweepPastFlyers(events, today);
-  sendGoodbyes(events, today);
+  // Detached on purpose: callers use the returned list synchronously, and a slow
+  // sequence of thank-yous must not hold up expiring the rows. The rows are marked
+  // before any send, so nothing is re-sent if this rejects.
+  sendGoodbyes(events, today).catch((err) => {
+    console.error("failed to send goodbyes:", err);
+  });
   return stale;
 }
 
@@ -346,24 +351,63 @@ function expirePastEvents(events, today = todayIso()) {
 // already the free-form audit field, and this only needs to be idempotent.
 const GOODBYE_NOTE = "נשלח תודה";
 
-function sendGoodbyes(events, today = todayIso()) {
+// Grouped by person, not by event. The note on each row is still the idempotency key —
+// no event thanks anyone twice — but one message per *event* meant a publisher with five
+// past events got the same text five times in a row. That happened: one submitter has
+// events 1, 2, 4, 6 and 14, all swept in a single run, and received five identical
+// messages. Dates run from June to August, so this is a backlog being cleared rather
+// than natural daily expiry, which is exactly when the pile-up is worst.
+async function sendGoodbyes(events, today = todayIso()) {
+  const bySubmitter = new Map();
   for (const event of events) {
     if (event.status !== "published") continue;
     if (!event.date || event.date >= today) continue;
     if (!event.submitter) continue;
     if ((event.notes || "").includes(GOODBYE_NOTE)) continue;
-
-    // Marked before sending, not after: a send that throws must not leave this
-    // event eligible again tomorrow and every day after.
-    storeUpdateEvent(EVENTS_FILE, event.id, {
-      notes: `${event.notes} | ${GOODBYE_NOTE}`.trim(),
-    });
-    // Only mentioned when there is something to mention: "0 people viewed your event"
-    // is worse than saying nothing at all.
-    const views = event.slug ? clickStats({ eventId: event.id }).total : 0;
-    const tail = views > 0 ? `\n\n${views} אנשים צפו בקישור לאירוע שלכם דרך FOMO 📈` : "";
-    notifySubmitter(event.submitter, `${goodbyeText()}${tail}`);
+    if (!bySubmitter.has(event.submitter)) bySubmitter.set(event.submitter, []);
+    bySubmitter.get(event.submitter).push(event);
   }
+
+  for (const [submitter, theirs] of bySubmitter) {
+    // Marked before sending, not after: a send that throws must not leave these
+    // events eligible again tomorrow and every day after.
+    for (const event of theirs) {
+      storeUpdateEvent(EVENTS_FILE, event.id, {
+        notes: `${event.notes} | ${GOODBYE_NOTE}`.trim(),
+      });
+    }
+    // Awaited rather than fired off in a loop: several sends at once arrive interleaved
+    // with whatever else the bot is saying to them.
+    await notifySubmitter(submitter, goodbyeMessage(theirs));
+  }
+}
+
+// One event keeps the original wording. Several become one message that names them,
+// because "thanks for publishing" repeated verbatim reads like a broken bot rather
+// than a thank-you.
+function goodbyeMessage(theirs) {
+  // Only mentioned when there is something to mention: "0 people viewed your event"
+  // is worse than saying nothing at all.
+  const viewsFor = (event) => (event.slug ? clickStats({ eventId: event.id }).total : 0);
+
+  if (theirs.length === 1) {
+    const views = viewsFor(theirs[0]);
+    const tail = views > 0 ? `\n\n${views} אנשים צפו בקישור לאירוע שלכם דרך FOMO 📈` : "";
+    return `${goodbyeText()}${tail}`;
+  }
+
+  const lines = [`איזה כיף שפרסמתם אצלנו ${theirs.length} אירועים!`, "", "תהנו 🎉", ""];
+  let total = 0;
+  for (const event of theirs) {
+    const views = viewsFor(event);
+    total += views;
+    lines.push(`• ${event.event_name}${views > 0 ? ` — ${views} צפיות` : ""}`);
+  }
+  if (total > 0) {
+    lines.push("", `סה״כ ${total} אנשים צפו בקישורים שלכם דרך FOMO 📈`);
+  }
+  lines.push("", "לא לשכוח שאפשר גם לדבר עם הבוט שלנו ולברר על אירועים");
+  return lines.join("\n");
 }
 
 // A flyer is only useful while its event is still ahead, and these are megabyte-scale
@@ -649,7 +693,12 @@ function clearSession(sender) {
 // A conversation that goes quiet is abandoned, not paused. Without this a half-finished
 // draft survives forever (it's persisted to state.json, so even a restart won't clear it)
 // and the next unrelated message gets answered in the context of a stale one.
-const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+// Five hours, up from thirty minutes. Half an hour was tuned to stop a stale draft
+// absorbing an unrelated message, but it also meant someone who asked about events over
+// lunch and came back after work started from nothing — and the conversation history is
+// the thing that makes follow-up questions work at all. The draft risk is still real;
+// MAX_INQUIRY_HISTORY still caps how much of a conversation is carried.
+const IDLE_TIMEOUT_MS = 5 * 60 * 60 * 1000;
 const IDLE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
 function hasSessionState(sender) {
@@ -2186,6 +2235,7 @@ module.exports = {
   PENDING_REMINDER_SLOT,
   publishDayOptions,
   goodbyeText,
+  goodbyeMessage,
   sendGoodbyes,
   get awaitingPublishChoice() { return awaitingPublishChoice; },
   get awaitingDailyChoice() { return awaitingDailyChoice; },
