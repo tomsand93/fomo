@@ -9,6 +9,7 @@ const { isFreeEntry, formatShort, formatLong } = require("./format-event");
 const { makeWeekly } = require("./make-weekly");
 const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent } = require("./events-store");
 const extractEventModule = require("./extract-event");
+const intentModule = require("./classify-intent");
 const { addCorrection, buildCorrectionGuidance } = require("./corrections-store");
 const answerInquiryModule = require("./answer-inquiry");
 const { sendWhatsApp, getMessageStatus } = require("./send-whatsapp");
@@ -44,6 +45,15 @@ let awaitingDailyChoice = new Map(); // sender -> { eventId, options, expectingD
 let undeliveredAdminNotices = new Set(); // event ids whose review notice never reached the admin, surfaced on her next message
 let askedForClarification = new Set(); // senders already asked a clarifying question this submission, so we never ask twice
 let incompleteAttempts = new Map(); // sender -> consecutive turns still missing required fields, so a draft can't loop forever
+// sender -> { text, at }. Set when the classifier can't tell which flow a stranger wants.
+// Persisted like every other conversation flag: the answer arrives on a separate inbound
+// webhook and Fly suspends this machine in between. The original text rides along so
+// answering doesn't make them retype what they already sent.
+let awaitingIntentConfirm = new Map();
+// senders just offered a way out of a submission that looks misrouted. Its own flag
+// because the activeSubmissions branch swallows every message: without it, the "1"
+// answering the offer would be appended to the event draft.
+let offeredEscape = new Set();
 let noticeSidToEventId = new Map(); // Twilio message sid of a review notice -> event id, so a WhatsApp reply to it resolves without a number
 // The admin's phone is also her QA/testing phone, so her role can't be inferred from the
 // message text: "2" is both a menu choice and (previously) a reject command. She declares
@@ -78,6 +88,8 @@ function loadState() {
     undeliveredAdminNotices = new Set(raw.undeliveredAdminNotices || []);
     askedForClarification = new Set(raw.askedForClarification || []);
     incompleteAttempts = new Map(raw.incompleteAttempts || []);
+    awaitingIntentConfirm = new Map(raw.awaitingIntentConfirm || []);
+    offeredEscape = new Set(raw.offeredEscape || []);
     noticeSidToEventId = new Map(raw.noticeSidToEventId || []);
     adminMode = new Map(raw.adminMode || []);
     lastActivity = new Map(raw.lastActivity || []);
@@ -110,6 +122,9 @@ function writeStateNow() {
     undeliveredAdminNotices: [...undeliveredAdminNotices],
     askedForClarification: [...askedForClarification],
     incompleteAttempts: [...incompleteAttempts.entries()],
+    // Bounded: an unanswered confirmation older than the last few is dead anyway.
+    awaitingIntentConfirm: [...awaitingIntentConfirm.entries()].slice(-50),
+    offeredEscape: [...offeredEscape],
     // Bounded: only recent notices need to stay resolvable by reply.
     noticeSidToEventId: [...noticeSidToEventId].slice(-50),
     adminMode: [...adminMode.entries()],
@@ -688,6 +703,8 @@ function clearSession(sender) {
   lastExtractedEvent.delete(sender);
   askedForClarification.delete(sender);
   incompleteAttempts.delete(sender);
+  awaitingIntentConfirm.delete(sender);
+  offeredEscape.delete(sender);
   activeInquiries.delete(sender);
   activeInquiryHistories.delete(sender);
   recentlyCompleted.delete(sender);
@@ -712,7 +729,8 @@ function hasSessionState(sender) {
     activeInquiries.has(sender) ||
     recentlyCompleted.has(sender) ||
     awaitingPublishChoice.has(sender) ||
-    awaitingDailyChoice.has(sender)
+    awaitingDailyChoice.has(sender) ||
+    awaitingIntentConfirm.has(sender)
   );
 }
 
@@ -1652,14 +1670,44 @@ const MAIN_MENU_BUTTON_OPTIONS = [
 const MENU_KEYWORDS = new Set(["תפריט", "/menu", "menu"]);
 const CANCEL_KEYWORDS = new Set(["ביטול", "/cancel", "cancel"]);
 
-const LIKELY_EVENT_TEXT_MIN_LENGTH = 40;
+// Above this the classifier's verdict is acted on directly; below it the sender is
+// asked. Deliberately cautious: the cost of asking is one extra message, and the cost
+// of guessing wrong is someone locked in an event draft with no way out.
+const INTENT_CONFIDENCE_THRESHOLD = 0.7;
 
-function looksLikeEventSubmission(trimmed, mediaUrls) {
-  if (mediaUrls.length) return true;
-  return trimmed.length >= LIKELY_EVENT_TEXT_MIN_LENGTH;
+// Media is never ambiguous. A flyer is the clearest "publish this" signal the bot gets,
+// it is the main job, and routing it anywhere but the draft would break the path that
+// matters most. Checked before the classifier so a flyer costs no model call and cannot
+// be talked out of the submission flow by its own caption.
+function hasUnambiguousSubmissionSignal(mediaUrls) {
+  return mediaUrls.length > 0;
 }
 
 const LIKELY_EVENT_DETECTED_TEXT = "נראה ששיתפתם פרטים על אירוע — מעבדים את זה עכשיו. (כתבו \"ביטול\" כדי לחזור לתפריט)";
+
+// Asked when the classifier cannot tell a submission from a question. Worded as what the
+// person wants rather than what the bot does. Plain numbered text on purpose: sendChoice
+// falls back to exactly this when no template is approved, so a template would change
+// nothing today and adds a Meta approval step.
+const INTENT_CONFIRM_TEXT = `רגע, רק לוודא — מה תרצו?
+
+1. לברר בנוגע לאירועים (אני מחפש/ת לאן ללכת)
+2. לפרסם אירוע (יש לי אירוע שאני רוצה לפרסם)`;
+
+// The two flow entry points, so the router switch, the classifier, the confirmation
+// answer and the escape answer cannot drift on what "start an inquiry" means.
+function startInquiry(sender) {
+  clearSession(sender);
+  activeInquiries.add(sender);
+  activeInquiryHistories.delete(sender);
+  saveState();
+}
+
+function startSubmission(sender) {
+  clearSession(sender);
+  activeSubmissions.set(sender, []);
+  saveState();
+}
 
 async function handleActiveSubmission(sender, text, mediaUrls) {
   const trimmed = text.trim();
@@ -1952,6 +2000,8 @@ function senderFlow(sender) {
   if (activeSubmissions.has(sender)) return "submission";
   if (activeInquiries.has(sender)) return "inquiry";
   if (awaitingPublishChoice.has(sender) || awaitingDailyChoice.has(sender)) return "publish-choice";
+  // Its own tag so drop-off at the confirmation is visible in interactions.jsonl.
+  if (awaitingIntentConfirm.has(sender)) return "intent-confirm";
   if (recentlyCompleted.has(sender)) return "post-submission";
   return "menu";
 }
@@ -2016,6 +2066,29 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
     clearSession(sender);
     saveState();
     return MENU_TEXT;
+  }
+
+  // Directly below the cancel keyword and above every flow branch: while this question is
+  // open, "1" and "2" mean what INTENT_CONFIRM_TEXT says they mean, not what the main menu
+  // says, so it has to outrank the switch below. It also has to outrank recentlyCompleted,
+  // which would otherwise forward a non-digit answer to Stav as an amendment.
+  if (awaitingIntentConfirm.has(sender)) {
+    const pending = awaitingIntentConfirm.get(sender);
+    awaitingIntentConfirm.delete(sender);
+    saveState();
+
+    if (trimmed === "1") {
+      startInquiry(sender);
+      // Re-run their original message rather than asking "what would you like to know?"
+      // — they already said.
+      return routeMessageInner(sender, pending.text, [], repliedSid, state);
+    }
+    if (trimmed === "2") {
+      startSubmission(sender);
+      return handleActiveSubmission(sender, pending.text, []);
+    }
+    // Anything else: the question is already cleared, so let this message be routed on
+    // its own merits below. Asking twice is how the old bug felt.
   }
 
   if (activeSubmissions.has(sender)) {
@@ -2095,22 +2168,66 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
       return PRICE_PLACEHOLDER_TEXT;
     case "4":
       return CUSTOMER_SERVICE_TEXT;
-    default:
-      if (looksLikeEventSubmission(trimmed, mediaUrls)) {
-        clearSession(sender);
-        activeSubmissions.set(sender, []);
-        saveState();
+    default: {
+      // A flyer is a submission, full stop — no model call, no confirmation.
+      if (hasUnambiguousSubmissionSignal(mediaUrls)) {
+        startSubmission(sender);
         const reply = await handleActiveSubmission(sender, text, mediaUrls);
         return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
       }
-      // Answering a reminder we sent unprompted. Checked here, after the menu keys and
-      // the submission sniffer, so it only ever catches what would have fallen through
-      // to the menu anyway.
+
+      // Answering a reminder we sent unprompted. Moved above the classifier: it is an
+      // exact match against a reminder we know we sent, so it needs no guessing and
+      // should not spend a model call.
       {
         const reply = replyToReminder(sender, trimmed);
         if (reply) return reply;
       }
+
+      if (!trimmed) return MENU_TEXT;
+
+      // Length is not intent. The old rule read any message of 40+ characters as an event
+      // and dropped the sender into a draft they could not leave — a request for gig
+      // recommendations is comfortably over 40 characters, and someone asking "what's on
+      // tonight?" is comfortably under it and got the menu instead of an answer. Ask what
+      // the person actually wants, and when the model isn't sure, ask the person.
+      if (isRateLimited(sender)) return RATE_LIMITED_TEXT;
+      // classifyIntent is written never to reject, but this is the one call standing
+      // between a stranger and the wrong flow, so it does not get to depend on that.
+      // Anything unexpected lands on the menu, which is always recoverable.
+      let intent = "other";
+      let confidence = 0;
+      try {
+        ({ intent, confidence } = await intentModule.classifyIntent(trimmed));
+      } catch (err) {
+        console.error("intent classification threw, falling back to menu:", err);
+        return MENU_TEXT;
+      }
+
+      if (confidence >= INTENT_CONFIDENCE_THRESHOLD) {
+        if (intent === "submit") {
+          startSubmission(sender);
+          const reply = await handleActiveSubmission(sender, text, mediaUrls);
+          return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
+        }
+        if (intent === "inquire") {
+          // Answer the question they already asked. Re-entering here lands in the
+          // activeInquiries branch above, which cannot route back to this one.
+          startInquiry(sender);
+          return routeMessageInner(sender, text, mediaUrls, repliedSid, state);
+        }
+        return MENU_TEXT;
+      }
+
+      // Not sure. Anything genuinely ambiguous between the two real flows gets the
+      // question; a low-confidence "other" is just noise and gets the menu.
+      if (intent === "submit" || intent === "inquire") {
+        awaitingIntentConfirm.set(sender, { text: trimmed, at: Date.now() });
+        saveState();
+        return INTENT_CONFIRM_TEXT;
+      }
       return MENU_TEXT;
+    }
   }
 }
 
@@ -2272,6 +2389,8 @@ module.exports = {
   get recentlyReminded() { return recentlyReminded; },
   upcomingPublishedEvents,
   get activeSubmissions() { return activeSubmissions; },
+  get awaitingIntentConfirm() { return awaitingIntentConfirm; },
+  get offeredEscape() { return offeredEscape; },
   get activeSubmissionImages() { return activeSubmissionImages; },
   get activeInquiries() { return activeInquiries; },
   get activeInquiryHistories() { return activeInquiryHistories; },

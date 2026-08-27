@@ -23,7 +23,7 @@ fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
 // to nothing respectively, which is correct behaviour but untestable.
 process.env.PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://test.fomo.local";
 
-const { routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, publishDayOptions, goodbyeText, goodbyeMessage, sendGoodbyes, mapsUrl, mapLink, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
+const { routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, publishDayOptions, goodbyeText, goodbyeMessage, sendGoodbyes, mapsUrl, mapLink, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, awaitingIntentConfirm, offeredEscape, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -38,6 +38,17 @@ answerInquiryModule.answerInquiry = async (history, events) => {
 // Stub the extractor too: the suite must run offline and deterministically, without
 // spending real OpenRouter calls. It parses the "field: value" shape the tests use and
 // merges across turns, which is the behaviour the routing logic actually depends on.
+// Stub the intent classifier too: the suite runs offline, and routing must be
+// deterministic. Keyed off the exact text so each case is explicit; anything unlisted
+// is a low-confidence "other", which must land on the menu.
+const intentModule = require("./classify-intent");
+const intentCalls = [];
+const INTENT_STUB = new Map();
+intentModule.classifyIntent = async (text) => {
+  intentCalls.push(text);
+  return INTENT_STUB.get(String(text).trim()) || { intent: "other", confidence: 0.2 };
+};
+
 const extractEventModule = require("./extract-event");
 const STUB_FIELD_LABELS = new Map([
   ["שם האירוע", "event_name"], ["תאריך", "date"], ["שעה", "start_time"],
@@ -1627,6 +1638,143 @@ async function demo() {
   const tapped = await routeMessage(tapSender, "1");
   if (!tapped.includes("נשלח אותו להודעה היומית")) {
     throw new Error("a button payload must be handled exactly like a typed number");
+  }
+
+  // REGRESSION (Yarden, 27/08/2026): a first-time visitor asked for punk gig
+  // recommendations — 43 characters, so the old 40-character rule read it as a forwarded
+  // event and opened a draft. Their reply saying they were not advertising anything got
+  // the identical missing-fields checklist, and "what is your purpose?" was answered with
+  // "we received your event and forwarded it for review". Nothing had been submitted.
+  INTENT_STUB.set("תמליץ לי על הופעות PUNK בחודש הקרוב בחיפה", { intent: "inquire", confidence: 0.95 });
+  INTENT_STUB.set("מעניין אותי אירוע, לא לשווק אחד", { intent: "inquire", confidence: 0.9 });
+  INTENT_STUB.set("מה המטרה שלך?", { intent: "other", confidence: 0.9 });
+
+  const yarden = "whatsapp:+972500009711";
+  const rowsBeforeYarden = fs.readFileSync(TEST_EVENTS_FILE, "utf8").split("\n").length;
+  const y1 = await routeMessage(yarden, "תמליץ לי על הופעות PUNK בחודש הקרוב בחיפה");
+  if (activeSubmissions.has(yarden)) {
+    throw new Error("a recommendation request must never open an event draft");
+  }
+  if (y1.includes("נראה ששיתפתם פרטים על אירוע")) {
+    throw new Error("a recommendation request must not be announced as an event submission");
+  }
+  if (!activeInquiries.has(yarden)) {
+    throw new Error("a confident inquiry should land in the inquiry flow");
+  }
+  // The answer arrives on the first reply. Sending the menu, or asking "what would you
+  // like to know?" to someone who just said, is the failure this replaced.
+  if (y1.includes("מה תרצו לעשות") || y1.includes("מה תרצו לדעת על האירועים")) {
+    throw new Error("an inquiry must be answered on the first reply, not bounced to a menu");
+  }
+  const y2 = await routeMessage(yarden, "מעניין אותי אירוע, לא לשווק אחד");
+  if (y2.includes("כדי להמשיך חסרים")) {
+    throw new Error("an inquirer must never receive the missing-fields checklist");
+  }
+  await routeMessage(yarden, "ביטול");
+  const y3 = await routeMessage(yarden, "מה המטרה שלך?");
+  if (y3.includes("קיבלנו את האירוע")) {
+    throw new Error("a question about the bot must never claim an event was received");
+  }
+  if (fs.readFileSync(TEST_EVENTS_FILE, "utf8").split("\n").length !== rowsBeforeYarden) {
+    throw new Error("nothing in that conversation should have been written to the CSV");
+  }
+
+  // The quiet half of the same bug: this is 23 characters, so it slipped under the old
+  // rule and avoided the draft — but then fell through to the menu. The single most
+  // common question the bot gets was answered with a numbered list of options.
+  INTENT_STUB.set("מה יש לעשות היום בחיפה?", { intent: "inquire", confidence: 0.95 });
+  const visitor = "whatsapp:+972500009722";
+  const askedWhatsOn = await routeMessage(visitor, "מה יש לעשות היום בחיפה?");
+  if (askedWhatsOn.includes("מה תרצו לעשות")) {
+    throw new Error("a visitor question must be answered, not met with the menu");
+  }
+  if (askedWhatsOn.includes("מה תרצו לדעת על האירועים")) {
+    throw new Error("the bot must not ask what they want to know — they just said");
+  }
+  if (!activeInquiries.has(visitor)) throw new Error("the visitor should be in the inquiry flow");
+  await routeMessage(visitor, "ביטול");
+
+  // A confident submission still opens a draft, and media never spends a model call.
+  INTENT_STUB.set("ג'אם סשן בבר בזל, מסדה 12, חיפה, יום חמישי ב-21:00", { intent: "submit", confidence: 0.95 });
+  const organizer = "whatsapp:+972500009733";
+  await routeMessage(organizer, "ג'אם סשן בבר בזל, מסדה 12, חיפה, יום חמישי ב-21:00");
+  if (!activeSubmissions.has(organizer)) {
+    throw new Error("a confident submission must still open a draft");
+  }
+  await routeMessage(organizer, "ביטול");
+
+  // A flyer is the clearest "publish this" signal there is, so it must reach the draft
+  // without asking a model and without the classifier being able to talk it out of the
+  // submission flow via its own caption. The media fetch itself fails here (there is no
+  // network in the suite) and that is fine: the routing decision happens before it, and
+  // the draft is open either way. What matters is that no classification was spent.
+  const flyerSender = "whatsapp:+972500009744";
+  const callsBeforeFlyer = intentCalls.length;
+  await routeMessage(flyerSender, "בואו לאירוע", ["https://example.test/flyer.jpg"]);
+  if (!activeSubmissions.has(flyerSender)) {
+    throw new Error("a flyer must always be treated as a submission");
+  }
+  if (intentCalls.length !== callsBeforeFlyer) {
+    throw new Error("media must short-circuit before the classifier is called");
+  }
+  await routeMessage(flyerSender, "ביטול");
+
+  // Ambiguous: ask rather than guess, and act on the answer without a retype.
+  INTENT_STUB.set("משהו על אירוע אולי", { intent: "inquire", confidence: 0.4 });
+  const unsure = "whatsapp:+972500009755";
+  const asked = await routeMessage(unsure, "משהו על אירוע אולי");
+  if (!asked.includes("רק לוודא")) {
+    throw new Error("a low-confidence classification should ask rather than guess");
+  }
+  if (activeSubmissions.has(unsure)) {
+    throw new Error("an unanswered confirmation must not open a draft");
+  }
+  const confirmed = await routeMessage(unsure, "2");
+  if (!activeSubmissions.has(unsure)) throw new Error("answering 2 should start the submission");
+  if (confirmed.includes("שלחו את פרטי האירוע")) {
+    throw new Error("the original text should be processed, not requested again");
+  }
+  await routeMessage(unsure, "ביטול");
+
+  await routeMessage(unsure, "משהו על אירוע אולי");
+  await routeMessage(unsure, "1");
+  if (!activeInquiries.has(unsure)) throw new Error("answering 1 should start the inquiry flow");
+  await routeMessage(unsure, "ביטול");
+
+  // "ביטול" outranks the confirmation, and an unrelated reply abandons it rather than
+  // re-asking forever.
+  await routeMessage(unsure, "משהו על אירוע אולי");
+  const cancelled = await routeMessage(unsure, "ביטול");
+  if (!cancelled.includes("מה תרצו לעשות")) throw new Error("cancel must outrank the confirmation");
+  if (awaitingIntentConfirm.has(unsure)) throw new Error("cancel must clear the confirmation");
+
+  // Its own sender: the per-sender rate limit counts classifier calls, and the cases
+  // above have already spent several on `unsure`.
+  const abandoner = "whatsapp:+972500009781";
+  await routeMessage(abandoner, "משהו על אירוע אולי");
+  const abandoned = await routeMessage(abandoner, "לא משנה");
+  if (!abandoned.includes("מה תרצו לעשות")) {
+    throw new Error("a non-answer should fall through, not re-ask");
+  }
+  if (awaitingIntentConfirm.has(abandoner)) {
+    throw new Error("the confirmation must be cleared after one attempt");
+  }
+
+  // A classifier that fails degrades to the menu, never into a draft.
+  const savedClassify = intentModule.classifyIntent;
+  intentModule.classifyIntent = async () => { throw new Error("model unavailable"); };
+  const broken = "whatsapp:+972500009766";
+  let degraded;
+  try {
+    degraded = await routeMessage(broken, "משהו ארוך מספיק כדי להיראות כמו אירוע כלשהו");
+  } finally {
+    intentModule.classifyIntent = savedClassify;
+  }
+  if (activeSubmissions.has(broken)) {
+    throw new Error("a failed classification must never open a draft");
+  }
+  if (!degraded.includes("מה תרצו לעשות")) {
+    throw new Error("a failed classification should land on the menu");
   }
 
   fs.unlinkSync(CORRECTIONS_FILE);
