@@ -18,7 +18,12 @@ const TEST_FLYER_DIR = path.join(__dirname, "test-flyers");
 process.env.FLYER_DIR = TEST_FLYER_DIR;
 fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
 
-const { routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, publishDayOptions, goodbyeText, goodbyeMessage, sendGoodbyes, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
+// shortLink and mapLink both need a base URL and read it once at module load, so it has
+// to be set before server.js is required. Without it they fall back to contact_link and
+// to nothing respectively, which is correct behaviour but untestable.
+process.env.PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://test.fomo.local";
+
+const { routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, publishDayOptions, goodbyeText, goodbyeMessage, sendGoodbyes, mapsUrl, mapLink, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -637,6 +642,46 @@ async function demo() {
   }
   if (makeDigest(boardEvents, "2026-09-20").includes("המלצה חמה")) {
     throw new Error("the daily digest must not carry the standing recommendation any more");
+  }
+
+  // --- Map links ---
+  //
+  // A tracked /m/<slug> rather than a bare maps URL, so opening a map is counted the
+  // way opening a link already is — and counted separately, since heading to a venue
+  // is a much stronger signal than tapping a link.
+  const mapEvent = { id: "1", slug: "n4ag", location: "בר בזל, מסדה 12, חיפה" };
+  if (!mapLink(mapEvent).includes("/m/n4ag")) {
+    throw new Error("a map link must point at the tracked /m/ route");
+  }
+  if (mapLink({ id: "1", location: "חיפה" })) {
+    throw new Error("an event with no slug has nothing to point at and must get no map link");
+  }
+  if (mapLink({ id: "1", slug: "n4ag" })) {
+    throw new Error("an event with no location must get no map link");
+  }
+  // A bare street resolves to whichever city the viewer is near, so the city is added.
+  if (!decodeURIComponent(mapsUrl("הרב אוחנה 4")).includes("חיפה")) {
+    throw new Error("a location without a city must have חיפה appended");
+  }
+  // ...but not twice.
+  if ((decodeURIComponent(mapsUrl("מסדה 12, חיפה")).match(/חיפה/g) || []).length !== 1) {
+    throw new Error("חיפה must not be appended to an address that already says it");
+  }
+  // The map belongs on the daily message, not on the board's one-line entries.
+  const formatEvent = require("./format-event");
+  const withMap = formatEvent.formatLong(
+    { ...mapEvent, event_name: "מסיבה", start_time: "22:00", category: "מסיבה" },
+    { linkFor: () => "", mapFor: mapLink }
+  ).text;
+  if (!withMap.includes("/m/n4ag")) {
+    throw new Error("formatLong must render the map when mapFor is given");
+  }
+  const withoutMap = formatEvent.formatLong(
+    { ...mapEvent, event_name: "מסיבה", start_time: "22:00", category: "מסיבה" },
+    { linkFor: () => "" }
+  ).text;
+  if (withoutMap.includes("/m/")) {
+    throw new Error("formatLong must render no map when mapFor is not given");
   }
 
   const inquiry = require("./answer-inquiry");

@@ -107,7 +107,10 @@ function formatShort(event, { linkFor = defaultLinkFor } = {}) {
 //
 // Time and entrance share a line: they are the two things someone checks together
 // when deciding whether they can go.
-function formatLong(event, { linkFor = defaultLinkFor, flyerUrl = () => "", withDate = false } = {}) {
+// `mapFor` is opt-in rather than always on: the board line is already dense, and only
+// the daily message has room for an extra line. Callers that do not pass it render
+// exactly what they rendered before.
+function formatLong(event, { linkFor = defaultLinkFor, flyerUrl = () => "", withDate = false, mapFor = () => "" } = {}) {
   const head = [`${iconFor(event)} ${event.event_name}`];
   if (event.category) head.push(`· ${event.category}`);
 
@@ -122,10 +125,14 @@ function formatLong(event, { linkFor = defaultLinkFor, flyerUrl = () => "", with
   const description = usableDescription(event);
   const link = linkFor(event);
 
+  // The map sits directly under the address it opens, so the two read as one block.
+  const map = event.location ? mapFor(event) : "";
+
   const lines = [
     head.join(" "),
     when.length ? when.join(" · ") : "",
     event.location ? `📍 ${event.location}` : "",
+    map ? `🗺 ${map}` : "",
     description,
     event.contact_person ? `👤 ${event.contact_person}` : "",
     link ? `🔗 ${link}` : "",

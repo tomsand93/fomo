@@ -230,7 +230,10 @@ function slotsDueAt(local) {
 // still ahead. Flyers follow as separate messages because Twilio carries one image each.
 function buildSlotPost(events, localDate) {
   const links = { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) };
-  const daily = makeDigest(events, localDate, links);
+  // The map goes on the daily message only. The board's one-line entries already carry
+  // a location, a price and a link; a second URL there is noise. formatShort ignores
+  // mapFor anyway, but passing it only where it is wanted keeps that deliberate.
+  const daily = makeDigest(events, localDate, { ...links, mapFor: mapLink });
   const board = makeWeekly(events, localDate, links);
   return `${daily}\n\n———\n\n${board}`;
 }
@@ -276,7 +279,7 @@ const MAX_SLOT_FLYERS = 3;
 async function sendSlotFlyers(events, localDate) {
   const flyered = digestFlyerEvents(events, localDate).slice(0, MAX_SLOT_FLYERS);
   for (const event of flyered) {
-    const { text, mediaUrl } = formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), withDate: true });
+    const { text, mediaUrl } = formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), withDate: true, mapFor: mapLink });
     if (!mediaUrl) continue;
     try {
       await sendWhatsApp(ADMIN_SENDER, text, mediaUrl);
@@ -998,6 +1001,25 @@ function shortLink(event) {
   return `${PUBLIC_BASE_URL.replace(/\/$/, "")}/e/${event.slug}`;
 }
 
+// Where /m/<slug> sends someone. A search query rather than coordinates: the addresses
+// here are typed by submitters ("בר בזל, מסדה 12, חיפה"), and a search resolves those
+// the way a person would, while geocoding them would need an API and a key.
+//
+// "חיפה" is appended when the address does not already say it, because a bare street
+// name resolves to whichever city the viewer happens to be near.
+function mapsUrl(location) {
+  const address = String(location || "").trim();
+  const query = /חיפה|haifa/i.test(address) ? address : `${address}, חיפה`;
+  return `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(query)}`;
+}
+
+// Unlike shortLink there is no fallback: without a slug or a base URL there is nothing
+// to point at, and a raw maps URL in the message would not be counted.
+function mapLink(event) {
+  if (!event.slug || !PUBLIC_BASE_URL || !event.location) return "";
+  return `${PUBLIC_BASE_URL.replace(/\/$/, "")}/m/${event.slug}`;
+}
+
 // contact_link holds whatever the submitter wrote, and in practice that is almost never
 // a bare URL — of the events in production only one is, the rest being names, phone
 // numbers or prices. So the link resolves to a real destination only when there is one
@@ -1181,12 +1203,12 @@ async function forwardAmendmentToAdmin(id, text, sender) {
 // A ready-to-forward post for the group. Same LONG rendering the daily message uses,
 // so the group sees one consistent format however an event reaches it.
 function formatPublishedPost(event) {
-  return formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), withDate: true }).text;
+  return formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), withDate: true, mapFor: mapLink }).text;
 }
 
 async function sendPublishedPost(id, event) {
   if (process.env.NODE_ENV === "test") return;
-  const { text, mediaUrl } = formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), withDate: true });
+  const { text, mediaUrl } = formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), withDate: true, mapFor: mapLink });
   if (event.flyer && !mediaUrl) {
     console.error(`event #${id} has a flyer but PUBLIC_BASE_URL is unset; sending text only`);
   }
@@ -2145,6 +2167,32 @@ const server = http.createServer((req, res) => {
   // The FOMO short link. Counts the visit, then either forwards to the submitter's own
   // URL or — far more often, since most events give a name or a phone rather than a link
   // — shows the event on a page of ours.
+  // The map link. A separate slug space from /e/ so the two are counted separately:
+  // opening a map is a much stronger signal of intent to attend than opening a link,
+  // and mixing them into one number would hide that.
+  if (req.method === "GET" && url.pathname.startsWith("/m/")) {
+    const slug = decodeURIComponent(url.pathname.slice("/m/".length));
+    const event = loadEvents(EVENTS_FILE).find((e) => e.slug && e.slug === slug);
+    if (!event || !event.location) {
+      res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end("האירוע לא נמצא");
+      return;
+    }
+
+    logClick({
+      slug: `map:${slug}`,
+      eventId: event.id,
+      userAgent: req.headers["user-agent"],
+      referer: req.headers.referer,
+      ip: (req.headers["fly-client-ip"] || req.socket.remoteAddress || ""),
+    });
+
+    // no-store for the same reason /e/ uses it: a cached redirect goes uncounted.
+    res.writeHead(302, { Location: mapsUrl(event.location), "Cache-Control": "no-store" });
+    res.end();
+    return;
+  }
+
   if (req.method === "GET" && url.pathname.startsWith("/e/")) {
     const slug = decodeURIComponent(url.pathname.slice("/e/".length));
     const event = loadEvents(EVENTS_FILE).find((e) => e.slug && e.slug === slug);
@@ -2249,6 +2297,8 @@ module.exports = {
   publishDayOptions,
   goodbyeText,
   goodbyeMessage,
+  mapsUrl,
+  mapLink,
   sendGoodbyes,
   get awaitingPublishChoice() { return awaitingPublishChoice; },
   get awaitingDailyChoice() { return awaitingDailyChoice; },
