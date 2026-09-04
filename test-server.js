@@ -743,6 +743,15 @@ async function demo() {
   if (!soul.SOUL_CORE || soul.SOUL_CORE.length < 50) {
     throw new Error("soul.js must load a real excerpt from soul.md, not come back empty");
   }
+  // REGRESSION (04/09/2026): soul.js parsed soul.md assuming bare \n. git's autocrlf
+  // rewrote the checked-out file to \r\n on this machine and loadSoulCore threw at
+  // require time — before any assertion in this suite ever ran, since the process
+  // crashed on the require() itself. This checks the file actually on disk is CRLF (so
+  // the assertion above — soul loaded a real, non-empty excerpt — is proof the parser
+  // survives it, not just proof it works on some other machine's checkout).
+  if (!fs.readFileSync(path.join(__dirname, "soul.md"), "utf8").includes("\r\n")) {
+    throw new Error("soul.md is checked out as LF here, so the CRLF regression above cannot be exercised — this test needs a CRLF checkout to mean anything");
+  }
   if (!askPrompt.includes(soul.SOUL_CORE)) {
     throw new Error("answer-inquiry's prompt must include the shared soul excerpt");
   }

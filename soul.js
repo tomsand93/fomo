@@ -11,7 +11,12 @@ const path = require("path");
 const SOUL_PATH = path.join(__dirname, "soul.md");
 
 function loadSoulCore() {
-  const raw = fs.readFileSync(SOUL_PATH, "utf8");
+  // Normalized to \n immediately: this file is Markdown, checked in and checked out on
+  // Windows, and git's core.autocrlf silently rewrites \n to \r\n on the way into the
+  // working tree (confirmed happening here — see the commit this comment shipped in).
+  // Every match below assumes \n; matching CRLF instead would just be the same bug with
+  // an extra case, so normalize once at the only place this file is read.
+  const raw = fs.readFileSync(SOUL_PATH, "utf8").replace(/\r\n/g, "\n");
   const match = raw.match(/## The excerpt every prompt shares[^\n]*\n\n>([^\n]+)/);
   if (!match) {
     throw new Error("soul.js: could not find the shared excerpt block in soul.md — did its heading or blockquote format change?");
