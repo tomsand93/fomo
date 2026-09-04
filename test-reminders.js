@@ -253,9 +253,14 @@ async function run() {
   checkTrue("with the reason kept", missed.detail.includes("window passed"));
 
   console.log("opt-in recording");
+  // recordReminderOptIns has no injectable clock — it checks isReminderMissed against
+  // real wall-clock time — so EVENT_DATE (fixed, for the window-math tests above, which
+  // do pass an explicit `now`) would eventually land in the past and this section would
+  // start failing for a reason unrelated to the code. A date computed from today can't.
+  const FUTURE_EVENT_DATE = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const events = [
-    { id: "7", event_name: "מסיבה", date: EVENT_DATE, start_time: "20:00" },
-    { id: "8", event_name: "הופעה", date: EVENT_DATE, start_time: "23:00" },
+    { id: "7", event_name: "מסיבה", date: FUTURE_EVENT_DATE, start_time: "20:00" },
+    { id: "8", event_name: "הופעה", date: FUTURE_EVENT_DATE, start_time: "23:00" },
   ];
   fs.unlinkSync(TEST_REMINDERS_FILE);
   delete require.cache[require.resolve("./reminders-store")];
