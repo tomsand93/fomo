@@ -724,8 +724,47 @@ async function demo() {
   if (!/שאלה רחבה/.test(askPrompt)) {
     throw new Error("the prompt must tell the model to clarify a broad question first");
   }
-  if (!/לכל היותר \d+ אירועים/.test(askPrompt)) {
-    throw new Error("the prompt must cap how many events one answer lists");
+  // Replaced the old "up to 5 events" cap: the prompt now tells the model to answer
+  // with one event at a time — the best match — and offer the next one only if asked.
+  if (!/אירוע אחד/.test(askPrompt)) {
+    throw new Error("the prompt must tell the model to answer with one event, not a list");
+  }
+  if (!/עוד משהו/.test(askPrompt)) {
+    throw new Error("the prompt must cover offering the next match when asked for another");
+  }
+
+  // --- soul.md: the one shared voice/purpose excerpt every prompt is built on ---
+  //
+  // extract-event.js, classify-intent.js and answer-inquiry.js each independently wrote
+  // their own framing before this existed, and could drift apart again if a prompt is
+  // edited without checking the others. Pinning the same core sentence in the built
+  // prompt of all three is what keeps that from happening silently.
+  const soul = require("./soul");
+  if (!soul.SOUL_CORE || soul.SOUL_CORE.length < 50) {
+    throw new Error("soul.js must load a real excerpt from soul.md, not come back empty");
+  }
+  if (!askPrompt.includes(soul.SOUL_CORE)) {
+    throw new Error("answer-inquiry's prompt must include the shared soul excerpt");
+  }
+  if (!extractEventModule.buildPrompt("x", "2026-09-01", false, null).includes(soul.SOUL_CORE)) {
+    throw new Error("extract-event's prompt must include the shared soul excerpt");
+  }
+  if (!intentModule.buildPrompt("x", "2026-09-01").includes(soul.SOUL_CORE)) {
+    throw new Error("classify-intent's prompt must include the shared soul excerpt");
+  }
+
+  // --- Language: the bot matches whoever it's talking to ---
+  //
+  // REGRESSION (04/09/2026): manual testing against the live model found the reply
+  // reverting to Hebrew mid-English-conversation on a short follow-up like "anything
+  // else?" — plausible since most of the system prompt itself is Hebrew. This locks the
+  // instruction that fixed it in place; it can't catch a live model drifting, but it can
+  // catch someone editing the prompt and losing the instruction entirely.
+  if (!askPrompt.includes("ההודעה האחרונה של המשתמש בלבד")) {
+    throw new Error("the prompt must say the reply language is decided by the user's latest message alone");
+  }
+  if (!askPrompt.includes("anything else")) {
+    throw new Error("the prompt must give a concrete example of a short English follow-up staying in English");
   }
 
   // --- Prompt injection and data leakage ---

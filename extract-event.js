@@ -1,4 +1,5 @@
 const { postJson } = require("./http-json");
+const { SOUL_CORE } = require("./soul");
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const MODEL = process.env.OPENROUTER_MODEL || "anthropic/claude-haiku-4.5";
@@ -26,7 +27,9 @@ function buildPrompt(conversationText, todayIso, hasImages, previousEvent, corre
     ? "\nבנוסף לטקסט צורפו תמונה/ות של פלייר האירוע. חלץ מידע גם מהטקסט המופיע בתמונה (שם האירוע, תאריך, שעה, מיקום וכו'). שים לב: הטקסט הגדול בפלייר הוא לרוב שם האירוע או רשימת המופיעים, לא המיקום.\n"
     : "\n";
   const previouslyExtractedNote = buildPreviouslyExtractedNote(previousEvent);
-  return `אתה עוזר שמחלץ פרטי אירוע תרבות מהודעות טקסט בעברית (או מעורבות עברית/אנגלית) שנשלחות בוואטסאפ.
+  return `${SOUL_CORE}
+
+אתה כרגע מחלץ פרטי אירוע תרבות ממה שהמארגן שלח בוואטסאפ (עברית, או מעורבות עברית/אנגלית).
 היום התאריך הוא ${todayIso} (פורמט YYYY-MM-DD).
 ${imageNote}${previouslyExtractedNote}
 חלץ את השדות הבאים מהטקסט (ומהתמונה אם צורפה). אם שדה לא מוזכר בשום מקום, השאר אותו כמחרוזת ריקה "".
@@ -134,4 +137,4 @@ function normalizeQuestions(raw) {
     .slice(0, MAX_QUESTIONS);
 }
 
-module.exports = { extractEvent, FIELD_KEYS };
+module.exports = { extractEvent, FIELD_KEYS, buildPrompt };

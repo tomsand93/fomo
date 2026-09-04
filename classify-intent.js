@@ -1,4 +1,5 @@
 const { postJson } = require("./http-json");
+const { SOUL_CORE } = require("./soul");
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 // Its own model setting, like the inquiry path. This runs in front of every message from
@@ -23,7 +24,9 @@ function fence(value) {
 }
 
 function buildPrompt(text, todayIso) {
-  return `אתה מסווג כוונות עבור בוט וואטסאפ של אירועי תרבות בחיפה.
+  return `${SOUL_CORE}
+
+אתה כרגע מסווג כוונות: לפני שהבוט מגיב, הוא צריך לדעת אם המשתמש מוסר אירוע או מחפש אירוע.
 היום התאריך הוא ${todayIso} (פורמט YYYY-MM-DD).
 
 הבוט עושה שני דברים עיקריים:
