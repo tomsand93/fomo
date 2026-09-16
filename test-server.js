@@ -733,6 +733,30 @@ async function demo() {
     throw new Error("the prompt must cover offering the next match when asked for another");
   }
 
+  // --- Classify against real categories, don't free-associate ---
+  //
+  // A topic query used to be matched by the model's own judgment against category and
+  // description text with no fallback spelled out. This locks in the two things that
+  // actually matter: the model is told to classify into the categories that really
+  // exist, and it's given a concrete instruction for what to do when nothing matches —
+  // show the real list, not invent a question or a category that has nothing on.
+  if (!askPrompt.includes("סיווג לפי קטגוריה")) {
+    throw new Error("the prompt must instruct classification against real categories");
+  }
+  for (const category of ["מסיבה", "מוזיקה חיה", "סדנה"]) {
+    if (!askPrompt.slice(askPrompt.indexOf("סיווג לפי קטגוריה"), askPrompt.indexOf("סיווג לפי קטגוריה") + 400).includes(category)) {
+      throw new Error(`the classification rule itself must name ${category}, not just availableOptions further down`);
+    }
+  }
+  if (!askPrompt.includes("רשימה ממוספרת")) {
+    throw new Error("an unmatched topic must fall back to a numbered list of real categories, not a guess");
+  }
+  // A category with nothing on must not appear in the classification rule either —
+  // the same guard as the availableOptions check above, but for the new rule's own list.
+  if (/סיווג לפי קטגוריה[^\n]*קולנוע/.test(askPrompt)) {
+    throw new Error("the classification rule must not offer a category with no events");
+  }
+
   // --- soul.md: the one shared voice/purpose excerpt every prompt is built on ---
   //
   // extract-event.js, classify-intent.js and answer-inquiry.js each independently wrote

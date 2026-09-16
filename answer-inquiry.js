@@ -93,10 +93,9 @@ function reminderRules() {
 // there's nothing here to cap, since the system prompt is what tells it to stop at one.
 
 // What the bot can actually offer, so a clarifying question proposes real choices
-// rather than inventing categories that have nothing on. Derived from the same list the
-// model is answering from, so the two cannot disagree.
-function availableOptions(events) {
-  const categories = [...new Set(events.map((e) => e.category).filter(Boolean))];
+// rather than inventing categories that have nothing on. `categories` is computed once
+// by the caller and shared with categoryFilterRules, so the two cannot disagree.
+function availableOptions(events, categories) {
   const dates = [...new Set(events.map((e) => e.date).filter(Boolean))].sort();
   if (!categories.length && !dates.length) return "";
   const lines = [];
@@ -105,6 +104,18 @@ function availableOptions(events) {
     lines.push(`תאריכים שיש בהם אירועים: ${dates.slice(0, 14).join(", ")}${dates.length > 14 ? " ועוד" : ""}.`);
   }
   return `\n${lines.join("\n")}\n`;
+}
+
+// Classification against the categories that actually exist, not free association. A
+// vague topic ("something with a weird vibe") used to get an ad-hoc clarifying question
+// the model invented on the spot; this makes the fallback concrete — the real category
+// list, as a pick-list, so the user is choosing from what's actually on rather than
+// guessing what words the bot will understand. Takes the categories directly (not the
+// event list) so it stays in lockstep with availableOptions, which is what proves the
+// list offered here is real.
+function categoryFilterRules(categories) {
+  if (!categories.length) return "";
+  return `- סיווג לפי קטגוריה: כשמשתמש מבקש נושא או סוג אירוע, נסה קודם להתאים אותו לאחת מהקטגוריות שבאמת קיימות ברשימה למטה (${categories.join(", ")}) — גם אם הניסוח שונה (למשל "פאנק" או "רוק" שייכים ל"מוזיקה חיה"). אם ההתאמה ברורה, ענה ישירות לפי הכלל של שאלה ממוקדת. אם הנושא לא מתאים בבירור לאף קטגוריה, אל תנחש ואל תמציא — הצג רשימה ממוספרת של הקטגוריות האמיתיות ובקש לבחור אחת, בלי לפרט אירועים.`;
 }
 
 // The one rule that decides which language the reply comes back in. Read together with
@@ -118,6 +129,10 @@ const LANGUAGE_RULE = `שפה — קריטי, אין לסטות מזה:
 - כשעונים באנגלית, אותם כללי טון חלים: קצר, חם, ישיר, כמו הודעת וואטסאפ — לא תרגום מילולי של משפט עברי.`;
 
 function buildSystemPrompt(events, todayIso) {
+  // Computed once and threaded through both categoryFilterRules and availableOptions,
+  // so "the categories the rule can classify into" and "the categories the model is
+  // told exist" can never drift apart into two different lists.
+  const categories = [...new Set(events.map((e) => e.category).filter(Boolean))];
   return `${SOUL_CORE}
 
 אתה כרגע עונה על שאלות לגבי אירועי תרבות בחיפה, בהתבסס אך ורק על רשימת האירועים שסופקה למטה.
@@ -132,6 +147,7 @@ function buildSystemPrompt(events, todayIso) {
 - זו שיחה מתמשכת: זכור מה נאמר בהודעות הקודמות וענה על שאלות המשך בהקשר שלהן.
 - שאלה רחבה ("מה יש?", "מה קורה החודש?", "יש משהו מעניין?", "what's on?") — אל תפרט אירועים ואל תציע רשימה. שאל שאלה קצרה אחת שתמקד, מבוססת על מה שבאמת קיים ברשימה למטה: יום מסוים, סוג אירוע, או אווירה (למשל "משהו עם מוזיקה חיה, מסיבה, או משהו רגוע יותר?") — לא שאלה גנרית. שאלה אחת בלבד, לא כמה.
 - שאלה ממוקדת ("יש ג'אז הסופ״ש?", "משהו ביום חמישי?") — ענה מיד עם אירוע אחד, בלי לשאול עוד שאלות ממקדות.
+${categoryFilterRules(categories)}
 - תשובה מציגה אירוע אחד — האירוע המתאים ביותר לשאלה — לא רשימה. אם ביקשו עוד ("עוד משהו?", "מה עוד יש?"), הצג את האירוע הבא המתאים, גם הוא אחד בכל פעם.
 - אל תחזור על אירוע שכבר הצגת בשיחה הזו, אלא אם ביקשו אותו במפורש.
 - אם המשתמש רוצה לפרסם אירוע, לראות מחירון או לפנות לשירות לקוחות, הסבר שיש לכתוב "ביטול" ולבחור באפשרות המתאימה בתפריט.
@@ -153,7 +169,7 @@ ${reminderRules()}
 - שים לב להתאמת מין ומספר: "אירוע אחד", "שני אירועים", "מסיבה אחת".
 - אל תתרגם מילולית ביטויים מאנגלית (למשל "אני מצטער אבל..." — עדיף פשוט "סליחה," או בלי התנצלות בכלל).
 
-${availableOptions(events)}
+${availableOptions(events, categories)}
 רשימת האירועים:
 ${eventsToText(events)}`;
 }
