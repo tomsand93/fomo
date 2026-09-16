@@ -326,17 +326,34 @@ async function confirmBoardDelivery(key, sid) {
 
 // Re-sends any board that never reached Stav. Called when she messages the bot, which is
 // itself proof the 24h window is open again.
+//
+// Stav's messages arrive as separate webhook hits, each calling this detached (not
+// awaited by handleAdminMessage). Without a lock, two messages seconds apart both
+// snapshot the same still-pending key and both send it before either await resolves
+// and deletes it - she got the same board 3-4 times over. One in-flight flush at a
+// time; a call that arrives mid-flush just waits for it instead of racing it.
+let flushingBoards = null;
+
 async function flushPendingBoards() {
   if (process.env.NODE_ENV === "test" || !pendingBoards.size) return;
-  for (const [key, post] of [...pendingBoards.entries()]) {
-    try {
-      await sendWhatsApp(ADMIN_SENDER, post);
-      pendingBoards.delete(key);
-    } catch (err) {
-      console.error(`failed to re-send ${key} board:`, err);
+  if (flushingBoards) return flushingBoards;
+  flushingBoards = (async () => {
+    for (const [key, post] of [...pendingBoards.entries()]) {
+      if (!pendingBoards.has(key)) continue; // sent by an earlier flush already
+      try {
+        await sendWhatsApp(ADMIN_SENDER, post);
+        pendingBoards.delete(key);
+      } catch (err) {
+        console.error(`failed to re-send ${key} board:`, err);
+      }
     }
+    saveState();
+  })();
+  try {
+    await flushingBoards;
+  } finally {
+    flushingBoards = null;
   }
-  saveState();
 }
 
 
