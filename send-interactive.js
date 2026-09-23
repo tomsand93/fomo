@@ -109,6 +109,7 @@ const TEMPLATE_BUTTON_KEYS = new Map([
   ["fomo_publish_day_v2", ["1", "2", "3"]],
   ["fomo_publish_day", ["1", "2", "3"]],
   ["fomo_main_menu", ["1", "2", "4"]],
+  ["fomo_review_event_v2", ["אשר", "דחה", "ממתינים"]],
   ["fomo_review_event", ["אשר", "דחה", "ממתינים"]],
 ]);
 

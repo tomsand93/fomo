@@ -1013,6 +1013,14 @@ const UNDELIVERED_STATUSES = new Set(["undelivered", "failed"]);
 // Verifying delivery means polling Twilio for several seconds, so it must never block the
 // webhook reply. The send is awaited (fast); the status check runs detached afterwards and
 // only records the outcome for the next admin contact.
+//
+// No template retry here for the preview itself: it carries a flyer image plus a full
+// paragraph of free text, which Meta will not approve as a template body. The actual
+// fallback is sendReviewButtons, sent unconditionally right after this in
+// forwardEventToAdmin — it goes through fomo_review_event via ContentSid, which (unlike
+// this preview) bypasses the 24h window whenever that template is approved. So the ping
+// reaches her regardless; only the flyer/description preview is what a closed window can
+// still cost her, and missedNoticesBanner is what surfaces that on her next message.
 async function confirmAdminNotification(id, sid) {
   try {
     const status = await getMessageStatus(sid);
@@ -1164,7 +1172,14 @@ function flyerUrl(name) {
 // and not yet acted on, cleared the moment anything resolves it, so it cannot drift onto
 // an unrelated event the way the old guess did.
 
-const REVIEW_TEMPLATE = "fomo_review_event";
+// v1 (fomo_review_event) reads "כל הפרטים המלאים מופיעים בהודעה שמעל" and invites a
+// swipe-reply to that message — wording that assumes the preview above it was delivered.
+// It is sent as the one thing that survives a closed 24h window, i.e. exactly when that
+// preview did NOT arrive, so the reply-to-message-above instruction pointed at nothing:
+// WhatsApp answered her swipe with "אין הודעה מעל" (event #38, 22/09/2026). v2 is
+// self-contained — no reference to another message — so the fallback holds up even when
+// it is the only thing she received.
+const REVIEW_TEMPLATE = "fomo_review_event_v2";
 // The template's buttons send these back as ButtonPayload. handleTwilio normalises that
 // into the message text, so a tap arrives looking exactly like her typing the word —
 // which is why the ids are the commands themselves rather than digits.
@@ -1432,7 +1447,9 @@ function missedNoticesBanner(events) {
   const lines = stillPending
     .map((e) => `#${e.id} ${e.event_name} — ${e.date} ${e.start_time}`)
     .join("\n");
-  return `⚠ אירועים שההודעה עליהם לא הגיעה אליך:\n${lines}\n\n`;
+  // The original notice never reached her phone, so there is no message to swipe-reply to
+  // (WhatsApp itself will say "אין הודעה מעל" if she tries) — spell out the typed form.
+  return `⚠ אירועים שההודעה עליהם לא הגיעה אליך (אי אפשר לענות על ההודעה המקורית — היא לא הגיעה):\n${lines}\n\nלטפל: אשר [מספר] או דחה [מספר]\n\n`;
 }
 
 // "Views" rather than "clicks" on purpose: WhatsApp and every preview crawler fetch a
@@ -2102,6 +2119,11 @@ ${ADMIN_HELP_TEXT}`;
 // remember from a switch that may have happened days and a restart ago.
 const CUSTOMER_MODE_BANNER = '👤 מצב לקוח (בדיקות) — כתבו "ניהול" כדי לחזור.';
 
+// Prefixed to every admin-mode reply for the same reason: a command that silently landed
+// in the wrong mode (e.g. "דחה 37" answered by the customer menu) is indistinguishable
+// from a bug unless every reply says outright which mode produced it.
+const ADMIN_MODE_BANNER = '🛠 מצב ניהול — כתבו "לקוח" למצב בדיקות.';
+
 const CUSTOMER_MODE_TEXT = `👤 מצב לקוח (בדיקות) — פקודות הניהול כבויות. כתבו "ניהול" כדי לחזור.
 
 ${MENU_TEXT}`;
@@ -2121,7 +2143,7 @@ function senderFlow(sender) {
 }
 
 async function routeMessage(sender, text, mediaUrls = [], repliedSid = "") {
-  const state = { inCustomerModeReply: false };
+  const state = { inCustomerModeReply: false, inAdminModeReply: false };
   // Captured before routing, since routing is what changes it.
   const flow = senderFlow(sender);
   logInteraction({
@@ -2133,7 +2155,11 @@ async function routeMessage(sender, text, mediaUrls = [], repliedSid = "") {
   });
 
   const reply = await routeMessageInner(sender, text, mediaUrls, repliedSid, state);
-  const full = state.inCustomerModeReply ? `${CUSTOMER_MODE_BANNER}\n\n${reply}` : reply;
+  const full = state.inCustomerModeReply
+    ? `${CUSTOMER_MODE_BANNER}\n\n${reply}`
+    : state.inAdminModeReply
+    ? `${ADMIN_MODE_BANNER}\n\n${reply}`
+    : reply;
 
   // Outbound keeps a length, not the text: every reply is reconstructible from the code,
   // and storing them again would double the log for nothing.
@@ -2167,6 +2193,7 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
     }
     // Default is admin: her real job. QA is the mode she opts into.
     if (adminMode.get(sender) !== "customer") {
+      state.inAdminModeReply = true;
       return handleAdminMessage(text, repliedSid);
     }
     // Customer mode is sticky and survives restarts, so announcing it only at the switch

@@ -521,13 +521,13 @@ async function demo() {
   await routeMessage(amendSender, "2");
   const receipt = await routeMessage(
     amendSender,
-    'שם האירוע: לילה לבן\nתאריך: 2026-09-20\nשעה: 18:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: תרבות\nקישור: https://haifa.muni.il/x'
+    'שם האירוע: לילה לבן\nתאריך: 2026-12-20\nשעה: 18:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: תרבות\nקישור: https://haifa.muni.il/x'
   );
 
   // The receipt must echo the captured fields: a bare "we got it" gave the submitter
   // nothing to check, so a misread date only surfaced after publication.
   if (!receipt.includes("לילה לבן")) throw new Error("receipt should echo the event name");
-  if (!receipt.includes("20.9")) throw new Error("receipt should echo the parsed date so a wrong one is visible");
+  if (!receipt.includes("20.12")) throw new Error("receipt should echo the parsed date so a wrong one is visible");
   if (!receipt.includes("18:00")) throw new Error("receipt should echo the start time");
 
   // The receipt now ends with the publish-day question, so answer it before testing
@@ -555,7 +555,7 @@ async function demo() {
   await routeMessage(amendSender, "2");
   await routeMessage(
     amendSender,
-    'שם האירוע: בדיקת שאלה\nתאריך: 2026-09-21\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/1'
+    'שם האירוע: בדיקת שאלה\nתאריך: 2026-12-21\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/1'
   );
   await routeMessage(amendSender, "1"); // close the publish-day question first
   const question = await routeMessage(amendSender, "מתי זה יפורסם?");
