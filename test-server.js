@@ -72,6 +72,12 @@ function stubExtract(conversationText) {
 
 extractEventModule.extractEvent = async (conversationText) => stubExtract(conversationText);
 
+// Dates relative to the real clock: hardcoded ones rot into the past and the publish-day
+// options (which drop past days) change under the test.
+function inDays(n) {
+  return new Date(Date.now() + n * 864e5).toISOString().slice(0, 10);
+}
+
 async function demo() {
   if (fs.existsSync(TEST_EVENTS_FILE)) fs.unlinkSync(TEST_EVENTS_FILE);
 
@@ -1195,7 +1201,7 @@ async function demo() {
   await routeMessage(choiceSender, "2");
   await routeMessage(
     choiceSender,
-    'שם האירוע: בדיקת בחירה\nתאריך: 2026-09-25\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/9'
+    `שם האירוע: בדיקת בחירה\nתאריך: ${inDays(20)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/9`
   );
   if (!awaitingPublishChoice.has(choiceSender)) {
     throw new Error("the publish-day question should be open after a submission");
@@ -1209,7 +1215,7 @@ async function demo() {
   }
   const chosenRow = eventsStore.loadEvents(TEST_EVENTS_FILE)
     .find((e) => e.event_name === "בדיקת בחירה");
-  if (chosenRow.daily_days !== "2026-09-24") {
+  if (chosenRow.daily_days !== inDays(19)) {
     throw new Error(`"day before" should record the day before the event, got ${chosenRow.daily_days}`);
   }
 
@@ -1415,7 +1421,7 @@ async function demo() {
   await routeMessage(otherSender, "2");
   await routeMessage(
     otherSender,
-    'שם האירוע: בדיקת תאריך\nתאריך: 2026-09-26\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/8'
+    `שם האירוע: בדיקת תאריך\nתאריך: ${inDays(20)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/8`
   );
   const otherKey = awaitingPublishChoice.get(otherSender).options
     .find((o) => o.date === null).key;
@@ -1427,7 +1433,7 @@ async function demo() {
   if (!(await routeMessage(otherSender, "2020-01-01")).includes("כבר עבר")) {
     throw new Error("a past date should be refused");
   }
-  const acceptedDate = await routeMessage(otherSender, "2026-09-24");
+  const acceptedDate = await routeMessage(otherSender, inDays(18));
   if (!acceptedDate.includes("נשלח אותו להודעה היומית")) {
     throw new Error("a valid future date should be accepted");
   }
@@ -1912,6 +1918,80 @@ async function demo() {
   }
   if (!activeSubmissions.has(slow)) throw new Error("a progressing submission must stay open");
   await routeMessage(slow, "ביטול");
+
+  // "אין" answers the link question. It used to be fed to the extractor, which found
+  // nothing, so the same question came back until the submitter cancelled (25/09/2026).
+  const noLink = "whatsapp:+972500009444";
+  await routeMessage(noLink, "2");
+  const askedLink = await routeMessage(
+    noLink,
+    `שם האירוע: בלי קישור\nתאריך: ${inDays(12)}\nשעה: 17:00\nמיקום: מלמעלה, סירקין 21, חיפה\nקטגוריה: מסיבה`
+  );
+  if (!askedLink.includes("מה הקישור או מספר הטלפון")) {
+    throw new Error("a paid-or-unknown-price event with no contact should be asked for one");
+  }
+  const afterNo = await routeMessage(noLink, "אין");
+  if (!afterNo.includes("קיבלנו את האירוע")) {
+    throw new Error(`"אין" must be accepted as an answer to the link question, got: ${afterNo}`);
+  }
+  if (!awaitingPublishChoice.has(noLink)) {
+    throw new Error('an event submitted with "אין" should get the normal receipt and publish-day question');
+  }
+  const noLinkRow = eventsStore.loadEvents(TEST_EVENTS_FILE).find((e) => e.event_name === "בלי קישור");
+  if (!noLinkRow) throw new Error('the event answered with "אין" should be filed');
+
+  // Several publish days in one answer, in the shapes real submitters used.
+  for (const [i, answer] of ["1 ו2", "2. 1.", "1, 2", "ביום האירוע + יום לפני"].entries()) {
+    const multi = `whatsapp:+97250000955${i}`;
+    await routeMessage(multi, "2");
+    await routeMessage(
+      multi,
+      `שם האירוע: כמה ימים ${i}\nתאריך: ${inDays(15)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/m`
+    );
+    const reply = await routeMessage(multi, answer);
+    if (!reply.includes("נשלח אותו להודעה היומית")) {
+      throw new Error(`"${answer}" should pick several days, got: ${reply}`);
+    }
+    const row = eventsStore.loadEvents(TEST_EVENTS_FILE).find((e) => e.event_name === `כמה ימים ${i}`);
+    if (row.daily_days !== [inDays(14), inDays(15)].join(",")) {
+      throw new Error(`"${answer}" should record both days, got ${row.daily_days}`);
+    }
+  }
+  // A number that is not an option must not be half-accepted.
+  const badMulti = "whatsapp:+972500009560";
+  await routeMessage(badMulti, "2");
+  await routeMessage(
+    badMulti,
+    `שם האירוע: מספר שגוי\nתאריך: ${inDays(15)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/b`
+  );
+  if (!(await routeMessage(badMulti, "1, 9")).includes("אפשר לבחור כמה")) {
+    throw new Error("an answer with an out-of-range number should re-ask");
+  }
+
+  // Answering slowly, one field per message, must never hit the give-up limit.
+  const stepwise = "whatsapp:+972500009570";
+  await routeMessage(stepwise, "2");
+  await routeMessage(stepwise, "שם האירוע: צעד צעד");
+  await routeMessage(stepwise, `תאריך: ${inDays(9)}`);
+  await routeMessage(stepwise, "שעה: 20:00");
+  const stepFinal = await routeMessage(stepwise, "מיקום: בר בזל, מסדה 12, חיפה");
+  if (!activeSubmissions.has(stepwise) || stepFinal.includes("העברנו אותו לבדיקה")) {
+    throw new Error("a submitter adding a field every turn must not be cut off after three turns");
+  }
+  await routeMessage(stepwise, "ביטול");
+
+  // Review commands run even when the admin is in customer mode.
+  await routeMessage(ADMIN, "לקוח");
+  const approveInCustomer = await routeMessage(ADMIN, `אשר ${noLinkRow.id}`);
+  if (approveInCustomer.includes("העברנו את התוספת")) {
+    throw new Error("an approve command in customer mode must not be forwarded as an amendment");
+  }
+  const menuInCustomer = await routeMessage(ADMIN, "אשרר את זה בבקשה");
+  if (menuInCustomer.includes("🛠")) {
+    throw new Error("only exact review commands may bypass customer mode");
+  }
+  await routeMessage(ADMIN, "ביטול");
+  await routeMessage(ADMIN, "ניהול");
 
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);

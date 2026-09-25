@@ -45,6 +45,7 @@ let awaitingDailyChoice = new Map(); // sender -> { eventId, options, expectingD
 let undeliveredAdminNotices = new Set(); // event ids whose review notice never reached the admin, surfaced on her next message
 let askedForClarification = new Set(); // senders already asked a clarifying question this submission, so we never ask twice
 let incompleteAttempts = new Map(); // sender -> consecutive turns still missing required fields, so a draft can't loop forever
+let contactDeclined = new Set(); // senders who answered the link question with "אין", so it is never asked again this submission
 // sender -> { text, at }. Set when the classifier can't tell which flow a stranger wants.
 // Persisted like every other conversation flag: the answer arrives on a separate inbound
 // webhook and Fly suspends this machine in between. The original text rides along so
@@ -88,6 +89,7 @@ function loadState() {
     undeliveredAdminNotices = new Set(raw.undeliveredAdminNotices || []);
     askedForClarification = new Set(raw.askedForClarification || []);
     incompleteAttempts = new Map(raw.incompleteAttempts || []);
+    contactDeclined = new Set(raw.contactDeclined || []);
     awaitingIntentConfirm = new Map(raw.awaitingIntentConfirm || []);
     offeredEscape = new Set(raw.offeredEscape || []);
     noticeSidToEventId = new Map(raw.noticeSidToEventId || []);
@@ -122,6 +124,7 @@ function writeStateNow() {
     undeliveredAdminNotices: [...undeliveredAdminNotices],
     askedForClarification: [...askedForClarification],
     incompleteAttempts: [...incompleteAttempts.entries()],
+    contactDeclined: [...contactDeclined],
     // Bounded: an unanswered confirmation older than the last few is dead anyway.
     awaitingIntentConfirm: [...awaitingIntentConfirm.entries()].slice(-50),
     offeredEscape: [...offeredEscape],
@@ -720,6 +723,7 @@ function clearSession(sender) {
   lastExtractedEvent.delete(sender);
   askedForClarification.delete(sender);
   incompleteAttempts.delete(sender);
+  contactDeclined.delete(sender);
   awaitingIntentConfirm.delete(sender);
   offeredEscape.delete(sender);
   activeInquiries.delete(sender);
@@ -803,7 +807,9 @@ const AMENDMENT_FORWARDED_TEXT = "העברנו את התוספת לסתיו, ה�
 // Questions are the narrower, more recognisable set, so detect those and treat the rest
 // as a correction — the failure mode that matters is dropping a fix, not forwarding one
 // question too many.
-const QUESTION_MARKERS = /[?？]|^(מתי|איפה|מה|האם|כמה|למה|איך|מי)\b/;
+// Not \b: JS word boundaries only know ASCII letters, so "מה\b" never matched "מה קורה"
+// and only a literal question mark was ever detected.
+const QUESTION_MARKERS = /[?？]|^(מתי|איפה|מה|האם|כמה|למה|איך|מי)(\s|$)/;
 
 function looksLikeQuestion(text) {
   return QUESTION_MARKERS.test(text.trim());
@@ -938,6 +944,21 @@ const FIELD_QUESTIONS = new Map([
   ["קטגוריה", "מה סוג האירוע? (מוזיקה, מסיבה, קולנוע וכו')"],
   ["קישור / איש קשר", "מה הקישור או מספר הטלפון לפרטים?"],
 ]);
+
+const CONTACT_LABEL = "קישור / איש קשר";
+
+// "אין" is a complete answer to "what's the link or phone?", but the old flow handed it to
+// the extractor like any other detail. Nothing got filled in, so the same question came
+// straight back, and the submitter either gave up with "ביטול" (lost the event: 25/09/2026)
+// or said "אין" twice and got a curt fallback with no receipt. Short, and starting with a
+// "no", so a real contact ("אין לנו אתר, 054-1234567") is still read as one: the caller
+// checks the extractor found nothing first.
+const NO_CONTACT_RE = /^(אין|לא|אינ|no\b|none|nope|n\/a|-+|—)/i;
+
+function declinesContact(text) {
+  const trimmed = String(text || "").trim();
+  return trimmed.length > 0 && trimmed.length <= 40 && NO_CONTACT_RE.test(trimmed);
+}
 
 // One missing field gets a direct question. Several get a short list, because six
 // separate questions in one message is worse than the labels were.
@@ -1417,6 +1438,10 @@ function formatPendingList(events) {
 
 // Explicit id ("אשר 6"), or bare ("אשר") as a WhatsApp reply to the event's own notice.
 const ADMIN_COMMAND_RE = /^(אשר|דחה)(?:\s*#?(\d+))?\s*(.*)$/;
+// The subset of admin commands unambiguous enough to run from customer mode: a bare
+// button payload, or approve/reject with an id. Not ADMIN_COMMAND_RE itself, which
+// accepts any text that merely starts with "אשר".
+const ADMIN_ONLY_COMMAND_RE = /^(?:(?:אשר|דחה)(?:\s*#?\d+.*)?|ממתינים|תקן\s*#?\d+.*)$/s;
 
 // Approving and rejecting are irreversible from the submitter's point of view - they get a
 // "your event was published/declined" message either way - so the target is never guessed.
@@ -1856,14 +1881,37 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
   const event = await extractEventModule.extractEvent(conversationText, undefined, newImages, previousEvent, correctionGuidance);
   imagesSentToModel.set(sender, images.length);
   lastExtractedEvent.set(sender, event);
-  const missing = missingFields(event);
+
+  // Only a "no" to a question we actually asked: the previous turn has to have been
+  // missing the contact, and this turn must not have found one anyway.
+  if (
+    previousExtraction &&
+    missingFields(previousExtraction).includes(CONTACT_LABEL) &&
+    missingFields(event).includes(CONTACT_LABEL) &&
+    declinesContact(trimmed)
+  ) {
+    contactDeclined.add(sender);
+    saveState();
+  }
+  // The extractor may copy the "אין" itself into the field; it is not a contact, and
+  // left there it would be printed as the event's link.
+  if (contactDeclined.has(sender) && event.contact_link && !fieldIsValid("contact_link", event.contact_link)) {
+    event.contact_link = "";
+  }
+  const missing = missingFields(event).filter((label) => !(label === CONTACT_LABEL && contactDeclined.has(sender)));
 
   // Re-asking forever is worse than forwarding an imperfect draft: a submitter who has
   // already sent the detail (and can see it in their own message) has no way to satisfy
   // the bot, and no reason to believe a fourth attempt will work. After a few tries, hand
   // it to Stav with the gap named — she can fill it in or reject it.
   if (missing.length) {
-    const attempts = (incompleteAttempts.get(sender) || 0) + 1;
+    // Only a turn that got nowhere counts toward giving up. Counting every turn cut off
+    // people who were answering: a flyer sent as two images plus an opening "I want to
+    // publish" used all three tries and was forwarded half-empty (event #40, 24/09/2026),
+    // and the full text that followed arrived as a duplicate.
+    const previousMissing = previousExtraction ? missingFields(previousExtraction).length : Infinity;
+    const madeProgress = previousExtraction && missing.length < previousMissing;
+    const attempts = (incompleteAttempts.get(sender) || 0) + (madeProgress ? 0 : 1);
     incompleteAttempts.set(sender, attempts);
     saveState();
 
@@ -1932,6 +1980,8 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
   // Stav should see that attendees have no way to ask a question before she publishes it.
   if (!event.contact_link && isFreeEntry(event)) {
     unresolved.push("אין קישור או איש קשר — אירוע חינמי");
+  } else if (!event.contact_link && contactDeclined.has(sender)) {
+    unresolved.push("אין קישור או איש קשר — המגיש/ה אמר/ה שאין");
   }
 
   // Read the flyer before clearSession drops it.
@@ -2051,19 +2101,43 @@ function goodbyeText() {
   ].join("\n");
 }
 
-// Records the chosen day on the event and closes the question.
-function recordDailyDay(sender, pending, date, map) {
+// Records the chosen days on the event. Closes the question unless the submitter also
+// picked "another date", in which case it stays open for that date.
+function recordDailyDays(sender, pending, dates, map, { askForOtherDate = false } = {}) {
   const event = storeFindEvent(EVENTS_FILE, pending.eventId);
   if (event) {
-    const days = new Set((event.daily_days || "").split(",").filter(Boolean));
-    days.add(date);
+    const days = new Set((event.daily_days || "").split(",").filter((d) => d && d !== DECLINE_DAILY));
+    for (const date of dates) days.add(date);
     storeUpdateEvent(EVENTS_FILE, pending.eventId, { daily_days: [...days].sort().join(",") });
   }
-  map.delete(sender);
+  if (askForOtherDate) map.set(sender, { ...pending, expectingDate: true });
+  else map.delete(sender);
   saveState();
-  const [, , month, day] = date.match(/^(\d{4})-(\d{2})-(\d{2})$/) || [];
-  const when = day ? `${Number(day)}.${Number(month)}` : date;
-  return `סגור — נשלח אותו להודעה היומית ב-${when}. 🙌`;
+  const when = [...dates].sort().map(shortDate).join(", ");
+  const done = `סגור — נשלח אותו להודעה היומית ב-${when}. 🙌`;
+  return askForOtherDate ? `${done}\n\n${ASK_OTHER_DATE_TEXT}` : done;
+}
+
+function recordDailyDay(sender, pending, date, map) {
+  return recordDailyDays(sender, pending, [date], map);
+}
+
+// Which options an answer picks. Submitters regularly want more than one day and say so
+// in every shape: "1 ו2", "2. 3.", "1, 2 ,3 ,5", "יום לפני + בהקדם האפשרי" — each of
+// which the old exact-key match rejected by re-showing the same list (four of the first
+// test users, 17-24/09/2026). Digits count only when every number in the answer is a
+// real key, so a typed date like "16-9-2026" is never read as options 16 and 9.
+function pickDayOptions(options, answer) {
+  const exact = options.find((option) => option.key === answer);
+  if (exact) return [exact];
+
+  const numbers = answer.match(/\d+/g) || [];
+  if (numbers.length && numbers.every((n) => options.some((option) => option.key === n))) {
+    return options.filter((option) => numbers.includes(option.key));
+  }
+  if (numbers.length) return [];
+
+  return options.filter((option) => answer.includes(option.label));
 }
 
 // Shared by both questions: the one asked right after submission and the one asked
@@ -2082,12 +2156,26 @@ function handleDayChoice(sender, trimmed, map) {
     return recordDailyDay(sender, pending, date, map);
   }
 
-  const chosen = pending.options.find((option) => option.key === trimmed);
-  if (!chosen) {
+  const picked = pickDayOptions(pending.options, trimmed);
+  if (!picked.length) {
     // Not a menu key. Rather than scold, re-show the options — a submitter who
     // typed a sentence here is answering the question, just not in the shape asked.
-    return `${PUBLISH_CHOICE_INTRO}\n${renderOptions(pending.options)}`;
+    return `${PUBLISH_CHOICE_INTRO}\n${renderOptions(pending.options)}\n\n(אפשר לבחור כמה, למשל: 1,2)`;
   }
+
+  // Several days: record every real date, and ask for the extra one if "another date"
+  // was among them. "No daily message" alongside actual days is outvoted by the days.
+  if (picked.length > 1) {
+    const dates = picked.map((option) => option.date).filter((date) => date && date !== DECLINE_DAILY);
+    const wantsOther = picked.some((option) => option.date === null);
+    if (dates.length) return recordDailyDays(sender, pending, dates, map, { askForOtherDate: wantsOther });
+    if (wantsOther) {
+      map.set(sender, { ...pending, expectingDate: true });
+      saveState();
+      return ASK_OTHER_DATE_TEXT;
+    }
+  }
+  const chosen = picked[0];
 
   if (chosen.date === DECLINE_DAILY) {
     // Recorded rather than left empty. Empty means "not asked yet", and the question is
@@ -2192,7 +2280,11 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
       return CUSTOMER_MODE_TEXT;
     }
     // Default is admin: her real job. QA is the mode she opts into.
-    if (adminMode.get(sender) !== "customer") {
+    // A review command is never something a customer would type, so it runs even in
+    // customer mode. In customer mode "אשר 42" was forwarded to her as an amendment to
+    // event #42 (25/09/2026), and ten taps on the review template's "אשר" button each got
+    // the customer menu (16/09/2026) — she tests and reviews on the same phone.
+    if (adminMode.get(sender) !== "customer" || ADMIN_ONLY_COMMAND_RE.test(trimmed)) {
       state.inAdminModeReply = true;
       return handleAdminMessage(text, repliedSid);
     }
@@ -2248,6 +2340,14 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
   }
 
   if (activeInquiries.has(sender)) {
+    // A bare image mid-inquiry got no reply at all (28/08/2026): the empty text went to
+    // the model as the question. A flyer is a submission everywhere else, so here too.
+    if (!trimmed && hasUnambiguousSubmissionSignal(mediaUrls)) {
+      startSubmission(sender);
+      const reply = await handleActiveSubmission(sender, text, mediaUrls);
+      return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
+    }
+
     if (text.length > MAX_MESSAGE_LENGTH) {
       return MESSAGE_TOO_LONG_TEXT;
     }
