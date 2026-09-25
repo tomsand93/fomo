@@ -58,9 +58,9 @@ function logClick({ slug, eventId, userAgent = "", referer = "", ip = "" }) {
   });
 }
 
-// Inbound text is stored verbatim: it is the raw material for improving the extractor,
-// and it is the same text already sitting in activeSubmissions. Outbound keeps only a
-// length, since the reply can be reconstructed from the code.
+// Whole conversations are stored verbatim, both directions: "in" and "out" for webhook
+// messages and replies, "push" for anything the bot sends unprompted. Reviewing real
+// conversations is how the bot improves, and replies can't be reliably rebuilt from code.
 function logInteraction(record) {
   appendLine(INTERACTIONS_FILE, { ts: new Date().toISOString(), ...record });
 }

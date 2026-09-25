@@ -2249,9 +2249,11 @@ async function routeMessage(sender, text, mediaUrls = [], repliedSid = "") {
     ? `${ADMIN_MODE_BANNER}\n\n${reply}`
     : reply;
 
-  // Outbound keeps a length, not the text: every reply is reconstructible from the code,
-  // and storing them again would double the log for nothing.
-  logInteraction({ dir: "out", sender, flow, chars: String(full || "").length });
+  // The full reply, not just its length. Reconstructing replies from the code worked in
+  // theory, but reviewing the first test run meant guessing which message each length
+  // was — and a reply built from LLM output or live event data can't be rebuilt at all.
+  const out = String(full || "");
+  logInteraction({ dir: "out", sender, flow, chars: out.length, text: out });
   return full;
 }
 

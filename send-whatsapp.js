@@ -12,7 +12,34 @@ function requireEnv(name) {
 // Posts to the Messages endpoint. Shared so the interactive sender can reach the same
 // endpoint with different fields (ContentSid instead of Body) without a second copy of
 // the auth, timeout and error handling.
+// Every message the bot sends on its own initiative (review notices, reminders, digests,
+// button prompts) passes through here, so this is where it is logged. Webhook replies go
+// back as TwiML instead and are logged in routeMessage. Required lazily: the CLI senders
+// load this module too, and a logging problem must never block a send.
+function logPush(fields, outcome) {
+  try {
+    require("./clicks-store").logInteraction({
+      dir: "push",
+      sender: fields.To,
+      text: fields.Body || "",
+      template: fields.ContentSid || undefined,
+      variables: fields.ContentVariables || undefined,
+      media: fields.MediaUrl ? 1 : 0,
+      ...outcome,
+    });
+  } catch (err) {
+    console.error("failed to log outbound message:", err.message);
+  }
+}
+
 function postForm(fields) {
+  return postFormUnlogged(fields).then(
+    (result) => { logPush(fields, { sid: result.sid }); return result; },
+    (err) => { logPush(fields, { error: String(err.message).slice(0, 300) }); throw err; }
+  );
+}
+
+function postFormUnlogged(fields) {
   const accountSid = requireEnv("TWILIO_ACCOUNT_SID");
   const authToken = requireEnv("TWILIO_AUTH_TOKEN");
   const from = requireEnv("TWILIO_WHATSAPP_FROM");
