@@ -134,7 +134,9 @@ function formatLong(event, { linkFor = defaultLinkFor, flyerUrl = () => "", with
     event.location ? `📍 ${event.location}` : "",
     map ? `🗺 ${map}` : "",
     description,
-    event.contact_person ? `👤 ${event.contact_person}` : "",
+    // No contact_person line. In practice it was the submitter's own name, read off the
+    // sign-off at the bottom of their message, and Stav flagged it as noise in the
+    // group (03/10/2026). The landing page behind the link still shows it.
     link ? `🔗 ${link}` : "",
   ].filter(Boolean);
 

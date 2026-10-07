@@ -1060,7 +1060,7 @@ async function demo() {
   const freeLong = fmt.formatLong(freeEvent, { flyerUrl: (e) => (e.flyer ? `https://h/${e.flyer}` : "") });
   const longLines = freeLong.text.split("\n").length;
   if (longLines < 5 || longLines > 7) throw new Error(`LONG must be 5-7 lines, got ${longLines}`);
-  if (!freeLong.text.includes("👤 מאיה")) throw new Error("LONG must show the contact person");
+  if (freeLong.text.includes("👤")) throw new Error("LONG must not show the contact person — it reads as the submitter's signature");
   if (!freeLong.mediaUrl) throw new Error("LONG must return the flyer as mediaUrl");
   if (freeLong.text.includes("9-abc.jpg")) throw new Error("the flyer must not appear as a text line");
   if (fmt.formatLong(paidEvent).mediaUrl) {
@@ -1270,8 +1270,8 @@ async function demo() {
   if (notice.includes("📅 20.10")) {
     throw new Error("the daily preview must not repeat the date — the heading carries it");
   }
-  if (!notice.includes("👤 מאיה")) {
-    throw new Error("the long preview must show the contact person");
+  if (notice.includes("👤 מאיה")) {
+    throw new Error("the long preview must match the group post, which has no contact person");
   }
   // The uncertainty note is why she reviews at all — it must survive the rewrite.
   if (!notice.includes("לא הובהר")) {
