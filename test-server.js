@@ -1227,13 +1227,13 @@ async function demo() {
   await routeMessage(dateAnswerSender, "2");
   await routeMessage(
     dateAnswerSender,
-    'שם האירוע: בדיקת סדר\nתאריך: 2026-09-28\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/6'
+    `שם האירוע: בדיקת סדר\nתאריך: ${inDays(20)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/6`
   );
   // Pick by intent, not position: the option list gained a decline entry at the end.
   const lastKey = awaitingPublishChoice.get(dateAnswerSender).options
     .find((o) => o.date === null).key;
   await routeMessage(dateAnswerSender, lastKey); // choose "another date"
-  const typedDate = await routeMessage(dateAnswerSender, "2026-09-27");
+  const typedDate = await routeMessage(dateAnswerSender, inDays(19));
   if (typedDate.includes("העברנו")) {
     throw new Error("a typed date answering the question must not be forwarded as an amendment");
   }
@@ -1397,7 +1397,7 @@ async function demo() {
   await routeMessage(declineSender, "2");
   await routeMessage(
     declineSender,
-    'שם האירוע: בדיקת סירוב\nתאריך: 2026-09-29\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/4'
+    `שם האירוע: בדיקת סירוב\nתאריך: ${inDays(20)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/4`
   );
   const declineKey = awaitingPublishChoice.get(declineSender).options
     .find((o) => o.date === "decline").key;
@@ -1446,7 +1446,7 @@ async function demo() {
   await routeMessage(cancelSender, "2");
   await routeMessage(
     cancelSender,
-    'שם האירוע: בדיקת ביטול\nתאריך: 2026-09-27\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/7'
+    `שם האירוע: בדיקת ביטול\nתאריך: ${inDays(20)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/7`
   );
   await routeMessage(cancelSender, "ביטול");
   if (awaitingPublishChoice.has(cancelSender)) {
@@ -1706,7 +1706,7 @@ async function demo() {
   await routeMessage(tapSender, "2");
   await routeMessage(
     tapSender,
-    'שם האירוע: בדיקת כפתור\nתאריך: 2026-10-05\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/5'
+    `שם האירוע: בדיקת כפתור\nתאריך: ${inDays(20)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/5`
   );
   if (!awaitingPublishChoice.has(tapSender)) {
     throw new Error("the publish-day question should be open before testing a tap");

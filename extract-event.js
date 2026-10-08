@@ -2,7 +2,7 @@ const { postJson } = require("./http-json");
 const { SOUL_CORE } = require("./soul");
 
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const MODEL = process.env.OPENROUTER_MODEL || "anthropic/claude-haiku-4.5";
+const MODEL = process.env.OPENROUTER_MODEL || "anthropic/claude-haiku-5.5";
 
 const FIELD_KEYS = [
   "event_name", "date", "start_time", "end_time", "location",
@@ -86,7 +86,12 @@ function callOpenRouter(content) {
     payload: {
       model: MODEL,
       messages: [{ role: "user", content }],
+      // Haiku 5.5 ignores temperature (OpenRouter drops it) but still honours it on
+      // older models, so it stays. Reasoning off: Haiku 5.5 thinks by default, and
+      // thinking tokens come out of max_tokens and are billed as output. Older
+      // models accept the flag and are already non-thinking.
       temperature: 0,
+      reasoning: { enabled: false },
       max_tokens: 500,
     },
   });

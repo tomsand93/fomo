@@ -8,7 +8,7 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const MODEL =
   process.env.OPENROUTER_INTENT_MODEL ||
   process.env.OPENROUTER_MODEL ||
-  "anthropic/claude-haiku-4.5";
+  "anthropic/claude-haiku-5.5";
 
 const VALID_INTENTS = new Set(["submit", "inquire", "other"]);
 
@@ -72,7 +72,10 @@ function callOpenRouter(prompt) {
     payload: {
       model: MODEL,
       messages: [{ role: "user", content: prompt }],
+      // Same as extract-event.js. Matters most here: with thinking on, a 60-token cap
+      // can run out before any JSON is written, and the 6s timeout below has no room.
       temperature: 0,
+      reasoning: { enabled: false },
       max_tokens: 60,
     },
     // Deliberately tighter than the default. This sits in front of every stranger's
