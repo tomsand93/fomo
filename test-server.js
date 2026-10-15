@@ -990,6 +990,40 @@ async function demo() {
     }
   }
 
+  // A submitter who picks a day for the daily message must get it on that day, even
+  // when the event itself is later (14/10/2026: approved at 17:00, missing at 17:50).
+  const { digestFlyerEvents } = require("./make-digest");
+  const { longDate } = require("./clock");
+  const promotedEvents = [
+    { status: "published", event_name: "היום", date: "2026-10-14", start_time: "21:00", location: "חיפה" },
+    { status: "published", event_name: "בעוד שבוע", date: "2026-10-21", start_time: "20:00", location: "חיפה", daily_days: "2026-10-14", flyer: "f.jpg" },
+    { status: "published", event_name: "לא נבחר", date: "2026-10-22", start_time: "20:00", location: "חיפה", daily_days: "2026-10-21" },
+    { status: "published", event_name: "סירב", date: "2026-10-23", start_time: "20:00", location: "חיפה", daily_days: "decline" },
+  ];
+  const promotedDigest = makeDigest(promotedEvents, "2026-10-14");
+  if (!promotedDigest.includes("בעוד שבוע")) {
+    throw new Error("an event whose daily_days includes today must be in today's digest");
+  }
+  if (promotedDigest.includes("לא נבחר") || promotedDigest.includes("סירב")) {
+    throw new Error("a later event must not reach the digest unless today is one of its chosen days");
+  }
+  if (!promotedDigest.includes("— יום")) {
+    throw new Error("a promoted event must sit under its own day header so it isn't read as today");
+  }
+  if (promotedDigest.indexOf("היום") > promotedDigest.indexOf("בעוד שבוע")) {
+    throw new Error("today's events must come before promoted later ones");
+  }
+  if (/📅 \d/.test(promotedDigest)) {
+    throw new Error("a promoted event's date must lead with a day name, not a bare number");
+  }
+  if (!digestFlyerEvents(promotedEvents, "2026-10-14").some((e) => e.event_name === "בעוד שבוע")) {
+    throw new Error("a promoted event's flyer must follow the digest like today's do");
+  }
+  const onlyPromoted = makeDigest(promotedEvents.slice(1, 2), "2026-10-14");
+  if (onlyPromoted.includes("אין אירועים") || onlyPromoted.includes(`📅 ${longDate("2026-10-14")}`)) {
+    throw new Error("a digest with only a promoted event must show it, without announcing today's date");
+  }
+
   // The range must end on the last day that actually has an event: with empty days
   // skipped, a header running to Saturday over a board ending Friday promises a day
   // that is not on it.

@@ -6,14 +6,9 @@ const { formatLong } = require("./format-event");
 // where the board only has to say enough to recognise one. Flyers are attached per
 // event by the caller, so this returns text only.
 function makeDigest(events, targetDate, options = {}) {
-  const publishable = events
-    .filter((event) =>
-      event.date === targetDate &&
-      event.status === "published" &&
-      event.start_time &&
-      event.location
-    )
-    .sort((a, b) => a.start_time.localeCompare(b.start_time));
+  const publishable = digestEvents(events, targetDate);
+  const today = publishable.filter((event) => event.date === targetDate);
+  const promoted = publishable.filter((event) => event.date !== targetDate);
 
   const title = "מה עושים היום בחיפה? 🎈";
 
@@ -24,9 +19,21 @@ function makeDigest(events, targetDate, options = {}) {
     return [title, "", "אין אירועים מוכנים לפרסום היום."].join("\n");
   }
 
-  const lines = [title, "", `📅 ${longDate(targetDate)}`, ""];
+  const lines = [title, ""];
 
-  for (const event of publishable) {
+  if (today.length) {
+    lines.push(`📅 ${longDate(targetDate)}`, "");
+    for (const event of today) lines.push(formatLong(event, options).text, "");
+  }
+
+  // Events on a later day that the submitter asked to have in today's message. Each day
+  // gets the board's "— day —" header, so nobody reads them as happening today.
+  let currentDate = "";
+  for (const event of promoted) {
+    if (event.date !== currentDate) {
+      currentDate = event.date;
+      lines.push(`— ${longDate(currentDate)} —`);
+    }
     lines.push(formatLong(event, options).text, "");
   }
 
@@ -39,15 +46,22 @@ function makeDigest(events, targetDate, options = {}) {
 // caller sends these as follow-up messages: Twilio takes one MediaUrl per message,
 // so a day with several flyers cannot be a single send.
 function digestFlyerEvents(events, targetDate) {
+  return digestEvents(events, targetDate).filter((event) => event.flyer);
+}
+
+// Today's events, plus later ones whose submitter picked today for the daily message
+// (daily_days). That choice used to be recorded and then ignored: the submitter was told
+// "we'll send it in the daily message on X" and it never went out (14/10/2026).
+function digestEvents(events, targetDate) {
   return events
     .filter((event) =>
-      event.date === targetDate &&
       event.status === "published" &&
       event.start_time &&
       event.location &&
-      event.flyer
+      (event.date === targetDate ||
+        (event.date > targetDate && (event.daily_days || "").split(",").includes(targetDate)))
     )
-    .sort((a, b) => a.start_time.localeCompare(b.start_time));
+    .sort((a, b) => a.date.localeCompare(b.date) || a.start_time.localeCompare(b.start_time));
 }
 
 function demo() {
