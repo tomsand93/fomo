@@ -74,12 +74,44 @@ function postFormUnlogged(fields) {
   });
 }
 
+// Twilio rejects a body over 1600 characters outright (error 21617), so the send throws
+// and nothing is queued for retry. The 15 Oct 2026 18:00 board (2338 chars) was lost
+// this way. Kept under the cap with a margin, since Twilio's count and JS's can differ.
+const MAX_BODY_CHARS = 1500;
+
+// Breaks at blank lines so an event never straddles two messages; a single paragraph
+// longer than the cap falls back to line breaks, and a single line to a hard cut.
+function splitBody(body, max = MAX_BODY_CHARS) {
+  if (body.length <= max) return [body];
+  const parts = [];
+  let current = "";
+  const push = (piece, sep) => {
+    if (!current) { current = piece; return; }
+    if (current.length + sep.length + piece.length <= max) { current += sep + piece; return; }
+    parts.push(current);
+    current = piece;
+  };
+  for (const paragraph of body.split("\n\n")) {
+    if (paragraph.length <= max) { push(paragraph, "\n\n"); continue; }
+    for (const line of paragraph.split("\n")) {
+      for (let i = 0; i < line.length; i += max) push(line.slice(i, i + max), "\n");
+    }
+  }
+  if (current) parts.push(current);
+  return parts;
+}
+
 // mediaUrl must be publicly reachable — Twilio fetches it itself, so a local path or a
-// base64 data URL will not work.
-function sendWhatsApp(to, body, mediaUrl = "") {
-  const fields = { To: to, Body: body };
+// base64 data URL will not work. A long body goes out as several messages in order; the
+// image rides on the first, and the first result is returned so callers' delivery checks
+// still have a sid (a closed 24h window drops every part alike).
+async function sendWhatsApp(to, body, mediaUrl = "") {
+  const [first, ...rest] = splitBody(body);
+  const fields = { To: to, Body: first };
   if (mediaUrl) fields.MediaUrl = mediaUrl;
-  return postForm(fields);
+  const result = await postForm(fields);
+  for (const part of rest) await postForm({ To: to, Body: part });
+  return result;
 }
 
 // Twilio reports WhatsApp delivery failures (notably error 63016, "outside the 24h
@@ -132,4 +164,4 @@ async function getMessageStatus(sid) {
   return message;
 }
 
-module.exports = { sendWhatsApp, getMessageStatus, postForm };
+module.exports = { sendWhatsApp, getMessageStatus, postForm, splitBody };

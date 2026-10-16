@@ -623,6 +623,16 @@ async function demo() {
     throw new Error("admin-mode replies must not carry the customer-mode banner");
   }
 
+  // Twilio rejects bodies over 1600 chars (21617) and the 15 Oct 18:00 board was lost to
+  // it. A long post must split under the cap, at blank lines, losing nothing.
+  const { splitBody } = require("./send-whatsapp");
+  const longPost = ["כותרת", ...Array.from({ length: 7 }, (_, i) => `אירוע ${i}\n${"א".repeat(380)}`)].join("\n\n");
+  const longParts = splitBody(longPost);
+  if (longParts.length < 2) throw new Error("a long post should split into several messages");
+  if (longParts.some((p) => p.length > 1600)) throw new Error("every part must fit Twilio's 1600-char cap");
+  if (longParts.join("\n\n") !== longPost) throw new Error("splitting must not drop or reorder text");
+  if (splitBody("קצר").length !== 1) throw new Error("a short post should go out as one message");
+
   // The weekly board carries the location, because "where" is the first thing someone
   // scanning the week asks. An event without one must simply omit the line rather than
   // print an empty marker. Neither the board nor the digest carries the standing
