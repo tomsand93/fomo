@@ -1,4 +1,4 @@
-const { loadEvents } = require("./events-store");
+const { loadEvents, runsOn } = require("./events-store");
 const { dayOfWeek, addDays, shortDate, longDate, todayIso, DAY_NAMES } = require("./clock");
 const { formatShort } = require("./format-event");
 
@@ -24,8 +24,10 @@ function makeWeekly(events, fromDate = todayIso(), options = {}) {
   for (const event of events) {
     if (event.status !== "published") continue;
     if (!event.start_time || !event.event_name) continue;
-    const bucket = byDate.get(event.date);
-    if (bucket) bucket.push(event);
+    // A festival sits under each of its days, not just the first.
+    for (const [date, bucket] of byDate) {
+      if (runsOn(event, date)) bucket.push(event);
+    }
   }
   for (const bucket of byDate.values()) {
     bucket.sort((a, b) => a.start_time.localeCompare(b.start_time));

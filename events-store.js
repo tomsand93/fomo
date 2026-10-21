@@ -11,10 +11,16 @@ const path = require("path");
 //                    message. Empty means they have not been asked yet; the literal
 //                    "decline" means they were asked and said no, which is why the two
 //                    are not the same value
+//   end_date       - last day of a multi-day event (a festival), YYYY-MM-DD. Empty for
+//                    the usual one-day event, so readers use end_date || date
+//   flyer_sent_at  - when this event's flyer post went to Stav. Set once, never
+//                    cleared: the same image post kept reaching her at approval, at
+//                    every slot and on each chosen day (16/10/2026)
 const CSV_HEADERS = [
   "id", "status", "event_name", "date", "start_time", "end_time", "location",
   "category", "price", "organizer", "contact_link", "contact_person", "description",
   "source", "published_at", "notes", "submitter", "flyer", "slug", "daily_days",
+  "end_date", "flyer_sent_at",
 ];
 
 function csv(value) {
@@ -217,11 +223,29 @@ function appendEvent(filePath, event, source, sender, missing) {
     // nobody ever publishes.
     slug: makeSlug(new Set(events.map((e) => e.slug).filter(Boolean))),
     daily_days: "",
+    end_date: cleanEndDate(event.date, event.end_date),
+    flyer_sent_at: "",
   };
 
   events.push(row);
   fs.writeFileSync(filePath, eventsToCsv(events, CSV_HEADERS), "utf8");
   return id;
+}
+
+// Only a real later day counts. The extractor sometimes echoes the start date, and an
+// end before the start would hide the event from every board.
+function cleanEndDate(date, endDate) {
+  const value = String(endDate || "").trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) && value > (date || "") ? value : "";
+}
+
+// The last day an event runs: end_date for a festival, otherwise its one date.
+function lastDay(event) {
+  return event.end_date && event.end_date > event.date ? event.end_date : event.date;
+}
+
+function runsOn(event, date) {
+  return Boolean(event.date) && event.date <= date && date <= lastDay(event);
 }
 
 function updateEvent(filePath, id, changes) {
@@ -245,6 +269,9 @@ module.exports = {
   appendEvent,
   updateEvent,
   findEvent,
+  lastDay,
+  runsOn,
+  cleanEndDate,
   parseCsvLine,
   makeSlug,
   randomSlug,

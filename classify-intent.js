@@ -10,7 +10,7 @@ const MODEL =
   process.env.OPENROUTER_MODEL ||
   "anthropic/claude-haiku-5.5";
 
-const VALID_INTENTS = new Set(["submit", "inquire", "other"]);
+const VALID_INTENTS = new Set(["submit", "inquire", "cancel", "other"]);
 
 // Same defence as answer-inquiry.js: the message is written by a stranger and lands
 // inside the prompt. Newlines are the part that matters — they let injected text start
@@ -36,10 +36,12 @@ function buildPrompt(text, todayIso) {
 סווג את ההודעה לאחת מהכוונות:
 - "submit" — המשתמש מוסר פרטים של אירוע מסוים שהוא מארגן או מקדם, כדי שנפרסם אותו.
   סימנים: שם אירוע, תאריך, שעה, שם מקום, מחיר כניסה, קישור לכרטיסים, "רוצה לפרסם", "מצרף פלייר".
+  הודעה מועברת (forward) או מודעה מוכנה על אירוע מסוים — עם תאריך/שעה ומקום או מחיר — היא "submit", גם בלי שום בקשה מפורשת לפרסם.
 - "inquire" — המשתמש מחפש אירועים בשביל עצמו, שואל מה קורה, או מבקש המלצה.
   סימנים: "תמליץ לי", "מה יש", "מה קורה", "אילו הופעות", "אני מחפש", "יש משהו ב...".
   שים לב: הודעה יכולה להזכיר סוגה מוזיקלית, עיר ותאריך ועדיין להיות בקשת המלצה ולא פרסום.
   ההבדל הוא מי עושה מה: מארגן *מוסר* אירוע מסוים, מחפש *מבקש* אירועים כלשהם.
+- "cancel" — המשתמש רוצה לבטל או להסיר אירוע שהוא כבר שלח לנו ("האירוע בוטל", "תורידו את האירוע שלי").
 - "other" — כל דבר אחר: ברכה, שאלה על הבוט עצמו, תלונה, ספאם, או טקסט לא ברור.
 
 דוגמאות:
@@ -48,6 +50,8 @@ function buildPrompt(text, todayIso) {
 - «מה קורה הערב?» -> {"intent":"inquire","confidence":0.95}
 - «ג'אם סשן בבר בזל, מסדה 12, יום חמישי 21:00, כניסה חופשית» -> {"intent":"submit","confidence":0.95}
 - «רוצה לפרסם אירוע» -> {"intent":"submit","confidence":0.9}
+- «🎸 אפי בהופעה אקוסטית ⏎ יום שישי 21:30 ⏎ בר בזל, מסדה 12 ⏎ כרטיסים: 60 ₪» -> {"intent":"submit","confidence":0.95}
+- «ההופעה של יום חמישי בוטלה, אפשר להוריד אותה?» -> {"intent":"cancel","confidence":0.9}
 - «מה המטרה שלך?» -> {"intent":"other","confidence":0.9}
 - «היי» -> {"intent":"other","confidence":0.9}
 

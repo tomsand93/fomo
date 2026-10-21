@@ -22,8 +22,10 @@ fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
 // to be set before server.js is required. Without it they fall back to contact_link and
 // to nothing respectively, which is correct behaviour but untestable.
 process.env.PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://test.fomo.local";
+// The flyer-and-text pairing window, shortened so the suite does not sit in it.
+process.env.PAIR_WAIT_MS = "50";
 
-const { routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, publishDayOptions, goodbyeText, goodbyeMessage, sendGoodbyes, mapsUrl, mapLink, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, awaitingIntentConfirm, offeredEscape, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
+const { receiveInbound, looksLikeEventAnnouncement, routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, publishDayOptions, goodbyeText, goodbyeMessage, sendGoodbyes, mapsUrl, mapLink, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, awaitingIntentConfirm, offeredEscape, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -1033,6 +1035,32 @@ async function demo() {
   if (onlyPromoted.includes("אין אירועים") || onlyPromoted.includes(`📅 ${longDate("2026-10-14")}`)) {
     throw new Error("a digest with only a promoted event must show it, without announcing today's date");
   }
+  if (onlyPromoted.includes("היום בחיפה") || !onlyPromoted.includes("בקרוב")) {
+    throw new Error("a digest with nothing on today must not be titled 'today'");
+  }
+  if (!promotedDigest.includes("היום בחיפה")) {
+    throw new Error("a digest with events today keeps the 'today' title");
+  }
+
+  // The slot sends today's events and the promoted ones as separate messages.
+  const { makeDailyParts } = require("./make-digest");
+  const parts = makeDailyParts(promotedEvents, "2026-10-14");
+  if (!parts.today.includes("היום בחיפה") || parts.today.includes("בעוד שבוע")) {
+    throw new Error("the today message holds only today's events");
+  }
+  if (!parts.promoted.includes("בקרוב") || !parts.promoted.includes("בעוד שבוע") || parts.promoted.includes("21:00")) {
+    throw new Error("the promoted message holds only later events, under the 'soon' title");
+  }
+  const onlyLater = makeDailyParts(promotedEvents.slice(1, 2), "2026-10-14");
+  if (onlyLater.today !== "" || !onlyLater.promoted) throw new Error("an empty today message is skipped");
+
+  // The slot opens with a note naming each message that follows, for Stav only.
+  const { buildSlotPosts } = require("./server");
+  const slotPosts = buildSlotPosts(promotedEvents.slice(1, 2), "2026-10-14", "18:00");
+  if (slotPosts.length !== 3) throw new Error("no events today: the note, the promoted message and the board");
+  if (!slotPosts[0].includes("1. אירועים בימים הקרובים") || !slotPosts[0].includes("2. הלוח השבועי") || !slotPosts[0].includes("אין אירועים שמתקיימים היום")) {
+    throw new Error(`the note should number exactly the messages sent, got: ${slotPosts[0]}`);
+  }
 
   // The range must end on the last day that actually has an event: with empty days
   // skipped, a header running to Saturday over a board ending Friday promises a day
@@ -2036,6 +2064,116 @@ async function demo() {
   }
   await routeMessage(ADMIN, "ביטול");
   await routeMessage(ADMIN, "ניהול");
+
+  // --- Feedback of 16/10/2026 ---
+
+  // A flyer post goes out once ever.
+  {
+    const { digestFlyerEvents } = require("./make-digest");
+    const base = { status: "published", event_name: "פלייר", date: "2026-10-20", start_time: "20:00", location: "בר בזל, מסדה 12", flyer: "f.jpg" };
+    if (digestFlyerEvents([base], "2026-10-20").length !== 1) throw new Error("an unsent flyer should be attached");
+    if (digestFlyerEvents([{ ...base, flyer_sent_at: "2026-10-19T10:00:00Z" }], "2026-10-20").length) {
+      throw new Error("a flyer already sent must not be attached again");
+    }
+  }
+
+  // A partial send says how far it got, so the board is not retried from the top.
+  {
+    const sw = require("./send-whatsapp");
+    const parts = sw.splitBody(`${"א".repeat(1400)}\n\n${"ב".repeat(1400)}`);
+    if (parts.length !== 2) throw new Error("a long body should split in two");
+  }
+
+  // Multi-day events appear on every day they run, and expire after the last.
+  {
+    const { makeDigest } = require("./make-digest");
+    const { makeWeekly } = require("./make-weekly");
+    const fest = { status: "published", event_name: "פסטיבל שלושה ימים", date: "2026-10-20", end_date: "2026-10-22", start_time: "18:00", location: "גן הבהאים, חיפה", category: "מוזיקה" };
+    for (const day of ["2026-10-20", "2026-10-21", "2026-10-22"]) {
+      if (!makeDigest([fest], day).includes("פסטיבל שלושה ימים")) throw new Error(`a festival should be in the digest on ${day}`);
+    }
+    if (makeDigest([fest], "2026-10-23").includes("פסטיבל שלושה ימים")) throw new Error("a festival should be gone after its last day");
+    const board = makeWeekly([fest], "2026-10-20");
+    if ((board.match(/פסטיבל שלושה ימים/g) || []).length !== 3) throw new Error("a festival should sit under each of its days on the board");
+    if (upcomingPublishedEvents([fest], "2026-10-22").length !== 1) throw new Error("a festival is still upcoming on its last day");
+    if (upcomingPublishedEvents([fest], "2026-10-23").length) throw new Error("a festival is over after its last day");
+    if (eventsStore.cleanEndDate("2026-10-20", "2026-10-20") !== "") throw new Error("an end date equal to the start is dropped");
+  }
+
+  // A flyer and its text sent as two messages reach the draft together, with one reply.
+  {
+    const imageFirst = "whatsapp:+972500016100";
+    const [a, b] = await Promise.all([
+      receiveInbound(imageFirst, "", ["https://media.example/flyer.jpg"]),
+      receiveInbound(imageFirst, "שם האירוע: זוג תמונה וטקסט"),
+    ]);
+    if (b !== null || !a) throw new Error("the pair should get exactly one reply, from the first webhook");
+    if (!a.includes("נראה ששיתפתם פרטים על אירוע")) throw new Error(`the pair should open a submission, got: ${a}`);
+    if (!(activeSubmissions.get(imageFirst) || []).join(" ").includes("זוג תמונה וטקסט")) {
+      throw new Error("the caption should be in the same draft as the image");
+    }
+    await routeMessage(imageFirst, "ביטול");
+
+    const textFirst = "whatsapp:+972500016101";
+    const [c, d] = await Promise.all([
+      receiveInbound(textFirst, "שם האירוע: טקסט ואז תמונה"),
+      receiveInbound(textFirst, "", ["https://media.example/flyer.jpg"]),
+    ]);
+    if (d !== null || !c || !c.includes("נראה ששיתפתם פרטים על אירוע")) {
+      throw new Error("text then image should be one submission with one reply");
+    }
+    if (!(activeSubmissions.get(textFirst) || []).join(" ").includes("טקסט ואז תמונה")) {
+      throw new Error("text sent before the image must not be wiped by it");
+    }
+    await routeMessage(textFirst, "ביטול");
+
+    // A menu digit is never held back waiting for a partner.
+    const digit = await receiveInbound("whatsapp:+972500016102", "1");
+    if (!digit.includes("מה תרצו לדעת")) throw new Error("a bare menu choice should be answered straight away");
+    await routeMessage("whatsapp:+972500016102", "ביטול");
+  }
+
+  // A forwarded announcement starts a submission even when the model calls it "other".
+  {
+    const forwarded = "whatsapp:+972500016200";
+    const announcement = "🎸 אפי בהופעה אקוסטית\nיום שישי 21:30\nבר בזל, מסדה 12\nכרטיסים 60 ₪";
+    if (!looksLikeEventAnnouncement(announcement)) throw new Error("a flyer-style text should read as an announcement");
+    if (looksLikeEventAnnouncement("מה יש ביום שישי בערב?")) throw new Error("a question is not an announcement");
+    const reply = await routeMessage(forwarded, announcement);
+    if (!reply.includes("נראה ששיתפתם פרטים על אירוע")) throw new Error(`a forwarded event should open a draft, got: ${reply}`);
+    await routeMessage(forwarded, "ביטול");
+    if (!(await routeMessage(forwarded, "asdf")).includes("מה תרצו לעשות")) throw new Error("noise still gets the menu");
+  }
+
+  // Submitters cancel their own events, and only their own.
+  {
+    const owner = "whatsapp:+972500016300";
+    const stranger = "whatsapp:+972500016301";
+    const draft = (name) => ({ event_name: name, date: inDays(10), start_time: "20:00", location: "בר בזל, מסדה 12", category: "מוזיקה", contact_link: "https://x.co/c" });
+    const firstId = eventsStore.appendEvent(TEST_EVENTS_FILE, draft("לביטול ראשון"), "whatsapp", owner, []);
+    const secondId = eventsStore.appendEvent(TEST_EVENTS_FILE, draft("לביטול שני"), "whatsapp", owner, []);
+    eventsStore.appendEvent(TEST_EVENTS_FILE, draft("של מישהו אחר"), "whatsapp", stranger, []);
+
+    const list = await routeMessage(owner, "5");
+    if (!list.includes("לביטול ראשון") || !list.includes("לביטול שני") || list.includes("של מישהו אחר")) {
+      throw new Error(`the cancel list should hold exactly the sender's events, got: ${list}`);
+    }
+    if (!(await routeMessage(owner, "2")).includes("לבטל את")) throw new Error("picking an event should ask to confirm");
+    const done = await routeMessage(owner, "1");
+    if (!done.includes("בוטל")) throw new Error("confirming should cancel");
+    if (eventsStore.findEvent(TEST_EVENTS_FILE, secondId).status !== "cancelled") throw new Error("the row should be cancelled");
+    if (eventsStore.findEvent(TEST_EVENTS_FILE, firstId).status === "cancelled") throw new Error("only the picked event is cancelled");
+
+    // One event left: straight to the yes/no, and "2" keeps it.
+    const confirm = await routeMessage(owner, "בטל אירוע");
+    if (!confirm.includes("לביטול ראשון") || !confirm.includes("1. כן")) throw new Error("a single event should go straight to confirmation");
+    if (!(await routeMessage(owner, "2")).includes("לא ביטלנו")) throw new Error("\"2\" should keep the event");
+    if (eventsStore.findEvent(TEST_EVENTS_FILE, firstId).status === "cancelled") throw new Error("a kept event stays live");
+
+    if (!(await routeMessage("whatsapp:+972500016302", "5")).includes("לא מצאנו אירועים")) {
+      throw new Error("someone with no events should be told so");
+    }
+  }
 
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);

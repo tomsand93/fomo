@@ -3,11 +3,11 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { URLSearchParams } = require("url");
-const { loadEvents, makeDigest, digestFlyerEvents } = require("./make-digest");
+const { loadEvents, makeDigest, makeDailyParts, digestFlyerEvents } = require("./make-digest");
 const { israelClock, todayIso, addDays, shortDate, isReminderDue, isReminderMissed } = require("./clock");
 const { isFreeEntry, formatShort, formatLong } = require("./format-event");
 const { makeWeekly } = require("./make-weekly");
-const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent } = require("./events-store");
+const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent, lastDay } = require("./events-store");
 const extractEventModule = require("./extract-event");
 const intentModule = require("./classify-intent");
 const { addCorrection, buildCorrectionGuidance } = require("./corrections-store");
@@ -65,6 +65,9 @@ let lastActivity = new Map(); // sender -> ms timestamp of last inbound message,
 // like everything else here: the reply comes minutes to hours later, and Fly suspends
 // this machine in between, so an in-memory note would be gone before it is read.
 let recentlyReminded = new Map();
+// sender -> { ids, pickedId }. A submitter cancelling one of their own events: ids is the
+// numbered list they were shown, pickedId the one awaiting a yes/no.
+let awaitingCancelChoice = new Map();
 const llmCallTimestamps = new Map(); // sender -> array of ms timestamps of recent LLM calls
 const RATE_LIMIT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
@@ -96,6 +99,7 @@ function loadState() {
     adminMode = new Map(raw.adminMode || []);
     lastActivity = new Map(raw.lastActivity || []);
     recentlyReminded = new Map(raw.recentlyReminded || []);
+    awaitingCancelChoice = new Map(raw.awaitingCancelChoice || []);
   } catch (err) {
     if (err.code !== "ENOENT") console.error("failed to load state:", err);
   }
@@ -128,6 +132,7 @@ function writeStateNow() {
     // Bounded: an unanswered confirmation older than the last few is dead anyway.
     awaitingIntentConfirm: [...awaitingIntentConfirm.entries()].slice(-50),
     offeredEscape: [...offeredEscape],
+    awaitingCancelChoice: [...awaitingCancelChoice.entries()].slice(-50),
     // Bounded: only recent notices need to stay resolvable by reply.
     noticeSidToEventId: [...noticeSidToEventId].slice(-50),
     adminMode: [...adminMode.entries()],
@@ -179,7 +184,7 @@ const MAX_INQUIRY_HISTORY = 20;
 
 function upcomingPublishedEvents(events, today = todayIso()) {
   return events
-    .filter((event) => event.status === "published" && event.date >= today)
+    .filter((event) => event.status === "published" && lastDay(event) >= today)
     .sort((a, b) => a.date.localeCompare(b.date))
     .slice(0, MAX_INQUIRY_EVENTS);
 }
@@ -244,17 +249,38 @@ function slotsDueAt(local) {
   return DAILY_SLOTS.filter((entry) => entry.days.includes(local.day) && isDue(local, entry));
 }
 
-// One delivery per slot: today's events in full, then the rolling board for the days
-// still ahead. Flyers follow as separate messages because Twilio carries one image each.
-function buildSlotPost(events, localDate) {
+// Up to three messages per slot, each one Stav can forward as is: events happening
+// today, later events whose submitter picked today, and the rolling board. They used to
+// be one message under "what's on today", which on 18/10 held only a Saturday event.
+// Empty ones are skipped; the board always goes, so a quiet day still shows the bot ran.
+// Flyers follow as separate messages because Twilio carries one image each.
+//
+// A short note for Stav goes first, naming what each message below it is. It is its own
+// message so the ones she forwards stay clean.
+const SLOT_POST_LABELS = {
+  today: "אירועים שמתקיימים היום",
+  promoted: "אירועים בימים הקרובים, שהמפרסמים ביקשו שיופיעו בהודעה של היום",
+  board: "הלוח השבועי — כל האירועים המאושרים עד סוף השבוע",
+};
+
+function buildSlotPosts(events, localDate, slot = "") {
   const links = { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) };
-  // The map goes on the daily message only. The board's one-line entries already carry
+  // The map goes on the daily messages only. The board's one-line entries already carry
   // a location, a price and a link; a second URL there is noise. formatShort ignores
   // mapFor anyway, but passing it only where it is wanted keeps that deliberate.
-  const daily = makeDigest(events, localDate, { ...links, mapFor: mapLink });
+  const { today, promoted } = makeDailyParts(events, localDate, { ...links, mapFor: mapLink });
   const board = makeWeekly(events, localDate, links);
-  return `${daily}\n\n———\n\n${board}`;
+  const parts = [["today", today], ["promoted", promoted], ["board", board]].filter(([, text]) => text);
+  const intro = [
+    `📬 ההודעות להעברה לקבוצה${slot ? ` (${slot})` : ""} 👇`,
+    "",
+    ...parts.map(([kind], i) => `${i + 1}. ${SLOT_POST_LABELS[kind]}`),
+  ];
+  if (!today) intro.push("", "אין אירועים שמתקיימים היום, לכן אין הודעת \"מה עושים היום\".");
+  return [intro.join("\n"), ...parts.map(([, text]) => text)];
 }
+
+const SLOT_POST_SEPARATOR = "\n\n———\n\n";
 
 async function sendDueBoards(now = new Date()) {
   if (process.env.NODE_ENV === "test") return;
@@ -267,23 +293,38 @@ async function sendDueBoards(now = new Date()) {
     sentBoards.add(key);
     saveState();
 
+    const events = loadEvents(EVENTS_FILE);
+    const posts = buildSlotPosts(events, localDate, slot);
+    let sent = 0;
     try {
-      const events = loadEvents(EVENTS_FILE);
-      const post = buildSlotPost(events, localDate);
       // Goes to Stav, not the group: WhatsApp's API can't post into a normal group
       // (channels.md), so she forwards it — and gets to eyeball it first.
-      const result = await sendWhatsApp(ADMIN_SENDER, post);
+      let firstSid = "";
+      for (const post of posts) {
+        const result = await sendWhatsApp(ADMIN_SENDER, post);
+        if (!firstSid) firstSid = result.sid;
+        sent += 1;
+      }
       // A resolved send is not delivery: the slots fire when Stav is usually not
       // mid-conversation, so her 24h WhatsApp window is typically closed and Twilio
       // drops the message with 63016. Every board between 16 Aug and 23 Aug 2026 was
       // lost this way, silently. Hold it until confirmed.
-      pendingBoards.set(key, post);
+      pendingBoards.set(key, posts.join(SLOT_POST_SEPARATOR));
       saveState();
-      confirmBoardDelivery(key, result.sid);
+      confirmBoardDelivery(key, firstSid);
       await sendSlotFlyers(events, localDate);
     } catch (err) {
       console.error(`failed to send the ${slot} message:`, err);
-      sentBoards.delete(key); // let the next check retry within the same window
+      if (sent > 0 || err.sentParts > 0) {
+        // Some of it already reached Stav. Retrying from the top re-sent it every five
+        // minutes, so only the rest is queued, for her next message.
+        const rest = [err.sentParts > 0 ? err.unsent : posts[sent], ...posts.slice(sent + 1)];
+        pendingBoards.set(key, rest.join(SLOT_POST_SEPARATOR));
+        saveState();
+        await sendSlotFlyers(loadEvents(EVENTS_FILE), localDate);
+        continue;
+      }
+      sentBoards.delete(key); // nothing went out: let the next check retry within the window
       saveState();
     }
   }
@@ -301,6 +342,7 @@ async function sendSlotFlyers(events, localDate) {
     if (!mediaUrl) continue;
     try {
       await sendWhatsApp(ADMIN_SENDER, text, mediaUrl);
+      markFlyerSent(event.id);
     } catch (err) {
       // One failed image must not stop the rest, and the text has already landed.
       console.error(`failed to send the flyer for event #${event.id}:`, err);
@@ -368,8 +410,12 @@ async function flushPendingBoards() {
 // judged this event, it just ran out of time. The submitter is not notified either; from
 // their side nothing was decided, and a "your event was declined" message days after the
 // fact would be both confusing and slightly insulting.
+// needs_info is a submission forwarded with gaps. It waits for Stav like any other, but
+// the pending list only knew "submitted", so these never showed up there.
+const AWAITING_REVIEW = new Set(["submitted", "needs_info"]);
+
 function expirePastEvents(events, today = todayIso()) {
-  const stale = events.filter((e) => e.status === "submitted" && e.date && e.date < today);
+  const stale = events.filter((e) => AWAITING_REVIEW.has(e.status) && e.date && lastDay(e) < today);
   for (const event of stale) {
     storeUpdateEvent(EVENTS_FILE, event.id, {
       status: "expired",
@@ -401,7 +447,7 @@ async function sendGoodbyes(events, today = todayIso()) {
   const bySubmitter = new Map();
   for (const event of events) {
     if (event.status !== "published") continue;
-    if (!event.date || event.date >= today) continue;
+    if (!event.date || lastDay(event) >= today) continue;
     if (!event.submitter) continue;
     if ((event.notes || "").includes(GOODBYE_NOTE)) continue;
     if (!bySubmitter.has(event.submitter)) bySubmitter.set(event.submitter, []);
@@ -455,7 +501,7 @@ function goodbyeMessage(theirs) {
 // the event's text stays in the history either way.
 function sweepPastFlyers(events, today = todayIso()) {
   for (const event of events) {
-    if (!event.flyer || !event.date || event.date >= today) continue;
+    if (!event.flyer || !event.date || lastDay(event) >= today) continue;
     if (deleteFlyer(event.flyer)) {
       storeUpdateEvent(EVENTS_FILE, event.id, { flyer: "" });
     }
@@ -488,7 +534,7 @@ async function sendPendingReminder() {
   expirePastEvents(loadEvents(EVENTS_FILE));
 
   const events = loadEvents(EVENTS_FILE);
-  const pending = events.filter((e) => e.status === "submitted");
+  const pending = events.filter((e) => AWAITING_REVIEW.has(e.status));
   if (!pending.length) return;
 
   const lines = [`יש ${pending.length} אירועים שממתינים לאישור:`, ""];
@@ -731,6 +777,7 @@ function clearSession(sender) {
   recentlyCompleted.delete(sender);
   awaitingPublishChoice.delete(sender);
   awaitingDailyChoice.delete(sender);
+  awaitingCancelChoice.delete(sender);
 }
 
 // A conversation that goes quiet is abandoned, not paused. Without this a half-finished
@@ -785,7 +832,8 @@ const MENU_TEXT = `היי! מה תרצו לעשות?
 1. לברר בנוגע לאירועים
 2. לפרסם אירוע
 3. לראות מחירון פרסום
-4. שירות לקוחות`;
+4. שירות לקוחות
+5. לבטל אירוע שפרסמתי`;
 
 const ASK_EVENT_DETAILS_TEXT = "שלחו את פרטי האירוע בפורמט חופשי.";
 
@@ -813,6 +861,21 @@ const QUESTION_MARKERS = /[?？]|^(מתי|איפה|מה|האם|כמה|למה|א�
 
 function looksLikeQuestion(text) {
   return QUESTION_MARKERS.test(text.trim());
+}
+
+// A forwarded announcement, recognisable without the model: it says when, plus where or
+// how to get in. Stav forwards events cold, without picking "publish" first, and the
+// classifier calling one "other" (or timing out) dropped her back at the menu
+// (16/10/2026). Only consulted when the model did not say "inquire".
+const ANNOUNCEMENT_WHEN_RE = /\d{1,2}[./]\d{1,2}|\d{1,2}:\d{2}|יום\s+(ראשון|שני|שלישי|רביעי|חמישי|שישי|שבת)|מוצ"?ש|הערב|מחר/;
+const ANNOUNCEMENT_DETAIL_RE = /https?:\/\/|www\.|\d{9,}|📍|כתובת|רחוב|כניסה|כרטיס|₪|ש"ח|ש״ח/;
+const ANNOUNCEMENT_MIN_LENGTH = 120;
+
+function looksLikeEventAnnouncement(text) {
+  const value = String(text || "").trim();
+  if (!value || looksLikeQuestion(value)) return false;
+  if (!ANNOUNCEMENT_WHEN_RE.test(value)) return false;
+  return ANNOUNCEMENT_DETAIL_RE.test(value) || value.length >= ANNOUNCEMENT_MIN_LENGTH;
 }
 
 // Pushback, as distinct from a question. "I'm interested in an event, not marketing one"
@@ -898,7 +961,7 @@ function isUsableLocation(value) {
 
 function fieldIsValid(key, value) {
   if (!value) return true; // emptiness is handled by missingFields, not here
-  if (key === "date") return isValidDate(value);
+  if (key === "date" || key === "end_date") return isValidDate(value);
   if (key === "start_time" || key === "end_time") return TIME_RE.test(value);
   if (key === "contact_link") return CONTACT_LINK_RE.test(value.trim());
   if (key === "location") return isUsableLocation(value);
@@ -1121,7 +1184,7 @@ function escapeHtml(value) {
 // phone with a bad connection and nothing to fetch.
 function eventLandingPage(event) {
   const rows = [
-    ["📅", event.date ? shortDate(event.date) : ""],
+    ["📅", event.date ? `${shortDate(event.date)}${lastDay(event) !== event.date ? `–${shortDate(lastDay(event))}` : ""}` : ""],
     ["🕗", event.start_time ? `${event.start_time}${event.end_time ? `-${event.end_time}` : ""}` : ""],
     ["📍", event.location],
     [isFreeEntry(event) ? "🆓" : "🎫", isFreeEntry(event) ? "כניסה חופשית" : event.price],
@@ -1289,14 +1352,24 @@ function formatPublishedPost(event) {
   return formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), withDate: true, mapFor: mapLink }).text;
 }
 
+// Each event's flyer post reaches Stav once ever. It used to repeat at approval, at both
+// weekend slots and on every day the submitter chose, and she read it as the bot
+// re-sending everything (16/10/2026). Later boards still carry the event as text.
+function markFlyerSent(id) {
+  storeUpdateEvent(EVENTS_FILE, id, { flyer_sent_at: new Date().toISOString() });
+}
+
 async function sendPublishedPost(id, event) {
   if (process.env.NODE_ENV === "test") return;
-  const { text, mediaUrl } = formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), withDate: true, mapFor: mapLink });
-  if (event.flyer && !mediaUrl) {
+  const rendered = formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), withDate: true, mapFor: mapLink });
+  const { text } = rendered;
+  const mediaUrl = event.flyer_sent_at ? "" : rendered.mediaUrl;
+  if (event.flyer && !rendered.mediaUrl) {
     console.error(`event #${id} has a flyer but PUBLIC_BASE_URL is unset; sending text only`);
   }
   try {
     await sendWhatsApp(ADMIN_SENDER, text, mediaUrl);
+    if (mediaUrl) markFlyerSent(id);
   } catch (err) {
     console.error(`failed to send published post for event #${id}:`, err);
   }
@@ -1379,6 +1452,7 @@ const FIELD_LABELS = new Map([
   ["תאריך", "date"],
   ["שעה", "start_time"],
   ["שעת סיום", "end_time"],
+  ["תאריך סיום", "end_date"],
   ["מיקום", "location"],
   ["קטגוריה", "category"],
   ["מחיר", "price"],
@@ -1429,7 +1503,7 @@ function formatPendingList(events) {
   // Past-dated submissions are never worth showing: they can't be published, so listing
   // them only invites a decision that has no effect. The daily sweep closes them; this
   // filter keeps them out of the list in between sweeps.
-  const pending = events.filter((e) => e.status === "submitted" && (!e.date || e.date >= today));
+  const pending = events.filter((e) => AWAITING_REVIEW.has(e.status) && (!e.date || lastDay(e) >= today));
   if (!pending.length) return "אין אירועים ממתינים כרגע.";
   return pending
     .map((e) => `#${e.id} ${e.event_name} — ${e.date} ${e.start_time}`)
@@ -1557,6 +1631,9 @@ async function handleAdminMessage(text, repliedSid = "") {
     if (existing.status === "published") {
       return `אירוע #${id} כבר מאושר ומפורסם.`;
     }
+    if (existing.status === "cancelled") {
+      return `אירוע #${id} "${existing.event_name}" בוטל על ידי המפרסם.`;
+    }
     // Expired events close themselves, so reaching one by explicit id is either a typo or
     // a deliberate revival. Say what happened rather than silently publishing a past date;
     // she can still correct the date with "תקן" and approve it then.
@@ -1648,6 +1725,78 @@ function extractMediaUrls(params) {
   return urls;
 }
 
+// WhatsApp sends a flyer and its text as two webhooks a second apart, and they ran in
+// parallel: the text's classifier call wiped the image's fresh draft (or sent it to
+// the menu), or two extractions raced over one draft (16/10/2026). Each sender's
+// messages now run one at a time, and the first half of a likely pair waits briefly so
+// both reach the router as one message.
+const PAIR_WAIT_MS = Number(process.env.PAIR_WAIT_MS || 3000);
+const inboundChains = new Map(); // sender -> tail of that sender's routing queue
+const heldInbound = new Map(); // sender -> { msg, timer, dispatch } waiting for its other half
+
+function isBareCommand(text) {
+  const value = text.trim().toLowerCase();
+  return /^\d{1,2}$/.test(value) || MENU_KEYWORDS.has(value) || CANCEL_KEYWORDS.has(value);
+}
+
+// Only from the menu, where the two halves would otherwise go separate ways. Inside a
+// flow the queue alone is enough: the second half lands in the same draft.
+function shouldHoldForCompanion(sender, text, mediaUrls) {
+  if (sender === ADMIN_SENDER && adminMode.get(sender) !== "customer") return false;
+  const flow = senderFlow(sender);
+  if (flow !== "menu" && flow !== "post-submission") return false;
+  if (mediaUrls.length) return !text.trim();
+  return Boolean(text.trim()) && !isBareCommand(text);
+}
+
+function mergeInbound(first, second) {
+  return {
+    text: [first.text, second.text].map((t) => t.trim()).filter(Boolean).join("\n"),
+    mediaUrls: [...first.mediaUrls, ...second.mediaUrls],
+    repliedSid: first.repliedSid || second.repliedSid,
+  };
+}
+
+function enqueueInbound(sender, msg) {
+  const previous = inboundChains.get(sender) || Promise.resolve();
+  const run = previous.then(() => routeMessage(sender, msg.text, msg.mediaUrls, msg.repliedSid));
+  const tail = run.catch(() => {});
+  inboundChains.set(sender, tail);
+  tail.then(() => {
+    if (inboundChains.get(sender) === tail) inboundChains.delete(sender);
+  });
+  return run;
+}
+
+// Resolves to the reply, or to null when this message was folded into another one's
+// and that webhook answers for both.
+function receiveInbound(sender, text, mediaUrls = [], repliedSid = "") {
+  const msg = { text, mediaUrls, repliedSid };
+  const held = heldInbound.get(sender);
+  if (held) {
+    clearTimeout(held.timer);
+    heldInbound.delete(sender);
+    if (isBareCommand(text) && !mediaUrls.length) {
+      held.dispatch(held.msg);
+      return enqueueInbound(sender, msg);
+    }
+    held.dispatch(mergeInbound(held.msg, msg));
+    return Promise.resolve(null);
+  }
+  if (!shouldHoldForCompanion(sender, text, mediaUrls)) return enqueueInbound(sender, msg);
+  return new Promise((resolve, reject) => {
+    const entry = {
+      msg,
+      dispatch: (final) => enqueueInbound(sender, final).then(resolve, reject),
+    };
+    entry.timer = setTimeout(() => {
+      heldInbound.delete(sender);
+      entry.dispatch(entry.msg);
+    }, PAIR_WAIT_MS);
+    heldInbound.set(sender, entry);
+  });
+}
+
 async function handleTwilio(req, res, body) {
   if (process.env.NODE_ENV !== "test") {
     const signature = req.headers["x-twilio-signature"];
@@ -1673,10 +1822,17 @@ async function handleTwilio(req, res, body) {
 
   let reply;
   try {
-    reply = await routeMessage(sender, text, mediaUrls, repliedSid);
+    reply = await receiveInbound(sender, text, mediaUrls, repliedSid);
   } catch (err) {
     console.error("routeMessage failed:", err);
     reply = "מצטערים, קרתה תקלה. נסו שוב בעוד רגע.";
+  }
+
+  // Folded into the other half of a flyer-and-text pair, which replies for both.
+  if (reply === null) {
+    res.writeHead(200, { "Content-Type": "text/xml; charset=utf-8" });
+    res.end(EMPTY_TWIML);
+    return;
   }
 
   // A TwiML reply is one plain-text node — it cannot carry buttons however many
@@ -1801,6 +1957,98 @@ const INTENT_CONFIRM_TEXT = `רגע, רק לוודא — מה תרצו?
 1. לברר בנוגע לאירועים (אני מחפש/ת לאן ללכת)
 2. לפרסם אירוע (יש לי אירוע שאני רוצה לפרסם)`;
 
+// Submitters had no way to take an event back (16/10/2026). They can cancel their own,
+// matched by phone number, from the menu ("5"), by saying so ("בטל אירוע"), or when the
+// classifier hears it. A bare "ביטול" still only exits whatever flow they are in.
+const CANCEL_EVENT_RE = /^(לבטל|בטל|ביטול|מבטל|מבטלת)\s+(את\s+)?(ה)?אירוע|^cancel (my )?event/i;
+const CANCELLABLE_STATUSES = new Set(["submitted", "needs_info", "published"]);
+const NO_EVENTS_TO_CANCEL_TEXT = "לא מצאנו אירועים קרובים שפרסמתם מהמספר הזה.";
+const CANCEL_KEPT_TEXT = "בסדר, לא ביטלנו כלום.";
+
+function cancellableEventsFor(sender, today = todayIso()) {
+  return loadEvents(EVENTS_FILE)
+    .filter((e) => e.submitter === sender && CANCELLABLE_STATUSES.has(e.status) && (!e.date || lastDay(e) >= today))
+    .sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+}
+
+function cancelLabel(event) {
+  return event.date ? `${event.event_name} — ${shortDate(event.date)}` : event.event_name;
+}
+
+function cancelConfirmText(event) {
+  return `לבטל את "${cancelLabel(event)}"?\n\n1. כן, לבטל\n2. לא`;
+}
+
+function startCancellation(sender) {
+  clearSession(sender);
+  const theirs = cancellableEventsFor(sender);
+  if (!theirs.length) {
+    saveState();
+    return `${NO_EVENTS_TO_CANCEL_TEXT}\n\n${MENU_TEXT}`;
+  }
+  const ids = theirs.map((e) => e.id);
+  // One event needs no list: go straight to the yes/no.
+  if (theirs.length === 1) {
+    awaitingCancelChoice.set(sender, { ids, pickedId: ids[0] });
+    saveState();
+    return cancelConfirmText(theirs[0]);
+  }
+  awaitingCancelChoice.set(sender, { ids, pickedId: "" });
+  saveState();
+  const lines = theirs.map((e, i) => `${i + 1}. ${cancelLabel(e)}`);
+  return `איזה אירוע לבטל?\n\n${lines.join("\n")}\n\nשלחו את המספר.`;
+}
+
+async function handleCancelChoice(sender, trimmed) {
+  const pending = awaitingCancelChoice.get(sender);
+
+  if (!pending.pickedId) {
+    const index = Number(trimmed) - 1;
+    const id = Number.isInteger(index) ? pending.ids[index] : undefined;
+    const event = id && storeFindEvent(EVENTS_FILE, id);
+    if (!event) return `שלחו את מספר האירוע מהרשימה (1-${pending.ids.length}), או "ביטול" כדי לחזור לתפריט.`;
+    awaitingCancelChoice.set(sender, { ...pending, pickedId: id });
+    saveState();
+    return cancelConfirmText(event);
+  }
+
+  const event = storeFindEvent(EVENTS_FILE, pending.pickedId);
+  if (trimmed === "2" || !event) {
+    awaitingCancelChoice.delete(sender);
+    saveState();
+    return CANCEL_KEPT_TEXT;
+  }
+  if (trimmed !== "1") return cancelConfirmText(event);
+
+  awaitingCancelChoice.delete(sender);
+  saveState();
+  await cancelEvent(event, sender);
+  return `האירוע "${event.event_name}" בוטל ולא יופיע יותר בלוח ובהודעות.`;
+}
+
+async function cancelEvent(event, sender) {
+  // Re-checked against the row, not the list shown earlier: the owner is the only
+  // person this may act for, and the event may have changed since.
+  if (event.submitter !== sender || !CANCELLABLE_STATUSES.has(event.status)) return;
+  storeUpdateEvent(EVENTS_FILE, event.id, {
+    status: "cancelled",
+    notes: `${event.notes} | בוטל על ידי המפרסם`.trim(),
+  });
+  if (undeliveredAdminNotices.delete(String(event.id))) saveState();
+  if (lastButtonEventId === String(event.id)) { lastButtonEventId = ""; saveState(); }
+  if (process.env.NODE_ENV === "test") return;
+  // Boards and reminders skip it from now on by themselves. A post Stav already
+  // forwarded to the group is the one thing the bot cannot take back, so she is told.
+  const wasPublished = event.status === "published";
+  const lines = [`🚫 אירוע #${event.id} "${event.event_name}" בוטל על ידי המפרסם (${sender}).`];
+  if (wasPublished) lines.push("אם הוא כבר הועבר לקבוצה, כדאי לעדכן שם.");
+  try {
+    await sendWhatsApp(ADMIN_SENDER, lines.join("\n"));
+  } catch (err) {
+    console.error(`failed to tell the admin about cancelled event #${event.id}:`, err);
+  }
+}
+
 // The two flow entry points, so the router switch, the classifier, the confirmation
 // answer and the escape answer cannot drift on what "start an inquiry" means.
 function startInquiry(sender) {
@@ -1816,7 +2064,7 @@ function startSubmission(sender) {
   saveState();
 }
 
-async function handleActiveSubmission(sender, text, mediaUrls) {
+async function handleActiveSubmission(sender, text, mediaUrls, { rateCounted = false } = {}) {
   const trimmed = text.trim();
 
   // Answering the escape offer. Above the append below, so the answer never becomes part
@@ -1839,10 +2087,6 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
     return MESSAGE_TOO_LONG_TEXT;
   }
 
-  if (isRateLimited(sender)) {
-    return RATE_LIMITED_TEXT;
-  }
-
   const images = activeSubmissionImages.get(sender) || [];
   if (mediaUrls.length) {
     const remainingSlots = Math.max(0, MAX_IMAGES_PER_EVENT - images.length);
@@ -1861,6 +2105,13 @@ async function handleActiveSubmission(sender, text, mediaUrls) {
   const messages = activeSubmissions.get(sender);
   messages.push(text);
   saveState();
+
+  // Checked only once the image and text are stored: a flyer sent in a burst of messages
+  // used to be refused before it was even fetched, and never reached the draft. Now it
+  // is kept, and the next message picks it up.
+  if (!rateCounted && isRateLimited(sender)) {
+    return RATE_LIMITED_TEXT;
+  }
 
   if (!messages.some((m) => m.trim()) && !images.length) {
     return ASK_EVENT_DETAILS_TEXT;
@@ -2224,6 +2475,7 @@ function senderFlow(sender) {
   if (activeSubmissions.has(sender)) return "submission";
   if (activeInquiries.has(sender)) return "inquiry";
   if (awaitingPublishChoice.has(sender) || awaitingDailyChoice.has(sender)) return "publish-choice";
+  if (awaitingCancelChoice.has(sender)) return "cancel";
   // Its own tag so drop-off at the confirmation is visible in interactions.jsonl.
   if (awaitingIntentConfirm.has(sender)) return "intent-confirm";
   if (recentlyCompleted.has(sender)) return "post-submission";
@@ -2297,10 +2549,18 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
     state.inCustomerModeReply = true;
   }
 
+  if (CANCEL_EVENT_RE.test(trimmed)) {
+    return startCancellation(sender);
+  }
+
   if (CANCEL_KEYWORDS.has(lowerTrimmed) || MENU_KEYWORDS.has(lowerTrimmed)) {
     clearSession(sender);
     saveState();
     return MENU_TEXT;
+  }
+
+  if (awaitingCancelChoice.has(sender)) {
+    return handleCancelChoice(sender, trimmed);
   }
 
   // Directly below the cancel keyword and above every flow branch: while this question is
@@ -2333,6 +2593,15 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
   // Must sit above the recentlyCompleted branch below: a bare "2" answering the
   // publish-day question would otherwise be read as a stray follow-up and forwarded
   // to Stav as a correction to the event.
+  // A flyer here is the next event, not an answer. It used to be dropped and the day
+  // options re-shown. The question is closed unanswered, which leaves daily_days empty
+  // so it is asked again at approval.
+  if ((awaitingPublishChoice.has(sender) || awaitingDailyChoice.has(sender)) && hasUnambiguousSubmissionSignal(mediaUrls)) {
+    startSubmission(sender);
+    const reply = await handleActiveSubmission(sender, text, mediaUrls);
+    return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
+  }
+
   if (awaitingPublishChoice.has(sender)) {
     return handleDayChoice(sender, trimmed, awaitingPublishChoice);
   }
@@ -2354,7 +2623,7 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
       return MESSAGE_TOO_LONG_TEXT;
     }
 
-    if (isRateLimited(sender)) {
+    if (!state.rateCounted && isRateLimited(sender)) {
       return RATE_LIMITED_TEXT;
     }
 
@@ -2383,6 +2652,13 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
     const lastId = lastSubmittedEventId.get(sender) || "";
     recentlyCompleted.delete(sender);
     saveState();
+    // A flyer right after a submission was thrown away with a "we already got it". It is
+    // the next event.
+    if (hasUnambiguousSubmissionSignal(mediaUrls)) {
+      startSubmission(sender);
+      const reply = await handleActiveSubmission(sender, text, mediaUrls);
+      return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
+    }
     if (trimmed !== "1" && trimmed !== "2" && trimmed !== "3" && trimmed !== "4") {
       // The message right after a submission is usually about that submission, not a new
       // one. Treating every such message as a duplicate discarded real corrections — a
@@ -2411,6 +2687,8 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
       return PRICE_PLACEHOLDER_TEXT;
     case "4":
       return CUSTOMER_SERVICE_TEXT;
+    case "5":
+      return startCancellation(sender);
     default: {
       // A flyer is a submission, full stop — no model call, no confirmation.
       if (hasUnambiguousSubmissionSignal(mediaUrls)) {
@@ -2434,33 +2712,47 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
       // recommendations is comfortably over 40 characters, and someone asking "what's on
       // tonight?" is comfortably under it and got the menu instead of an answer. Ask what
       // the person actually wants, and when the model isn't sure, ask the person.
+      // Counted here once for the whole message: the flow it lands in does not count it
+      // again (it used to, so one forwarded event spent two of the five slots).
       if (isRateLimited(sender)) return RATE_LIMITED_TEXT;
+      state.rateCounted = true;
+      const submitNow = async () => {
+        startSubmission(sender);
+        const reply = await handleActiveSubmission(sender, text, mediaUrls, { rateCounted: true });
+        return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
+      };
+      const announcement = looksLikeEventAnnouncement(trimmed);
       // classifyIntent is written never to reject, but this is the one call standing
       // between a stranger and the wrong flow, so it does not get to depend on that.
-      // Anything unexpected lands on the menu, which is always recoverable.
+      // Anything unexpected lands on the menu, which is always recoverable - unless the
+      // text is plainly an event, which is never worth losing.
       let intent = "other";
       let confidence = 0;
       try {
         ({ intent, confidence } = await intentModule.classifyIntent(trimmed));
       } catch (err) {
         console.error("intent classification threw, falling back to menu:", err);
-        return MENU_TEXT;
+        return announcement ? submitNow() : MENU_TEXT;
+      }
+
+      if (intent === "cancel" && confidence >= INTENT_CONFIDENCE_THRESHOLD) {
+        return startCancellation(sender);
       }
 
       if (confidence >= INTENT_CONFIDENCE_THRESHOLD) {
-        if (intent === "submit") {
-          startSubmission(sender);
-          const reply = await handleActiveSubmission(sender, text, mediaUrls);
-          return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
-        }
+        if (intent === "submit") return submitNow();
         if (intent === "inquire") {
           // Answer the question they already asked. Re-entering here lands in the
           // activeInquiries branch above, which cannot route back to this one.
           startInquiry(sender);
           return routeMessageInner(sender, text, mediaUrls, repliedSid, state);
         }
-        return MENU_TEXT;
+        return announcement ? submitNow() : MENU_TEXT;
       }
+
+      // A forwarded announcement goes straight to the draft, even when the model was
+      // unsure. Only a real chance that it is a question still gets asked about.
+      if (announcement && intent !== "inquire") return submitNow();
 
       // Not sure. Anything genuinely ambiguous between the two real flows gets the
       // question; a low-confidence "other" is just noise and gets the menu.
@@ -2626,6 +2918,10 @@ if (require.main === module) {
 
 module.exports = {
   routeMessage,
+  buildSlotPosts,
+  receiveInbound,
+  looksLikeEventAnnouncement,
+  get awaitingCancelChoice() { return awaitingCancelChoice; },
   recordReminderOptIns,
   sendDueEventReminders,
   replyToReminder,

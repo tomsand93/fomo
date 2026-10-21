@@ -115,7 +115,14 @@ function formatLong(event, { linkFor = defaultLinkFor, flyerUrl = () => "", with
   if (event.category) head.push(`· ${event.category}`);
 
   const when = [];
-  if (withDate && event.date) when.push(`📅 ${shortDate(event.date)}`);
+  // A festival names its last day even under a day heading, or readers take it for
+  // a one-night thing.
+  const multiDay = event.end_date && event.end_date > event.date;
+  if (withDate && event.date) {
+    when.push(`📅 ${shortDate(event.date)}${multiDay ? `–${shortDate(event.end_date)}` : ""}`);
+  } else if (multiDay) {
+    when.push(`📅 עד ${shortDate(event.end_date)}`);
+  }
   if (event.start_time) {
     when.push(`🕗 ${event.start_time}${event.end_time ? `-${event.end_time}` : ""}`);
   }

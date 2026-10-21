@@ -5,7 +5,7 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const MODEL = process.env.OPENROUTER_MODEL || "anthropic/claude-haiku-5.5";
 
 const FIELD_KEYS = [
-  "event_name", "date", "start_time", "end_time", "location",
+  "event_name", "date", "end_date", "start_time", "end_time", "location",
   "category", "price", "organizer", "contact_link", "contact_person", "description",
 ];
 
@@ -35,6 +35,7 @@ ${imageNote}${previouslyExtractedNote}
 חלץ את השדות הבאים מהטקסט (ומהתמונה אם צורפה). אם שדה לא מוזכר בשום מקום, השאר אותו כמחרוזת ריקה "".
 - event_name: שם האירוע. אם אין כותרת מפורשת (כמו "שם האירוע:"), הסק שם קצר וברור מהשורה הראשונה או מהתיאור הכללי של האירוע. השאר ריק רק אם באמת אי אפשר להסיק שם כלשהו.
 - date: תאריך האירוע בפורמט YYYY-MM-DD. אם נאמר יום בשבוע (כמו "יום שישי") ללא תאריך מדויק, חשב את התאריך הקרוב ביותר בעתיד מהיום הנוכחי.
+- end_date: רק לאירוע שנמשך כמה ימים (פסטיבל, תערוכה, סדרת ערבים): היום האחרון בפורמט YYYY-MM-DD, ואז date הוא היום הראשון. לאירוע של יום אחד השאר ריק.
 - start_time: שעת התחלה בפורמט HH:MM (24 שעות). אם נאמר "בצהריים" השתמש ב-12:00, "בערב" 19:00, "אחר הצהריים" 16:00, אלא אם צוין אחרת.
 - end_time: שעת סיום בפורמט HH:MM, אם צוין.
 - location: שם המקום והכתובת המלאה, יחד (למשל "בר בזל, מסדה 12, חיפה"). אל תסתפק בשם העיר בלבד — אם יש רק "חיפה" בלי שם מקום או רחוב, השאר את השדה ריק כדי שנבקש מהמשתמש את הפרטים.

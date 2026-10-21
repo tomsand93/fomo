@@ -105,12 +105,25 @@ function splitBody(body, max = MAX_BODY_CHARS) {
 // base64 data URL will not work. A long body goes out as several messages in order; the
 // image rides on the first, and the first result is returned so callers' delivery checks
 // still have a sid (a closed 24h window drops every part alike).
+//
+// A failure after some parts went out says so on the error (sentParts, unsent): retrying
+// the whole body re-delivered part 1 every five minutes through the send window.
 async function sendWhatsApp(to, body, mediaUrl = "") {
-  const [first, ...rest] = splitBody(body);
-  const fields = { To: to, Body: first };
-  if (mediaUrl) fields.MediaUrl = mediaUrl;
-  const result = await postForm(fields);
-  for (const part of rest) await postForm({ To: to, Body: part });
+  const parts = splitBody(body);
+  let result = null;
+  for (let i = 0; i < parts.length; i += 1) {
+    const fields = { To: to, Body: parts[i] };
+    if (i === 0 && mediaUrl) fields.MediaUrl = mediaUrl;
+    try {
+      const sent = await postForm(fields);
+      if (i === 0) result = sent;
+    } catch (err) {
+      err.sentParts = i;
+      err.firstResult = result;
+      err.unsent = parts.slice(i).join("\n\n");
+      throw err;
+    }
+  }
   return result;
 }
 
