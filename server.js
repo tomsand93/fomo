@@ -1391,18 +1391,55 @@ function findDuplicateEvent(event) {
   return loadEvents(EVENTS_FILE).find((other) => CANCELLABLE_STATUSES.has(other.status) && isSameEvent(other, event));
 }
 
-async function acknowledgeDuplicate(sender, existing) {
+// A new image from the event's own submitter becomes its flyer, replacing any earlier
+// one. Sending the poster again was the only way a submitter could add or swap one, and
+// the duplicate check above would otherwise drop it. Cleared flyer_sent_at so the new
+// image goes out in the next slot. Returns "" when nothing changed (the same image).
+function replaceFlyer(existing, image) {
+  const name = saveFlyer(image, existing.id);
+  if (!name || name === existing.flyer) return "";
+  storeUpdateEvent(EVENTS_FILE, existing.id, { flyer: name, flyer_sent_at: "" });
+  if (existing.flyer) deleteFlyer(existing.flyer);
+  return name;
+}
+
+async function acknowledgeDuplicate(sender, existing, image = "") {
   // A correction that follows lands on the copy that was kept.
   lastSubmittedEventId.set(sender, existing.id);
   saveState();
+  const own = existing.submitter === sender;
+  const newFlyer = own && image ? replaceFlyer(existing, image) : "";
+
   // Someone else's submission matched: tell Stav, so a false match — two real events
-  // at one address and hour — can still be added by hand.
-  if (existing.submitter !== sender && process.env.NODE_ENV !== "test") {
+  // at one address and hour — can still be added by hand. Their image is shown to her
+  // but never replaces the organiser's flyer.
+  let notice = "";
+  let noticeImage = "";
+  if (newFlyer) {
+    notice = `🖼 ${existing.flyer ? "פלייר חדש" : "פלייר"} לאירוע #${existing.id} (${existing.event_name}), מ: ${sender}\n${existing.flyer ? "הוחלף באירוע" : "צורף לאירוע"}, ויישלח בהודעה היומית הבאה שהאירוע מופיע בה.`;
+    noticeImage = flyerUrl(newFlyer);
+  } else if (!own) {
+    notice = `🔁 אירוע #${existing.id} (${existing.event_name}) נשלח שוב, מ: ${sender}\nלא נוסף כאירוע חדש.`;
+    if (image) {
+      notice += "\nהתמונה שצירפו מצורפת כאן, והפלייר של האירוע לא הוחלף.";
+      noticeImage = flyerUrl(saveFlyer(image, `${existing.id}-offered`));
+    }
+  }
+  if (notice && process.env.NODE_ENV !== "test") {
     try {
-      await sendWhatsApp(ADMIN_SENDER, `🔁 אירוע #${existing.id} (${existing.event_name}) נשלח שוב, מ: ${sender}\nלא נוסף כאירוע חדש.`);
+      await sendWhatsApp(ADMIN_SENDER, notice, noticeImage);
     } catch (err) {
       console.error(`failed to tell the admin about a duplicate of event #${existing.id}:`, err);
     }
+  }
+
+  if (newFlyer) {
+    return [
+      `עדכנו את הפלייר של האירוע 🙌`,
+      `📌 ${existing.event_name}${existing.date ? ` · ${longDate(existing.date)}` : ""}`,
+      "",
+      "משהו נוסף לתקן? פשוט כתבו לנו כאן.",
+    ].join("\n");
   }
   const status = existing.status === "published" ? "וכבר אושר לפרסום" : "והוא בבדיקה";
   return [
@@ -2212,6 +2249,18 @@ async function handleActiveSubmission(sender, text, mediaUrls, { rateCounted = f
   imagesSentToModel.set(sender, images.length);
   lastExtractedEvent.set(sender, event);
 
+  // Already on file: checked before anything is asked, because a poster sent again —
+  // usually to add or swap the flyer — would otherwise be quizzed for a contact link
+  // only to end up as a copy that is never saved.
+  const knownEvent = findDuplicateEvent(event);
+  if (knownEvent) {
+    const firstImage = images[0] || "";
+    clearSession(sender);
+    recentlyCompleted.add(sender);
+    saveState();
+    return acknowledgeDuplicate(sender, knownEvent, firstImage);
+  }
+
   // Only a "no" to a question we actually asked: the previous turn has to have been
   // missing the contact, and this turn must not have found one anyway.
   if (
@@ -2284,8 +2333,6 @@ async function handleActiveSubmission(sender, text, mediaUrls, { rateCounted = f
     clearSession(sender);
     recentlyCompleted.add(sender);
     saveState();
-    const duplicate = findDuplicateEvent(event);
-    if (duplicate) return acknowledgeDuplicate(sender, duplicate);
     const { id } = appendEvent(event, "Twilio WhatsApp", sender);
     lastSubmittedEventId.set(sender, id);
     const flyer = persistFlyer(id, firstImage);
@@ -2321,8 +2368,6 @@ async function handleActiveSubmission(sender, text, mediaUrls, { rateCounted = f
   clearSession(sender);
   recentlyCompleted.add(sender);
   saveState();
-  const duplicate = findDuplicateEvent(event);
-  if (duplicate) return acknowledgeDuplicate(sender, duplicate);
   const { id } = appendEvent(event, "Twilio WhatsApp", sender);
   lastSubmittedEventId.set(sender, id);
   const flyer = persistFlyer(id, firstImage);
@@ -3002,6 +3047,7 @@ if (require.main === module) {
 module.exports = {
   routeMessage,
   buildSlotPosts,
+  acknowledgeDuplicate,
   receiveInbound,
   looksLikeEventAnnouncement,
   get awaitingCancelChoice() { return awaitingCancelChoice; },

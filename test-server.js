@@ -2113,6 +2113,24 @@ async function demo() {
     const copies = eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.event_name === "פעמיים");
     if (copies.length !== 1) throw new Error(`a resubmitted event must be filed once, got ${copies.length}`);
     if (!reply.includes("כבר אצלנו")) throw new Error(`a resubmission should be told it is already in, got: ${reply}`);
+
+    // Resent with a poster, it attaches the flyer; a different one replaces it and goes
+    // out again; someone else's never replaces it.
+    const { acknowledgeDuplicate } = require("./server");
+    const rowOf = () => eventsStore.loadEvents(TEST_EVENTS_FILE).find((e) => e.event_name === "פעמיים");
+    const attached = await acknowledgeDuplicate(again, rowOf(), flyerDataUrl);
+    const first = rowOf().flyer;
+    if (!first || !attached.includes("עדכנו את הפלייר")) throw new Error("the submitter's image should become the flyer");
+    eventsStore.updateEvent(TEST_EVENTS_FILE, rowOf().id, { flyer_sent_at: "2026-10-20T10:00:00Z" });
+    const sameAgain = await acknowledgeDuplicate(again, rowOf(), flyerDataUrl);
+    if (sameAgain.includes("עדכנו את הפלייר") || !rowOf().flyer_sent_at) throw new Error("the same image again changes nothing");
+    const otherImage = `data:image/png;base64,${Buffer.concat([pngBytes, Buffer.from([0])]).toString("base64")}`;
+    await acknowledgeDuplicate(again, rowOf(), otherImage);
+    if (rowOf().flyer === first || rowOf().flyer_sent_at) throw new Error("a new image replaces the flyer and is sent again");
+    if (flyerStore.flyerPath(first)) throw new Error("the replaced flyer file should be removed");
+    const kept = rowOf().flyer;
+    await acknowledgeDuplicate("whatsapp:+972500009571", rowOf(), flyerDataUrl);
+    if (rowOf().flyer !== kept) throw new Error("another sender's image must not replace the flyer");
   }
 
   // A number that is not an option must not be half-accepted.
