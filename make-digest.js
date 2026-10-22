@@ -1,4 +1,4 @@
-const { loadEvents, runsOn } = require("./events-store");
+const { loadEvents, runsOn, withoutDuplicates } = require("./events-store");
 const { longDate, todayIso } = require("./clock");
 const { formatLong } = require("./format-event");
 
@@ -93,14 +93,14 @@ function digestFlyerEvents(events, targetDate) {
 // "we'll send it in the daily message on X" and it never went out (14/10/2026).
 // A multi-day event counts as today's on every day it runs.
 function digestEvents(events, targetDate) {
-  return events
+  return withoutDuplicates(events
     .filter((event) =>
       event.status === "published" &&
       event.start_time &&
       event.location &&
       (runsOn(event, targetDate) ||
         (event.date > targetDate && (event.daily_days || "").split(",").includes(targetDate)))
-    )
+    ))
     .sort((a, b) => a.date.localeCompare(b.date) || a.start_time.localeCompare(b.start_time));
 }
 
@@ -129,4 +129,4 @@ if (require.main === module) {
   console.log(makeDigest(loadEvents(process.env.EVENTS_FILE || "events.csv"), dateArg));
 }
 
-module.exports = { loadEvents, makeDigest, makeDailyParts, digestFlyerEvents };
+module.exports = { loadEvents, makeDigest, makeDailyParts, digestEvents, digestFlyerEvents };

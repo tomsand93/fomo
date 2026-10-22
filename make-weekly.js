@@ -1,4 +1,4 @@
-const { loadEvents, runsOn } = require("./events-store");
+const { loadEvents, runsOn, withoutDuplicates } = require("./events-store");
 const { dayOfWeek, addDays, shortDate, longDate, todayIso, DAY_NAMES } = require("./clock");
 const { formatShort } = require("./format-event");
 
@@ -21,7 +21,10 @@ function makeWeekly(events, fromDate = todayIso(), options = {}) {
   const dates = rollingWindow(fromDate);
 
   const byDate = new Map(dates.map((date) => [date, []]));
-  for (const event of events) {
+  // A second copy of an event already on the board would print twice, one line under
+  // the other — which is how SEE GARDEN reached the group on 21/10/2026.
+  const published = withoutDuplicates(events.filter((event) => event.status === "published"));
+  for (const event of published) {
     if (event.status !== "published") continue;
     if (!event.start_time || !event.event_name) continue;
     // A festival sits under each of its days, not just the first.

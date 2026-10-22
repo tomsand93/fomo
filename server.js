@@ -3,11 +3,11 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { URLSearchParams } = require("url");
-const { loadEvents, makeDigest, makeDailyParts, digestFlyerEvents } = require("./make-digest");
-const { israelClock, todayIso, addDays, shortDate, isReminderDue, isReminderMissed } = require("./clock");
+const { loadEvents, makeDigest, makeDailyParts, digestEvents } = require("./make-digest");
+const { israelClock, todayIso, addDays, dayOfWeek, longDate, isReminderDue, isReminderMissed } = require("./clock");
 const { isFreeEntry, formatShort, formatLong } = require("./format-event");
 const { makeWeekly } = require("./make-weekly");
-const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent, lastDay } = require("./events-store");
+const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent, lastDay, runsOn, isSameEvent } = require("./events-store");
 const extractEventModule = require("./extract-event");
 const intentModule = require("./classify-intent");
 const { addCorrection, buildCorrectionGuidance } = require("./corrections-store");
@@ -249,35 +249,90 @@ function slotsDueAt(local) {
   return DAILY_SLOTS.filter((entry) => entry.days.includes(local.day) && isDue(local, entry));
 }
 
-// Up to three messages per slot, each one Stav can forward as is: events happening
-// today, later events whose submitter picked today, and the rolling board. They used to
-// be one message under "what's on today", which on 18/10 held only a Saturday event.
-// Empty ones are skipped; the board always goes, so a quiet day still shows the bot ran.
-// Flyers follow as separate messages because Twilio carries one image each.
+// Each slot is a short note for Stav, then the messages she forwards as is, in order:
+// events happening today, later events whose submitter picked today, and the rolling
+// board. Empty ones are skipped; the board always goes, so a quiet day still shows the
+// bot ran.
 //
-// A short note for Stav goes first, naming what each message below it is. It is its own
-// message so the ones she forwards stay clean.
+// An event with an unsent flyer is not in the text messages: its own post (image and
+// full text) goes right after the section it belongs to, instead. Sending both put the
+// same event in front of the group twice, and Stav could not tell which to forward.
+//
+// The note names each message by its own first line, which is what she sees in the
+// chat. It used to say "1. today's events, 2. ..." over messages that carry no numbers,
+// and she could not match them up (21/10/2026).
 const SLOT_POST_LABELS = {
-  today: "אירועים שמתקיימים היום",
-  promoted: "אירועים בימים הקרובים, שהמפרסמים ביקשו שיופיעו בהודעה של היום",
-  board: "הלוח השבועי — כל האירועים המאושרים עד סוף השבוע",
+  today: "האירועים שמתקיימים היום",
+  promoted: "אירועים בימים הבאים, שהמפרסמים ביקשו שיופיעו היום",
+  board: "הלוח: כל האירועים המאושרים עד סוף השבוע, בקצרה",
 };
+const MAX_SLOT_FLYERS = 3;
 
-function buildSlotPosts(events, localDate, slot = "") {
-  const links = { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) };
+// The earlier slot that already ran today, if any — the weekend's 12:00 before its 18:00.
+function earlierSlotToday(localDate, slot) {
+  const day = dayOfWeek(localDate);
+  const earlier = DAILY_SLOTS.filter((entry) => entry.days.includes(day) && slot && entry.slot < slot);
+  return earlier.length ? earlier[earlier.length - 1].slot : "";
+}
+
+// On a day with two slots, the second leaves out what the first already sent and is no
+// longer ahead: today's events that start before it, and the later events promoted for
+// today. Stav asked that a morning event never go out again in the evening, even when it
+// runs into the night (22/10/2026). An evening event goes in both, because at noon it
+// was still hours away.
+function coveredByEarlierSlot(event, localDate, slot) {
+  if (!earlierSlotToday(localDate, slot)) return false;
+  return !runsOn(event, localDate) || (event.start_time || "") < slot;
+}
+
+function buildSlotPosts(events, localDate, slot = "", links = { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) }) {
+  const daily = digestEvents(events, localDate);
+  const fresh = daily.filter((event) => !coveredByEarlierSlot(event, localDate, slot));
+  const flyered = fresh
+    .filter((event) => event.flyer && !event.flyer_sent_at && links.flyerUrl(event))
+    .slice(0, MAX_SLOT_FLYERS);
+  const flyeredIds = new Set(flyered.map((event) => event.id));
+
   // The map goes on the daily messages only. The board's one-line entries already carry
   // a location, a price and a link; a second URL there is noise. formatShort ignores
   // mapFor anyway, but passing it only where it is wanted keeps that deliberate.
-  const { today, promoted } = makeDailyParts(events, localDate, { ...links, mapFor: mapLink });
+  const longLinks = { ...links, mapFor: mapLink };
+  const { today, promoted } = makeDailyParts(fresh.filter((event) => !flyeredIds.has(event.id)), localDate, longLinks);
   const board = makeWeekly(events, localDate, links);
-  const parts = [["today", today], ["promoted", promoted], ["board", board]].filter(([, text]) => text);
+
+  const titled = (text, label) => ({ text, label: `"${text.split("\n")[0]}" — ${label}` });
+  const flyerPost = (event, isToday) => ({
+    ...formatLong(event, { ...longLinks, withDate: true }),
+    eventId: event.id,
+    label: `תמונה ופרטים: ${event.event_name}${isToday ? "" : ` (${longDate(event.date)})`}`,
+  });
+  const isToday = (event) => runsOn(event, localDate);
+  const posts = [
+    today && titled(today, SLOT_POST_LABELS.today),
+    ...flyered.filter(isToday).map((event) => flyerPost(event, true)),
+    promoted && titled(promoted, SLOT_POST_LABELS.promoted),
+    ...flyered.filter((event) => !isToday(event)).map((event) => flyerPost(event, false)),
+    titled(board, SLOT_POST_LABELS.board),
+  ].filter(Boolean);
+
   const intro = [
-    `📬 ההודעות להעברה לקבוצה${slot ? ` (${slot})` : ""} 👇`,
+    `📬 להעביר לקבוצה${slot ? ` ב-${slot}` : ""} — ${posts.length === 1 ? "הודעה אחת" : `${posts.length} הודעות`}, לפי הסדר:`,
     "",
-    ...parts.map(([kind], i) => `${i + 1}. ${SLOT_POST_LABELS[kind]}`),
+    ...posts.map((post, i) => `${i + 1}. ${post.label}`),
   ];
-  if (!today) intro.push("", "אין אירועים שמתקיימים היום, לכן אין הודעת \"מה עושים היום\".");
-  return [intro.join("\n"), ...parts.map(([, text]) => text)];
+  const earlier = earlierSlotToday(localDate, slot);
+  const coveredToday = daily.some((event) => isToday(event) && coveredByEarlierSlot(event, localDate, slot));
+  const hasToday = Boolean(today) || flyered.some(isToday);
+  if (!hasToday && coveredToday) {
+    intro.push("", `אירועי היום כבר נשלחו בהודעה של ${earlier}, לכן אין הודעת "מה עושים היום".`);
+  } else if (!hasToday) {
+    intro.push("", "אין אירועים שמתקיימים היום, לכן אין הודעת \"מה עושים היום\".");
+  } else if (coveredToday) {
+    intro.push("", `אירועים שכבר נשלחו בהודעה של ${earlier} לא מופיעים שוב.`);
+  }
+  intro.push("", "כל ההודעות שמתחת לזו — להעביר כמו שהן.");
+
+  return [{ text: intro.join("\n") }, ...posts.map(({ text, mediaUrl = "", eventId = "" }) => ({ text, mediaUrl, eventId }))];
 }
 
 const SLOT_POST_SEPARATOR = "\n\n———\n\n";
@@ -301,27 +356,26 @@ async function sendDueBoards(now = new Date()) {
       // (channels.md), so she forwards it — and gets to eyeball it first.
       let firstSid = "";
       for (const post of posts) {
-        const result = await sendWhatsApp(ADMIN_SENDER, post);
+        const result = await sendSlotPost(post);
         if (!firstSid) firstSid = result.sid;
         sent += 1;
       }
       // A resolved send is not delivery: the slots fire when Stav is usually not
       // mid-conversation, so her 24h WhatsApp window is typically closed and Twilio
       // drops the message with 63016. Every board between 16 Aug and 23 Aug 2026 was
-      // lost this way, silently. Hold it until confirmed.
-      pendingBoards.set(key, posts.join(SLOT_POST_SEPARATOR));
+      // lost this way, silently. Hold it until confirmed. The queued copy is text only;
+      // a flyer's event still reaches her, without its image.
+      pendingBoards.set(key, posts.map((post) => post.text).join(SLOT_POST_SEPARATOR));
       saveState();
       confirmBoardDelivery(key, firstSid);
-      await sendSlotFlyers(events, localDate);
     } catch (err) {
       console.error(`failed to send the ${slot} message:`, err);
       if (sent > 0 || err.sentParts > 0) {
         // Some of it already reached Stav. Retrying from the top re-sent it every five
         // minutes, so only the rest is queued, for her next message.
-        const rest = [err.sentParts > 0 ? err.unsent : posts[sent], ...posts.slice(sent + 1)];
+        const rest = [err.sentParts > 0 ? err.unsent : posts[sent].text, ...posts.slice(sent + 1).map((post) => post.text)];
         pendingBoards.set(key, rest.join(SLOT_POST_SEPARATOR));
         saveState();
-        await sendSlotFlyers(loadEvents(EVENTS_FILE), localDate);
         continue;
       }
       sentBoards.delete(key); // nothing went out: let the next check retry within the window
@@ -330,23 +384,18 @@ async function sendDueBoards(now = new Date()) {
   }
 }
 
-// Twilio attaches one image per message, so a day with several flyered events cannot be
-// a single send. The text already went out complete; these follow so Stav has the images
-// to forward alongside it. Capped, because a busy day should not become a photo album.
-const MAX_SLOT_FLYERS = 3;
-
-async function sendSlotFlyers(events, localDate) {
-  const flyered = digestFlyerEvents(events, localDate).slice(0, MAX_SLOT_FLYERS);
-  for (const event of flyered) {
-    const { text, mediaUrl } = formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), withDate: true, mapFor: mapLink });
-    if (!mediaUrl) continue;
-    try {
-      await sendWhatsApp(ADMIN_SENDER, text, mediaUrl);
-      markFlyerSent(event.id);
-    } catch (err) {
-      // One failed image must not stop the rest, and the text has already landed.
-      console.error(`failed to send the flyer for event #${event.id}:`, err);
-    }
+// Twilio attaches one image per message, so each flyered event is its own post. That
+// event is left out of the text messages, so a failed image must not lose it: the post
+// goes again as text only.
+async function sendSlotPost(post) {
+  if (!post.mediaUrl) return sendWhatsApp(ADMIN_SENDER, post.text);
+  try {
+    const result = await sendWhatsApp(ADMIN_SENDER, post.text, post.mediaUrl);
+    markFlyerSent(post.eventId);
+    return result;
+  } catch (err) {
+    console.error(`failed to send the flyer for event #${post.eventId}, sending its text alone:`, err);
+    return sendWhatsApp(ADMIN_SENDER, post.text);
   }
 }
 
@@ -1184,7 +1233,7 @@ function escapeHtml(value) {
 // phone with a bad connection and nothing to fetch.
 function eventLandingPage(event) {
   const rows = [
-    ["📅", event.date ? `${shortDate(event.date)}${lastDay(event) !== event.date ? `–${shortDate(lastDay(event))}` : ""}` : ""],
+    ["📅", event.date ? `${longDate(event.date)}${lastDay(event) !== event.date ? `–${longDate(lastDay(event))}` : ""}` : ""],
     ["🕗", event.start_time ? `${event.start_time}${event.end_time ? `-${event.end_time}` : ""}` : ""],
     ["📍", event.location],
     [isFreeEntry(event) ? "🆓" : "🎫", isFreeEntry(event) ? "כניסה חופשית" : event.price],
@@ -1332,6 +1381,36 @@ async function forwardEventToAdmin(id, event, sender, unresolved = [], flyer = "
     undeliveredAdminNotices.add(String(id));
     saveState();
   }
+}
+
+// The same event submitted again — retried by its submitter, or sent by a second
+// organiser — used to become a second row, a second review for Stav and, once both were
+// approved, two identical lines on the board (#69/#71, #73/#74, 21/10/2026). The copy
+// already on file is kept; the new one is not saved.
+function findDuplicateEvent(event) {
+  return loadEvents(EVENTS_FILE).find((other) => CANCELLABLE_STATUSES.has(other.status) && isSameEvent(other, event));
+}
+
+async function acknowledgeDuplicate(sender, existing) {
+  // A correction that follows lands on the copy that was kept.
+  lastSubmittedEventId.set(sender, existing.id);
+  saveState();
+  // Someone else's submission matched: tell Stav, so a false match — two real events
+  // at one address and hour — can still be added by hand.
+  if (existing.submitter !== sender && process.env.NODE_ENV !== "test") {
+    try {
+      await sendWhatsApp(ADMIN_SENDER, `🔁 אירוע #${existing.id} (${existing.event_name}) נשלח שוב, מ: ${sender}\nלא נוסף כאירוע חדש.`);
+    } catch (err) {
+      console.error(`failed to tell the admin about a duplicate of event #${existing.id}:`, err);
+    }
+  }
+  const status = existing.status === "published" ? "וכבר אושר לפרסום" : "והוא בבדיקה";
+  return [
+    `האירוע הזה כבר אצלנו ${status} 🙌`,
+    `📌 ${existing.event_name}${existing.date ? ` · ${longDate(existing.date)}` : ""}`,
+    "",
+    "אין צורך לשלוח אותו שוב. משהו לא נכון? פשוט כתבו לנו כאן מה לתקן.",
+  ].join("\n");
 }
 
 // A correction the submitter sent right after their event. Goes to Stav as plain text
@@ -1972,7 +2051,7 @@ function cancellableEventsFor(sender, today = todayIso()) {
 }
 
 function cancelLabel(event) {
-  return event.date ? `${event.event_name} — ${shortDate(event.date)}` : event.event_name;
+  return event.date ? `${event.event_name} — ${longDate(event.date)}` : event.event_name;
 }
 
 function cancelConfirmText(event) {
@@ -2205,6 +2284,8 @@ async function handleActiveSubmission(sender, text, mediaUrls, { rateCounted = f
     clearSession(sender);
     recentlyCompleted.add(sender);
     saveState();
+    const duplicate = findDuplicateEvent(event);
+    if (duplicate) return acknowledgeDuplicate(sender, duplicate);
     const { id } = appendEvent(event, "Twilio WhatsApp", sender);
     lastSubmittedEventId.set(sender, id);
     const flyer = persistFlyer(id, firstImage);
@@ -2240,6 +2321,8 @@ async function handleActiveSubmission(sender, text, mediaUrls, { rateCounted = f
   clearSession(sender);
   recentlyCompleted.add(sender);
   saveState();
+  const duplicate = findDuplicateEvent(event);
+  if (duplicate) return acknowledgeDuplicate(sender, duplicate);
   const { id } = appendEvent(event, "Twilio WhatsApp", sender);
   lastSubmittedEventId.set(sender, id);
   const flyer = persistFlyer(id, firstImage);
@@ -2262,13 +2345,13 @@ async function handleActiveSubmission(sender, text, mediaUrls, { rateCounted = f
 // location only surfaced after publication — or never. Echo back what was actually
 // extracted: wrong fields are obvious at a glance, and the next message can correct them.
 function formatSubmissionReceipt(event, flyer = "") {
-  const [, , month, day] = (event.date || "").match(/^(\d{4})-(\d{2})-(\d{2})$/) || [];
+  const day = /^\d{4}-\d{2}-\d{2}$/.test(event.date || "");
   const lines = [
     "קיבלנו את האירוע! 🎉 הוא נכנס לבדיקה לפני פרסום.",
     "",
     "זה מה שקלטנו:",
     event.event_name ? `📌 ${event.event_name}` : null,
-    day ? `📅 ${Number(day)}.${Number(month)}${event.start_time ? ` בשעה ${event.start_time}` : ""}` : null,
+    day ? `📅 ${longDate(event.date)}${event.start_time ? ` בשעה ${event.start_time}` : ""}` : null,
     event.location ? `📍 ${event.location}` : null,
     event.price ? `💸 ${event.price}` : null,
     event.contact_link ? `🔗 ${event.contact_link}` : null,
@@ -2364,7 +2447,7 @@ function recordDailyDays(sender, pending, dates, map, { askForOtherDate = false 
   if (askForOtherDate) map.set(sender, { ...pending, expectingDate: true });
   else map.delete(sender);
   saveState();
-  const when = [...dates].sort().map(shortDate).join(", ");
+  const when = [...dates].sort().map(longDate).join(", ");
   const done = `סגור — נשלח אותו להודעה היומית ב-${when}. 🙌`;
   return askForOtherDate ? `${done}\n\n${ASK_OTHER_DATE_TEXT}` : done;
 }

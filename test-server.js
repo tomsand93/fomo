@@ -300,8 +300,11 @@ async function demo() {
     location: "השועל והכרם", category: "אוכל ויין", price: "", organizer: "",
     contact_link: "https://example.com/wine", description: "פלייט של 3 יינות ב-180 שח",
   };
+  // Numbered, because each call stands for a different event: the same draft twice is
+  // one event submitted again, and is held as a duplicate rather than saved.
+  let draftCount = 0;
   function draftWithQuestions(questions) {
-    const draft = { ...completeDraft };
+    const draft = { ...completeDraft, event_name: `${completeDraft.event_name} ${++draftCount}` };
     Object.defineProperty(draft, "_questions", { value: questions, enumerable: false });
     return draft;
   }
@@ -1058,8 +1061,77 @@ async function demo() {
   const { buildSlotPosts } = require("./server");
   const slotPosts = buildSlotPosts(promotedEvents.slice(1, 2), "2026-10-14", "18:00");
   if (slotPosts.length !== 3) throw new Error("no events today: the note, the promoted message and the board");
-  if (!slotPosts[0].includes("1. אירועים בימים הקרובים") || !slotPosts[0].includes("2. הלוח השבועי") || !slotPosts[0].includes("אין אירועים שמתקיימים היום")) {
-    throw new Error(`the note should number exactly the messages sent, got: ${slotPosts[0]}`);
+  const note = slotPosts[0].text;
+  // Each message is named by its own first line, the thing Stav actually sees in the chat.
+  // This event has a flyer, so it is its own post, named by the event.
+  if (!note.includes("1. תמונה ופרטים: בעוד שבוע") || !note.includes(`2. "${slotPosts[2].text.split("\n")[0]}"`)) {
+    throw new Error(`the note should name each message by its title, got: ${note}`);
+  }
+  if (!note.includes("2 הודעות") || !note.includes("אין אירועים שמתקיימים היום")) {
+    throw new Error(`the note should count the messages and say there is nothing today, got: ${note}`);
+  }
+
+  // An event with an unsent flyer goes as its own image post, not also inside the text.
+  {
+    const flyerLinks = { linkFor: () => "", flyerUrl: (e) => (e.flyer ? `https://x/${e.flyer}` : "") };
+    const day = [
+      { id: "1", status: "published", event_name: "עם פלייר", date: "2026-10-14", start_time: "20:00", location: "חיפה", flyer: "a.jpg" },
+      { id: "2", status: "published", event_name: "בלי פלייר", date: "2026-10-14", start_time: "21:00", location: "חיפה" },
+    ];
+    const posts = buildSlotPosts(day, "2026-10-14", "18:00", flyerLinks);
+    const today = posts.find((p) => p.text.startsWith("מה עושים היום"));
+    const flyerPost = posts.find((p) => p.mediaUrl);
+    if (!today || today.text.includes("עם פלייר") || !today.text.includes("בלי פלייר")) {
+      throw new Error("a flyered event must leave the today text, which keeps the rest");
+    }
+    if (!flyerPost || !flyerPost.text.includes("עם פלייר") || flyerPost.eventId !== "1") {
+      throw new Error("a flyered event must go as its own image post");
+    }
+    if (posts.indexOf(flyerPost) !== posts.indexOf(today) + 1) {
+      throw new Error("the flyer post must follow the section it belongs to");
+    }
+    if (!flyerPost.text.includes("יום רביעי 14.10")) throw new Error("a forwarded post's date must carry its day name");
+    const sentAlready = buildSlotPosts(day.map((e) => ({ ...e, flyer_sent_at: "2026-10-13T10:00:00Z" })), "2026-10-14", "18:00", flyerLinks);
+    if (sentAlready.some((p) => p.mediaUrl) || !sentAlready.find((p) => p.text.startsWith("מה עושים היום")).text.includes("עם פלייר")) {
+      throw new Error("once its flyer went out, the event is back in the text");
+    }
+  }
+
+  // The weekend's 18:00 leaves out what its 12:00 already sent and has since started.
+  {
+    const friday = "2026-10-23";
+    const day = [
+      { id: "1", status: "published", event_name: "בוקר", date: friday, start_time: "10:00", end_time: "20:00", location: "חיפה" },
+      { id: "2", status: "published", event_name: "ערב", date: friday, start_time: "21:00", location: "חיפה" },
+      { id: "3", status: "published", event_name: "מקודם", date: "2026-10-24", start_time: "20:00", location: "חיפה", daily_days: friday },
+    ];
+    const todayOf = (posts) => (posts.find((p) => p.text.startsWith("מה עושים היום")) || { text: "" }).text;
+    const noon = buildSlotPosts(day, friday, "12:00");
+    if (!todayOf(noon).includes("בוקר") || !todayOf(noon).includes("ערב") || !noon.some((p) => p.text.startsWith("מה עושים בקרוב"))) {
+      throw new Error("the noon slot carries everything for the day");
+    }
+    const evening = buildSlotPosts(day, friday, "18:00");
+    if (todayOf(evening).includes("בוקר")) throw new Error("a morning event must not go out again in the evening");
+    if (!todayOf(evening).includes("ערב")) throw new Error("an evening event still goes in the evening slot");
+    if (evening.some((p) => p.text.startsWith("מה עושים בקרוב"))) throw new Error("promoted events go once, at noon");
+    if (!evening[0].text.includes("12:00")) throw new Error("the note should say what the noon slot already covered");
+    const weekday = buildSlotPosts(day.map((e) => ({ ...e, date: "2026-10-22", daily_days: "" })), "2026-10-22", "18:00");
+    if (!todayOf(weekday).includes("בוקר")) throw new Error("with no noon slot, the evening slot keeps the day's earlier events");
+  }
+
+  // The same event submitted twice is listed once.
+  {
+    const { isSameEvent, withoutDuplicates } = require("./events-store");
+    const a = { id: "69", status: "published", event_name: "SEE GARDEN — Season Closing", date: "2026-10-23", start_time: "19:00", location: "הרב אוחנה 4, חיפה" };
+    const b = { ...a, id: "71", event_name: "SEE GARDEN — SEASON CLOSING" };
+    if (!isSameEvent(a, b)) throw new Error("a name differing only in case is the same event");
+    if (!isSameEvent(a, { ...a, id: "72", event_name: "סגירת עונה" })) throw new Error("the same address and hour is the same event");
+    if (isSameEvent(a, { ...a, start_time: "21:00" })) throw new Error("another hour is another event");
+    const city = { ...a, location: "חיפה" };
+    if (isSameEvent(city, { ...city, event_name: "משהו אחר" })) throw new Error("a bare city is not an address");
+    if (withoutDuplicates([a, b]).length !== 1 || withoutDuplicates([a, b])[0].id !== "69") throw new Error("the first copy is kept");
+    const board = makeWeekly([a, b], "2026-10-22");
+    if (board.split("SEE GARDEN").length !== 2) throw new Error("the board must list a duplicated event once");
   }
 
   // The range must end on the last day that actually has an event: with empty days
@@ -1299,7 +1371,7 @@ async function demo() {
   await routeMessage(dateAnswerSender, "2");
   await routeMessage(
     dateAnswerSender,
-    `שם האירוע: בדיקת סדר\nתאריך: ${inDays(20)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/6`
+    `שם האירוע: בדיקת סדר\nתאריך: ${inDays(20)}\nשעה: 20:10\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/6`
   );
   // Pick by intent, not position: the option list gained a decline entry at the end.
   const lastKey = awaitingPublishChoice.get(dateAnswerSender).options
@@ -1469,7 +1541,7 @@ async function demo() {
   await routeMessage(declineSender, "2");
   await routeMessage(
     declineSender,
-    `שם האירוע: בדיקת סירוב\nתאריך: ${inDays(20)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/4`
+    `שם האירוע: בדיקת סירוב\nתאריך: ${inDays(20)}\nשעה: 20:20\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/4`
   );
   const declineKey = awaitingPublishChoice.get(declineSender).options
     .find((o) => o.date === "decline").key;
@@ -1493,7 +1565,7 @@ async function demo() {
   await routeMessage(otherSender, "2");
   await routeMessage(
     otherSender,
-    `שם האירוע: בדיקת תאריך\nתאריך: ${inDays(20)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/8`
+    `שם האירוע: בדיקת תאריך\nתאריך: ${inDays(20)}\nשעה: 20:30\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/8`
   );
   const otherKey = awaitingPublishChoice.get(otherSender).options
     .find((o) => o.date === null).key;
@@ -1518,7 +1590,7 @@ async function demo() {
   await routeMessage(cancelSender, "2");
   await routeMessage(
     cancelSender,
-    `שם האירוע: בדיקת ביטול\nתאריך: ${inDays(20)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/7`
+    `שם האירוע: בדיקת ביטול\nתאריך: ${inDays(20)}\nשעה: 20:40\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/7`
   );
   await routeMessage(cancelSender, "ביטול");
   if (awaitingPublishChoice.has(cancelSender)) {
@@ -1778,7 +1850,7 @@ async function demo() {
   await routeMessage(tapSender, "2");
   await routeMessage(
     tapSender,
-    `שם האירוע: בדיקת כפתור\nתאריך: ${inDays(20)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/5`
+    `שם האירוע: בדיקת כפתור\nתאריך: ${inDays(20)}\nשעה: 20:50\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/5`
   );
   if (!awaitingPublishChoice.has(tapSender)) {
     throw new Error("the publish-day question should be open before testing a tap");
@@ -2018,7 +2090,7 @@ async function demo() {
     await routeMessage(multi, "2");
     await routeMessage(
       multi,
-      `שם האירוע: כמה ימים ${i}\nתאריך: ${inDays(15)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/m`
+      `שם האירוע: כמה ימים ${i}\nתאריך: ${inDays(15)}\nשעה: 2${i}:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/m`
     );
     const reply = await routeMessage(multi, answer);
     if (!reply.includes("נשלח אותו להודעה היומית")) {
@@ -2029,12 +2101,26 @@ async function demo() {
       throw new Error(`"${answer}" should record both days, got ${row.daily_days}`);
     }
   }
+  // The same event sent in again is acknowledged, not filed a second time.
+  {
+    const again = "whatsapp:+972500009570";
+    const text = `שם האירוע: פעמיים\nתאריך: ${inDays(16)}\nשעה: 22:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/d`;
+    await routeMessage(again, "2");
+    await routeMessage(again, text);
+    await routeMessage(again, "ביטול"); // leave the publish-day question
+    await routeMessage(again, "2");
+    const reply = await routeMessage(again, text);
+    const copies = eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.event_name === "פעמיים");
+    if (copies.length !== 1) throw new Error(`a resubmitted event must be filed once, got ${copies.length}`);
+    if (!reply.includes("כבר אצלנו")) throw new Error(`a resubmission should be told it is already in, got: ${reply}`);
+  }
+
   // A number that is not an option must not be half-accepted.
   const badMulti = "whatsapp:+972500009560";
   await routeMessage(badMulti, "2");
   await routeMessage(
     badMulti,
-    `שם האירוע: מספר שגוי\nתאריך: ${inDays(15)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/b`
+    `שם האירוע: מספר שגוי\nתאריך: ${inDays(15)}\nשעה: 19:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/b`
   );
   if (!(await routeMessage(badMulti, "1, 9")).includes("אפשר לבחור כמה")) {
     throw new Error("an answer with an out-of-range number should re-ask");

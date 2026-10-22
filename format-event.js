@@ -6,7 +6,7 @@
 //
 //   SHORT - the rolling board. One glance per event, 1-2 lines.
 //   LONG  - the daily message. The full pitch, 5-7 lines plus the flyer as media.
-const { shortDate } = require("./clock");
+const { longDate } = require("./clock");
 
 const CATEGORY_ICONS = {
   "קולנוע": "🎬",
@@ -118,10 +118,12 @@ function formatLong(event, { linkFor = defaultLinkFor, flyerUrl = () => "", with
   // A festival names its last day even under a day heading, or readers take it for
   // a one-night thing.
   const multiDay = event.end_date && event.end_date > event.date;
+  // With the day name, as everywhere else a date is shown: Stav asked again on
+  // 22/10/2026, after a forwarded post read "📅 22.10" alone.
   if (withDate && event.date) {
-    when.push(`📅 ${shortDate(event.date)}${multiDay ? `–${shortDate(event.end_date)}` : ""}`);
+    when.push(`📅 ${longDate(event.date)}${multiDay ? `–${longDate(event.end_date)}` : ""}`);
   } else if (multiDay) {
-    when.push(`📅 עד ${shortDate(event.end_date)}`);
+    when.push(`📅 עד ${longDate(event.end_date)}`);
   }
   if (event.start_time) {
     when.push(`🕗 ${event.start_time}${event.end_time ? `-${event.end_time}` : ""}`);

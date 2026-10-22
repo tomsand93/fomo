@@ -248,6 +248,35 @@ function runsOn(event, date) {
   return Boolean(event.date) && event.date <= date && date <= lastDay(event);
 }
 
+// One event sent in twice: the same day and hour, under the same name or at the same
+// address. Both cases reached the board side by side on 21/10/2026 — SEE GARDEN from two
+// organisers (#69, #71), differing only in capitals, and BEN BAND sent twice by one
+// submitter (#73, #74), differing only in the description. Case, spacing and
+// punctuation are ignored, because that is all that told those copies apart.
+//
+// An address only counts when it has a street number: "חיפה" alone is the location of
+// many unrelated events, and two of them at the same hour are not one event.
+function matchKey(text) {
+  return String(text || "").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+function isSameEvent(a, b) {
+  if (!a.date || a.date !== b.date || (a.start_time || "") !== (b.start_time || "")) return false;
+  const name = matchKey(a.event_name);
+  const place = matchKey(a.location);
+  if (name && name === matchKey(b.event_name)) return true;
+  return /\d/.test(place) && place === matchKey(b.location);
+}
+
+// Keeps the first of each set of copies, so the one submitted first is the one shown.
+function withoutDuplicates(events) {
+  const kept = [];
+  for (const event of events) {
+    if (!kept.some((other) => isSameEvent(other, event))) kept.push(event);
+  }
+  return kept;
+}
+
 function updateEvent(filePath, id, changes) {
   const events = loadEvents(filePath);
   const index = events.findIndex((e) => e.id === String(id));
@@ -271,6 +300,8 @@ module.exports = {
   findEvent,
   lastDay,
   runsOn,
+  isSameEvent,
+  withoutDuplicates,
   cleanEndDate,
   parseCsvLine,
   makeSlug,
