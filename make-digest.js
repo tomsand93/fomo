@@ -92,12 +92,15 @@ function digestFlyerEvents(events, targetDate) {
 // (daily_days). That choice used to be recorded and then ignored: the submitter was told
 // "we'll send it in the daily message on X" and it never went out (14/10/2026).
 // A multi-day event counts as today's on every day it runs.
+//
+// No location is not a reason to leave an approved event out: Last Summer Sunset (#80)
+// was approved without one and silently missed its own day's message (23/10/2026),
+// while the board, which never required it, listed it. formatLong omits the line.
 function digestEvents(events, targetDate) {
   return withoutDuplicates(events
     .filter((event) =>
       event.status === "published" &&
       event.start_time &&
-      event.location &&
       (runsOn(event, targetDate) ||
         (event.date > targetDate && (event.daily_days || "").split(",").includes(targetDate)))
     ))

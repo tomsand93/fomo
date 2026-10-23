@@ -1097,6 +1097,13 @@ async function demo() {
     }
   }
 
+  // An approved event with no location still makes its day's message.
+  {
+    const { digestEvents } = require("./make-digest");
+    const noPlace = { id: "80", status: "published", event_name: "Last Summer Sunset", date: "2026-10-23", start_time: "12:00", location: "" };
+    if (!digestEvents([noPlace], "2026-10-23").length) throw new Error("a missing location must not drop an approved event");
+  }
+
   // The weekend's 18:00 leaves out what its 12:00 already sent and has since started.
   {
     const friday = "2026-10-23";
