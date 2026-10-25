@@ -409,12 +409,44 @@ async function confirmBoardDelivery(key, sid) {
       console.error(
         `${key} board was not delivered (status=${status.status}, error=${status.error_code}); queued for the next admin contact`
       );
+      // Waiting for her next message lost every Saturday she didn't happen to write
+      // (24/10/2026: both slots, on a busy day). The template is the one thing a closed
+      // window lets through; her tap reopens it, and that flushes the queue.
+      await sendSlotReadyPing(key);
       return;
     }
     pendingBoards.delete(key);
     saveState();
   } catch (err) {
     console.error(`failed to confirm delivery of ${key} board:`, err);
+  }
+}
+
+// Approved by Meta as a Utility template (submit-slot-ready-template.js). Its single
+// button sends SLOT_READY_KEY back, which handleAdminMessage answers by flushing the
+// queued boards.
+const SLOT_READY_TEMPLATE = "fomo_slot_ready";
+const SLOT_READY_KEY = "שלח";
+const SLOT_READY_OPTIONS = [
+  { key: "שלח", label: "לקבל את ההודעות" },
+];
+
+async function sendSlotReadyPing(key) {
+  try {
+    await ensureTemplates();
+    if (!approvedTemplateSid(SLOT_READY_TEMPLATE)) {
+      console.error(`${SLOT_READY_TEMPLATE} is not approved; the ${key} board waits for her next message`);
+      return;
+    }
+    const slot = key.slice(11); // `${date}:${slot}`
+    await sendChoice(ADMIN_SENDER, {
+      text: `ההודעות להעברה לקבוצה ב-${slot} מוכנות.`,
+      options: SLOT_READY_OPTIONS,
+      template: SLOT_READY_TEMPLATE,
+      variables: { 1: slot },
+    });
+  } catch (err) {
+    console.error(`failed to send the slot-ready ping for ${key}:`, err);
   }
 }
 
@@ -428,23 +460,35 @@ async function confirmBoardDelivery(key, sid) {
 // time; a call that arrives mid-flush just waits for it instead of racing it.
 let flushingBoards = null;
 
+// Resolves to how many boards went out, so a tap on the slot-ready button can say so.
 async function flushPendingBoards() {
-  if (process.env.NODE_ENV === "test" || !pendingBoards.size) return;
+  if (process.env.NODE_ENV === "test" || !pendingBoards.size) return 0;
   if (flushingBoards) return flushingBoards;
   flushingBoards = (async () => {
+    let sent = 0;
+    const today = israelClock(new Date()).date;
     for (const [key, post] of [...pendingBoards.entries()]) {
       if (!pendingBoards.has(key)) continue; // sent by an earlier flush already
+      // A board from a day that has passed headlines "what's on today" for yesterday;
+      // forwarding it would mislead the group, so it is dropped, not sent late.
+      if (key.slice(0, 10) < today) {
+        console.error(`dropping the ${key} board: its day has passed`);
+        pendingBoards.delete(key);
+        continue;
+      }
       try {
         await sendWhatsApp(ADMIN_SENDER, post);
         pendingBoards.delete(key);
+        sent += 1;
       } catch (err) {
         console.error(`failed to re-send ${key} board:`, err);
       }
     }
     saveState();
+    return sent;
   })();
   try {
-    await flushingBoards;
+    return await flushingBoards;
   } finally {
     flushingBoards = null;
   }
@@ -1631,7 +1675,7 @@ const ADMIN_COMMAND_RE = /^(אשר|דחה)(?:\s*#?(\d+))?\s*(.*)$/;
 // The subset of admin commands unambiguous enough to run from customer mode: a bare
 // button payload, or approve/reject with an id. Not ADMIN_COMMAND_RE itself, which
 // accepts any text that merely starts with "אשר".
-const ADMIN_ONLY_COMMAND_RE = /^(?:(?:אשר|דחה)(?:\s*#?\d+.*)?|ממתינים|תקן\s*#?\d+.*)$/s;
+const ADMIN_ONLY_COMMAND_RE = /^(?:(?:אשר|דחה)(?:\s*#?\d+.*)?|ממתינים|שלח|תקן\s*#?\d+.*)$/s;
 
 // Approving and rejecting are irreversible from the submitter's point of view - they get a
 // "your event was published/declined" message either way - so the target is never guessed.
@@ -1705,8 +1749,15 @@ async function handleAdminMessage(text, repliedSid = "") {
   const trimmed = text.trim();
   // Her message just reopened the 24h WhatsApp window, so any board Twilio dropped with
   // 63016 can finally be delivered. Detached: a slow re-send must not delay her reply.
-  flushPendingBoards();
+  const flushing = flushPendingBoards();
   const banner = missedNoticesBanner(loadEvents(EVENTS_FILE));
+
+  // A tap on the slot-ready button. Waits for the flush, so this reply lands after the
+  // boards instead of above them.
+  if (trimmed === SLOT_READY_KEY) {
+    const sent = await flushing;
+    return `${banner}${sent ? "אלה כל ההודעות שחיכו." : "אין הודעות שמחכות כרגע."}`;
+  }
 
   // "צפיות" on its own gives the busiest events; with an id, that event alone.
   if (trimmed === "צפיות" || trimmed.startsWith("צפיות ")) {

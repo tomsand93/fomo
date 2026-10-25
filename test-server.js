@@ -264,6 +264,12 @@ async function demo() {
     throw new Error("missed-notice warning should not persist after the event was handled");
   }
 
+  // A tap on the slot-ready template's button is a command, not unrecognised text.
+  const slotReadyTap = await routeMessage(ADMIN, "שלח");
+  if (!slotReadyTap.includes("אין הודעות שמחכות")) {
+    throw new Error("the slot-ready button should answer about the queued boards, not show the help text");
+  }
+
   // Admin corrections: Stav fixes a field, the event updates, and the correction is
   // recorded so later extractions can be told about it.
   const { buildCorrectionGuidance, correctionsPath, loadCorrections } = require("./corrections-store");
