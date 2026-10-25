@@ -12,7 +12,7 @@ const extractEventModule = require("./extract-event");
 const intentModule = require("./classify-intent");
 const { addCorrection, buildCorrectionGuidance } = require("./corrections-store");
 const answerInquiryModule = require("./answer-inquiry");
-const { sendWhatsApp, getMessageStatus } = require("./send-whatsapp");
+const { sendWhatsApp, getMessageStatus, postForm } = require("./send-whatsapp");
 const { fetchMediaAsDataUrl } = require("./fetch-media");
 const { saveFlyer, flyerPath, contentTypeFor, deleteFlyer } = require("./flyer-store");
 const { logClick, logInteraction, clickStats, pruneOlderThan } = require("./clicks-store");
@@ -431,14 +431,29 @@ const SLOT_READY_OPTIONS = [
   { key: "שלח", label: "לקבל את ההודעות" },
 ];
 
+// Stopgap while SLOT_READY_TEMPLATE awaits Meta: an already-approved template whose
+// variables are free text. It has no button, so {{1}} asks her to write anything; any
+// message from her flushes the queue. Body: "היי! 👋 עוד קצת ומתחיל {{1}}, ב-{{2}}. תהנו! 🎈"
+const SLOT_READY_FALLBACK_TEMPLATE = "fomo_event_reminder";
+const SLOT_READY_FALLBACK_TEXT = "סבב ההודעות לקבוצה (כתבו כאן כל דבר כדי לקבל אותן)";
+
 async function sendSlotReadyPing(key) {
   try {
     await ensureTemplates();
+    const slot = key.slice(11); // `${date}:${slot}`
     if (!approvedTemplateSid(SLOT_READY_TEMPLATE)) {
-      console.error(`${SLOT_READY_TEMPLATE} is not approved; the ${key} board waits for her next message`);
+      const fallbackSid = approvedTemplateSid(SLOT_READY_FALLBACK_TEMPLATE);
+      if (!fallbackSid) {
+        console.error(`neither ${SLOT_READY_TEMPLATE} nor ${SLOT_READY_FALLBACK_TEMPLATE} is approved; the ${key} board waits for her next message`);
+        return;
+      }
+      await postForm({
+        To: ADMIN_SENDER,
+        ContentSid: fallbackSid,
+        ContentVariables: JSON.stringify({ 1: SLOT_READY_FALLBACK_TEXT, 2: slot }),
+      });
       return;
     }
-    const slot = key.slice(11); // `${date}:${slot}`
     await sendChoice(ADMIN_SENDER, {
       text: `ההודעות להעברה לקבוצה ב-${slot} מוכנות.`,
       options: SLOT_READY_OPTIONS,
