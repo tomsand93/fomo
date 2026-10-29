@@ -373,6 +373,51 @@ async function run() {
   }
   process.env.REMINDERS_ENABLED = "1";
 
+  console.log("\nthe weekly publisher nudge");
+  // The real header: the nudge reads `submitter`, which writeEvents above leaves out.
+  const PUBLISHER_A = "whatsapp:+972500000011";
+  const PUBLISHER_B = "whatsapp:+972500000012";
+  fs.writeFileSync(TEST_EVENTS_FILE, [
+    "id,status,event_name,date,start_time,end_time,location,category,price,organizer,contact_link,description,source,published_at,notes,submitter,flyer",
+    `1,published,ערב ג'אז,2026-08-20,20:00,,חיפה,מוזיקה,,,,,,,,${PUBLISHER_A},`,
+    `2,published,עוד ערב,2026-08-21,20:00,,חיפה,מוזיקה,,,,,,,,${PUBLISHER_A},`,
+    `3,rejected,סדנה,2026-08-22,18:00,,חיפה,סדנה,,,,,,,,${PUBLISHER_B},`,
+    "4,published,של סתיו,2026-08-23,18:00,,חיפה,סדנה,,,,,,,,whatsapp:+972528762432,",
+    "5,published,בלי שולח,2026-08-24,18:00,,חיפה,סדנה,,,,,,,,,",
+  ].join("\n") + "\n", "utf8");
+  if (fs.existsSync(TEST_STATE_FILE)) fs.unlinkSync(TEST_STATE_FILE);
+  delete require.cache[require.resolve("./server")];
+  const server6 = require("./server");
+
+  // 2026-08-26 is a Wednesday; Israel is UTC+3, so 18:00 local is 15:00Z.
+  const wed = (hhmm) => new Date(`2026-08-26T${hhmm}:00Z`);
+  const nudged = [];
+  const recordNudge = async (sender) => { nudged.push(sender); };
+
+  await server6.sendDueWeeklyNudge(wed("14:55"), recordNudge);
+  check("not before 18:00", nudged.length, 0);
+  await server6.sendDueWeeklyNudge(new Date("2026-08-25T15:00:00Z"), recordNudge);
+  check("not on a Tuesday at 18:00", nudged.length, 0);
+  await server6.sendDueWeeklyNudge(wed("15:00"), recordNudge);
+  check("every submitter once, never Stav or a blank", nudged, [PUBLISHER_A, PUBLISHER_B]);
+  await server6.sendDueWeeklyNudge(wed("15:05"), recordNudge);
+  check("only once per Wednesday", nudged.length, 2);
+
+  delete require.cache[require.resolve("./server")];
+  const server7 = require("./server");
+  await server7.sendDueWeeklyNudge(wed("15:10"), recordNudge);
+  check("not again after a restart", nudged.length, 2);
+
+  const optOut = await server7.routeMessage(PUBLISHER_B, server7.NUDGE_OPTIONS[1].key);
+  checkTrue("opting out is confirmed", optOut.includes("הסרנו"));
+  check("next week skips whoever opted out",
+    server7.nudgeRecipients(require("./make-digest").loadEvents(TEST_EVENTS_FILE)), [PUBLISHER_A]);
+  delete require.cache[require.resolve("./server")];
+  check("the opt-out survives a restart", require("./server").nudgeOptOuts.has(PUBLISHER_B), true);
+  check("the template's buttons match the options",
+    require("./send-interactive").templateButtonKeys(server7.NUDGE_TEMPLATE),
+    server7.NUDGE_OPTIONS.map((option) => option.key));
+
   for (const file of [TEST_EVENTS_FILE, TEST_REMINDERS_FILE, TEST_STATE_FILE]) {
     if (fs.existsSync(file)) fs.unlinkSync(file);
   }

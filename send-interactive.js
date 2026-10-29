@@ -112,6 +112,7 @@ const TEMPLATE_BUTTON_KEYS = new Map([
   ["fomo_review_event_v2", ["אשר", "דחה", "ממתינים"]],
   ["fomo_review_event", ["אשר", "דחה", "ממתינים"]],
   ["fomo_slot_ready", ["שלח"]],
+  ["fomo_weekly_nudge", ["2", "הסר"]],
 ]);
 
 function templateButtonKeys(name) {

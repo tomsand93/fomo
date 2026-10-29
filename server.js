@@ -18,7 +18,7 @@ const { saveFlyer, flyerPath, contentTypeFor, deleteFlyer } = require("./flyer-s
 const { logClick, logInteraction, clickStats, pruneOlderThan } = require("./clicks-store");
 const { sendChoice, renderNumbered, approvedTemplateSid, ensureTemplates } = require("./send-interactive");
 const remindersStore = require("./reminders-store");
-const { deliverReminder, REMINDER_TEMPLATE } = require("./send-reminder");
+const { deliverReminder, REMINDER_TEMPLATE, windowIsOpen } = require("./send-reminder");
 
 const PORT = Number(process.env.PORT || 3000);
 const EVENTS_FILE = process.env.EVENTS_FILE || "events.csv";
@@ -87,8 +87,13 @@ function loadState() {
     awaitingDailyChoice = new Map(raw.awaitingDailyChoice || []);
     sentBoards = new Set(raw.sentBoards || []);
     sentReminders = new Set(raw.sentReminders || []);
+    sentNudges = new Set(raw.sentNudges || []);
+    nudgeOptOuts = new Set(raw.nudgeOptOuts || []);
     lastButtonEventId = raw.lastButtonEventId || "";
-    pendingBoards = new Map(raw.pendingBoards || []);
+    // Older state held each board as one joined string; it goes out as a single post.
+    pendingBoards = new Map(
+      (raw.pendingBoards || []).map(([key, posts]) => [key, Array.isArray(posts) ? posts : [{ text: posts }]])
+    );
     undeliveredAdminNotices = new Set(raw.undeliveredAdminNotices || []);
     askedForClarification = new Set(raw.askedForClarification || []);
     incompleteAttempts = new Map(raw.incompleteAttempts || []);
@@ -123,6 +128,9 @@ function writeStateNow() {
     // Only the last few send-windows matter; older keys can never fire again.
     sentBoards: [...sentBoards].slice(-20),
     sentReminders: [...sentReminders].slice(-14),
+    sentNudges: [...sentNudges].slice(-8),
+    // Never bounded: dropping an opt-out would start messaging someone who said stop.
+    nudgeOptOuts: [...nudgeOptOuts],
     lastButtonEventId,
     pendingBoards: [...pendingBoards.entries()].slice(-10),
     undeliveredAdminNotices: [...undeliveredAdminNotices],
@@ -229,8 +237,10 @@ const LOG_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // send window re-sent the board despite the comment promising otherwise — and Fly
 // suspends this machine when idle (auto_stop_machines), making restarts routine.
 let sentBoards = new Set(); // `${date}:${slot}` already sent, so a restart can't double-post
-let pendingBoards = new Map(); // `${date}:${slot}` -> post text that Twilio accepted but never delivered
+let pendingBoards = new Map(); // `${date}:${slot}` -> [{ text, mediaUrl, eventId }] Twilio accepted but never delivered
 let sentReminders = new Set(); // `${date}` already reminded, so a restart can't send twice
+let sentNudges = new Set(); // `${date}` the weekly publisher nudge already went out, same reason
+let nudgeOptOuts = new Set(); // senders who answered the weekly nudge with "הסר"
 // The event whose review buttons were sent last and not yet acted on. Persisted, because
 // Fly suspends this machine between messages: in memory it was gone by the time Stav
 // tapped, and a bare "אשר" from a button then had nothing to resolve against — which is
@@ -335,8 +345,6 @@ function buildSlotPosts(events, localDate, slot = "", links = { linkFor: shortLi
   return [{ text: intro.join("\n") }, ...posts.map(({ text, mediaUrl = "", eventId = "" }) => ({ text, mediaUrl, eventId }))];
 }
 
-const SLOT_POST_SEPARATOR = "\n\n———\n\n";
-
 async function sendDueBoards(now = new Date()) {
   if (process.env.NODE_ENV === "test") return;
   const local = israelClock(now);
@@ -363,9 +371,10 @@ async function sendDueBoards(now = new Date()) {
       // A resolved send is not delivery: the slots fire when Stav is usually not
       // mid-conversation, so her 24h WhatsApp window is typically closed and Twilio
       // drops the message with 63016. Every board between 16 Aug and 23 Aug 2026 was
-      // lost this way, silently. Hold it until confirmed. The queued copy is text only;
-      // a flyer's event still reaches her, without its image.
-      pendingBoards.set(key, posts.map((post) => post.text).join(SLOT_POST_SEPARATOR));
+      // lost this way, silently. Hold it until confirmed. The posts stay separate (with
+      // their flyers): she forwards each one as is, and a single joined message had her
+      // cutting it apart by hand (29/10/2026).
+      pendingBoards.set(key, posts);
       saveState();
       confirmBoardDelivery(key, firstSid);
     } catch (err) {
@@ -373,8 +382,8 @@ async function sendDueBoards(now = new Date()) {
       if (sent > 0 || err.sentParts > 0) {
         // Some of it already reached Stav. Retrying from the top re-sent it every five
         // minutes, so only the rest is queued, for her next message.
-        const rest = [err.sentParts > 0 ? err.unsent : posts[sent].text, ...posts.slice(sent + 1).map((post) => post.text)];
-        pendingBoards.set(key, rest.join(SLOT_POST_SEPARATOR));
+        const rest = [err.sentParts > 0 ? { text: err.unsent } : posts[sent], ...posts.slice(sent + 1)];
+        pendingBoards.set(key, rest);
         saveState();
         continue;
       }
@@ -482,7 +491,7 @@ async function flushPendingBoards() {
   flushingBoards = (async () => {
     let sent = 0;
     const today = israelClock(new Date()).date;
-    for (const [key, post] of [...pendingBoards.entries()]) {
+    for (const [key, posts] of [...pendingBoards.entries()]) {
       if (!pendingBoards.has(key)) continue; // sent by an earlier flush already
       // A board from a day that has passed headlines "what's on today" for yesterday;
       // forwarding it would mislead the group, so it is dropped, not sent late.
@@ -491,12 +500,18 @@ async function flushPendingBoards() {
         pendingBoards.delete(key);
         continue;
       }
+      let done = 0;
       try {
-        await sendWhatsApp(ADMIN_SENDER, post);
+        for (const post of posts) {
+          await sendSlotPost(post);
+          done += 1;
+        }
         pendingBoards.delete(key);
         sent += 1;
       } catch (err) {
         console.error(`failed to re-send ${key} board:`, err);
+        // Only what didn't go out stays queued, so the next flush doesn't repeat posts.
+        if (done > 0) pendingBoards.set(key, posts.slice(done));
       }
     }
     saveState();
@@ -659,6 +674,88 @@ async function sendPendingReminder() {
   } catch (err) {
     console.error("failed to send pending reminder:", err);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Weekly nudge to publishers: Wednesday 18:00, ahead of the weekend.
+// ---------------------------------------------------------------------------
+
+// Wednesday, because that is when people are planning the weekend, and late enough in
+// the week that an event sent now still makes the Friday and Saturday slots.
+const WEEKLY_NUDGE_SLOT = { day: 3, sendHour: 18, sendMinute: 0 };
+
+// Submitted as MARKETING (submit-nudge-template.js): it is promotional, and Meta
+// re-categorised the friendlier reminder template as marketing anyway. Body:
+//   "Hi! FOMO Haifa here. The weekend is coming, got an event soon? Send me the
+//    details and I'll make sure all of Haifa hears about it."
+const NUDGE_TEMPLATE = "fomo_weekly_nudge";
+const NUDGE_OPT_OUT_KEY = "הסר";
+// "2" is the main menu's "publish an event", so a tap starts a submission exactly as
+// typing it would. The opt-out is a button too: a weekly unsolicited message has to be
+// one tap away from stopping.
+const NUDGE_OPTIONS = [
+  { key: "2", label: "יש לי אירוע לפרסם" },
+  { key: NUDGE_OPT_OUT_KEY, label: "להסיר אותי" },
+];
+const NUDGE_TEXT = `היי! 👋 כאן FOMO חיפה 🎈
+סוף השבוע כבר מתקרב, יש לכם אירוע בקרוב? שלחו לי את הפרטים ואדאג שכל חיפה תשמע עליו ✨`;
+// The free-text version cannot carry buttons, so it spells out what they would do.
+const NUDGE_FREE_TEXT = `${NUDGE_TEXT}
+
+לפרסום כתבו 2 · כדי להפסיק לקבל את התזכורת הזו כתבו "${NUDGE_OPT_OUT_KEY}"`;
+const NUDGE_OPT_OUT_TEXT = "הסרנו אתכם מהתזכורת השבועית. תמיד אפשר לשלוח לנו אירוע כאן 💙";
+
+// Everyone who has ever sent us an event, once each. Stav is excluded (she is the one
+// publishing them), as is anyone who opted out or is mid-draft — a nudge to send an
+// event, landing in the middle of sending one, would only confuse the draft.
+function nudgeRecipients(events) {
+  const recipients = new Set();
+  for (const event of events) {
+    const sender = event.submitter;
+    if (!sender || sender === ADMIN_SENDER) continue;
+    if (nudgeOptOuts.has(sender) || activeSubmissions.has(sender)) continue;
+    recipients.add(sender);
+  }
+  return [...recipients];
+}
+
+// Same clock-based slot as sendDuePendingReminder, for the same reason: setInterval(7d)
+// would never survive Fly suspending the machine.
+//
+// `deliver` is injectable so the suite can check who is messaged without sending.
+async function sendDueWeeklyNudge(now = new Date(), deliver = deliverNudge) {
+  const local = israelClock(now);
+  if (local.day !== WEEKLY_NUDGE_SLOT.day || !isDue(local, WEEKLY_NUDGE_SLOT)) return;
+  if (sentNudges.has(local.date)) return;
+  // Claimed before sending: a crash mid-run can at worst skip someone this week, never
+  // message them twice.
+  sentNudges.add(local.date);
+  saveState();
+
+  for (const sender of nudgeRecipients(loadEvents(EVENTS_FILE))) {
+    try {
+      await deliver(sender, lastActivity.get(sender) || 0);
+    } catch (err) {
+      console.error(`failed to send the weekly nudge to ${sender}:`, err);
+    }
+  }
+}
+
+// Buttons through the approved template whenever there is one. Without it, only people
+// whose 24h window is provably open get the free-text version: outside the window Twilio
+// accepts text and then drops it (63016), so sending it would only look like it worked.
+async function deliverNudge(sender, lastInboundMs) {
+  if (process.env.NODE_ENV === "test") return;
+  await ensureTemplates();
+  if (approvedTemplateSid(NUDGE_TEMPLATE)) {
+    await sendChoice(sender, { text: NUDGE_TEXT, options: NUDGE_OPTIONS, template: NUDGE_TEMPLATE });
+    return;
+  }
+  if (windowIsOpen(lastInboundMs)) {
+    await sendWhatsApp(sender, NUDGE_FREE_TEXT);
+    return;
+  }
+  console.error(`${NUDGE_TEMPLATE} is not approved and ${sender}'s window is closed; skipping their weekly nudge`);
 }
 
 // ---------------------------------------------------------------------------
@@ -2743,6 +2840,13 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
     state.inCustomerModeReply = true;
   }
 
+  // Above every flow: "stop messaging me" must work whatever state they are in.
+  if (trimmed === NUDGE_OPT_OUT_KEY) {
+    nudgeOptOuts.add(sender);
+    saveState();
+    return NUDGE_OPT_OUT_TEXT;
+  }
+
   if (CANCEL_EVENT_RE.test(trimmed)) {
     return startCancellation(sender);
   }
@@ -3103,6 +3207,7 @@ if (require.main === module) {
   // missed tick still catches it, and reading the clock each time is what survives
   // Fly suspending the machine.
   setInterval(sendDueEventReminders, BOARD_CHECK_INTERVAL_MS).unref();
+  setInterval(sendDueWeeklyNudge, BOARD_CHECK_INTERVAL_MS).unref();
   // Keeps the click and interaction logs from growing without bound on a small volume.
   setInterval(() => {
     pruneOlderThan(LOG_RETENTION_DAYS);
@@ -3121,6 +3226,12 @@ module.exports = {
   sendDueEventReminders,
   replyToReminder,
   get recentlyReminded() { return recentlyReminded; },
+  sendDueWeeklyNudge,
+  nudgeRecipients,
+  get nudgeOptOuts() { return nudgeOptOuts; },
+  NUDGE_TEMPLATE,
+  NUDGE_OPTIONS,
+  NUDGE_TEXT,
   upcomingPublishedEvents,
   get activeSubmissions() { return activeSubmissions; },
   get awaitingIntentConfirm() { return awaitingIntentConfirm; },
