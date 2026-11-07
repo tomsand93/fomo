@@ -31,7 +31,7 @@ process.env.PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://test.fomo.
 // The flyer-and-text pairing window, shortened so the suite does not sit in it.
 process.env.PAIR_WAIT_MS = "50";
 
-const { receiveInbound, looksLikeEventAnnouncement, routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, publishDayOptions, goodbyeText, goodbyeMessage, sendGoodbyes, mapsUrl, mapLink, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, awaitingIntentConfirm, offeredEscape, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS } = require("./server");
+const { receiveInbound, looksLikeEventAnnouncement, routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, publishDayOptions, goodbyeText, goodbyeMessage, sendGoodbyes, mapsUrl, mapLink, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, awaitingIntentConfirm, offeredEscape, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS, outbox, awaitingConfirmation } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -86,8 +86,22 @@ extractEventModule.extractCorrection = async (event, text) => ({ ...(CORRECTION_
 
 // Dates relative to the real clock: hardcoded ones rot into the past and the publish-day
 // options (which drop past days) change under the test.
+// The reply to a complete submission: both versions went out, and this asks to confirm.
+const CONFIRM_PROMPT = "1. כן, שלחו לבדיקה";
+
 function inDays(n) {
   return new Date(Date.now() + n * 864e5).toISOString().slice(0, 10);
+}
+
+// The publish-day question is no longer asked at submission, only after approval. This
+// confirms the sender's pending event and has Stav approve it, which opens that question.
+async function openDayQuestion(sender) {
+  const { eventId } = awaitingConfirmation.get(sender);
+  await routeMessage(sender, "1");
+  const mode = adminMode.get(ADMIN);
+  adminMode.delete(ADMIN);
+  await routeMessage(ADMIN, `אשר ${eventId}`);
+  if (mode) adminMode.set(ADMIN, mode);
 }
 
 async function demo() {
@@ -106,31 +120,23 @@ async function demo() {
   // date silently turns this into an expiry test the moment it slips into the past.
   const futureDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const eventText = `שם האירוע: מסיבת בדיקה\nתאריך: ${futureDate}\nשעה: 21:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מסיבה\nקישור: https://example.com`;
+  outbox.length = 0;
   const submitReply = await routeMessage(sender, eventText);
-  if (!submitReply.includes("קיבלנו את האירוע")) throw new Error("complete event should be accepted");
+  if (!submitReply.includes("1. כן") || !outbox.some((m) => m.text.includes("קיבלנו את האירוע"))) {
+    throw new Error("complete event should be accepted and shown for confirmation");
+  }
   if (activeSubmissions.has(sender)) throw new Error("active submission should be cleared after submission");
   if (!fs.existsSync(TEST_EVENTS_FILE)) throw new Error("event should be appended to csv");
   const csvContent = fs.readFileSync(TEST_EVENTS_FILE, "utf8");
   if (!csvContent.includes("מסיבת בדיקה")) throw new Error("csv should contain the submitted event");
 
-  // A completed submission now ends by asking which day the group message should go
-  // out, so the submitter is mid-question rather than idle.
-  if (!submitReply.includes("ללוח השבועי")) {
-    throw new Error("the receipt should say the event is already on the weekly board");
-  }
-  if (!submitReply.includes("שואל את הבוט")) {
-    throw new Error("the receipt should say the event is discoverable by asking the bot");
-  }
-  if (!awaitingPublishChoice.has(sender)) {
-    throw new Error("a completed submission should ask which day to publish");
-  }
-  const dayChosen = await routeMessage(sender, "1"); // on the day of the event
-  if (!dayChosen.includes("נשלח אותו להודעה היומית")) {
-    throw new Error("choosing a publish day should confirm the day");
-  }
+  // The publish-day question is no longer asked at submission; the organizer confirms
+  // both versions instead.
   if (awaitingPublishChoice.has(sender)) {
-    throw new Error("the publish-day question should close once answered");
+    throw new Error("a completed submission no longer asks which day to publish");
   }
+  const confirmedReply = await routeMessage(sender, "1");
+  if (!confirmedReply.includes("עבר לבדיקה")) throw new Error("confirming sends the event to review");
 
   // Regression test: right after a submission completes, a non-menu follow-up should
   // acknowledge the situation instead of silently resetting with no context.
@@ -337,7 +343,7 @@ async function demo() {
   // Even if the model stays unsure, the second pass must complete rather than re-ask.
   const resolvedReply = await routeMessage(askSender, "לא יודע");
   if (resolvedReply.includes("שאלה קטנה")) throw new Error("the submitter must never be asked twice");
-  if (!resolvedReply.includes("קיבלנו את האירוע")) throw new Error("an unresolved question should still let the event through");
+  if (!resolvedReply.includes(CONFIRM_PROMPT)) throw new Error("an unresolved question should still let the event through");
   if (activeSubmissions.has(askSender)) throw new Error("submission should close after the single clarification round");
 
   // A confident draft should not interrogate the submitter at all.
@@ -346,7 +352,7 @@ async function demo() {
   await routeMessage(quietSender, "2");
   const quietReply = await routeMessage(quietSender, "ערב יין בשועל והכרם, 5.5, כניסה חופשית");
   if (quietReply.includes("שאלה קטנה")) throw new Error("a confident draft should not ask anything");
-  if (!quietReply.includes("קיבלנו את האירוע")) throw new Error("a confident complete draft should be accepted directly");
+  if (!quietReply.includes(CONFIRM_PROMPT)) throw new Error("a confident complete draft should be accepted directly");
 
   const server = require("./server");
   const eventsStore = require("./events-store");
@@ -356,6 +362,7 @@ async function demo() {
   extractModule.extractEvent = async () => draftWithQuestions([]);
   await routeMessage(replySubmitter, "2");
   await routeMessage(replySubmitter, "ערב יין, 5.5, כניסה חופשית");
+  await routeMessage(replySubmitter, "1"); // confirmed, so it reaches Stav
   const pendingEvents = eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.status === "submitted");
   const targetId = pendingEvents[pendingEvents.length - 1].id;
 
@@ -389,9 +396,12 @@ async function demo() {
     throw new Error("reply-based approval should publish the replied-to event");
   }
 
-  // An explicit id is unambiguous too.
+  // An explicit id is unambiguous too. The approval above asked its submitter the day
+  // question; leave it first.
+  await routeMessage(replySubmitter, "תפריט");
   await routeMessage(replySubmitter, "2");
   await routeMessage(replySubmitter, "ערב יין שני, 6.6, כניסה חופשית");
+  await routeMessage(replySubmitter, "1");
   const pending2 = eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.status === "submitted");
   const explicitId = pending2[pending2.length - 1].id;
   const explicitApprove = await routeMessage(ADMIN, `אשר ${explicitId}`);
@@ -399,8 +409,10 @@ async function demo() {
 
   // REGRESSION (chat_history.txt:148-149): "2" meant the menu's "publish an event", but was
   // read as the reject shortcut and silently rejected event #10. Digits must never act.
+  await routeMessage(replySubmitter, "תפריט");
   await routeMessage(replySubmitter, "2");
   await routeMessage(replySubmitter, "ערב יין שלישי, 7.7, כניסה חופשית");
+  await routeMessage(replySubmitter, "1");
   const pending3 = eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.status === "submitted");
   const shortcutId = pending3[pending3.length - 1].id;
   server.rememberNotice("SMshortcut", shortcutId);
@@ -426,7 +438,8 @@ async function demo() {
   const adminDraft = "שם האירוע: ערב הופעות\nתאריך: 2099-09-09\nשעה: 21:00\nמיקום: שוק תלפיות\nקטגוריה: מוזיקה חיה\nקישור: https://example.com/gig";
   const adminSubmits = await routeMessage(ADMIN, adminDraft);
   if (adminSubmits.includes("פקודות ניהול")) throw new Error("a QA submission must not hit the admin handler");
-  if (!adminSubmits.includes("קיבלנו את האירוע")) throw new Error("a QA submission should be accepted like any other");
+  if (!adminSubmits.includes(CONFIRM_PROMPT)) throw new Error("a QA submission should be accepted like any other");
+  awaitingConfirmation.delete(ADMIN);
 
   const backToAdmin = await routeMessage(ADMIN, "ניהול");
   if (!backToAdmin.includes("מצב ניהול")) throw new Error('"ניהול" should switch back to admin mode');
@@ -546,19 +559,20 @@ async function demo() {
   // because they only appear in this exact sequence.
   const amendSender = "whatsapp:+972500007777";
   await routeMessage(amendSender, "2");
-  const receipt = await routeMessage(
+  outbox.length = 0;
+  await routeMessage(
     amendSender,
     'שם האירוע: לילה לבן\nתאריך: 2026-12-20\nשעה: 18:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: תרבות\nקישור: https://haifa.muni.il/x'
   );
 
-  // The receipt must echo the captured fields: a bare "we got it" gave the submitter
+  // The previews must show the captured fields: a bare "we got it" gave the submitter
   // nothing to check, so a misread date only surfaced after publication.
+  const receipt = outbox.filter((m) => m.to === amendSender).map((m) => m.text).join(" ");
   if (!receipt.includes("לילה לבן")) throw new Error("receipt should echo the event name");
   if (!receipt.includes("20.12")) throw new Error("receipt should echo the parsed date so a wrong one is visible");
   if (!receipt.includes("18:00")) throw new Error("receipt should echo the start time");
 
-  // The receipt now ends with the publish-day question, so answer it before testing
-  // what happens to a stray message afterwards.
+  // Confirm it before testing what happens to a stray message afterwards.
   await routeMessage(amendSender, "1");
 
   // A correction must reach Stav, not be discarded as a duplicate submission.
@@ -584,7 +598,7 @@ async function demo() {
     amendSender,
     'שם האירוע: בדיקת שאלה\nתאריך: 2026-12-21\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/1'
   );
-  await routeMessage(amendSender, "1"); // close the publish-day question first
+  await routeMessage(amendSender, "1"); // confirm it first
   const question = await routeMessage(amendSender, "מתי זה יפורסם?");
   if (!question.includes("כבר נשלח לבדיקה")) {
     throw new Error("a question after submission should be acknowledged, not forwarded as an amendment");
@@ -1284,8 +1298,9 @@ async function demo() {
     choiceSender,
     `שם האירוע: בדיקת בחירה\nתאריך: ${inDays(20)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/9`
   );
-  if (!awaitingPublishChoice.has(choiceSender)) {
-    throw new Error("the publish-day question should be open after a submission");
+  await openDayQuestion(choiceSender);
+  if (!awaitingDailyChoice.has(choiceSender)) {
+    throw new Error("the publish-day question should be open after approval");
   }
   const numericAnswer = await routeMessage(choiceSender, "2");
   if (numericAnswer.includes("העברנו")) {
@@ -1310,8 +1325,9 @@ async function demo() {
     dateAnswerSender,
     `שם האירוע: בדיקת סדר\nתאריך: ${inDays(20)}\nשעה: 20:10\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/6`
   );
+  await openDayQuestion(dateAnswerSender);
   // Pick by intent, not position: the option list gained a decline entry at the end.
-  const lastKey = awaitingPublishChoice.get(dateAnswerSender).options
+  const lastKey = awaitingDailyChoice.get(dateAnswerSender).options
     .find((o) => o.date === null).key;
   await routeMessage(dateAnswerSender, lastKey); // choose "another date"
   const typedDate = await routeMessage(dateAnswerSender, inDays(19));
@@ -1480,13 +1496,14 @@ async function demo() {
     declineSender,
     `שם האירוע: בדיקת סירוב\nתאריך: ${inDays(20)}\nשעה: 20:20\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/4`
   );
-  const declineKey = awaitingPublishChoice.get(declineSender).options
+  await openDayQuestion(declineSender);
+  const declineKey = awaitingDailyChoice.get(declineSender).options
     .find((o) => o.date === "decline").key;
   const declined = await routeMessage(declineSender, declineKey);
   if (!declined.includes("בלוח השבועי בלבד")) {
     throw new Error("declining should confirm the event stays on the weekly board only");
   }
-  if (awaitingPublishChoice.has(declineSender)) {
+  if (awaitingDailyChoice.has(declineSender)) {
     throw new Error("declining should close the question");
   }
   // Recorded, not left empty: empty means "not asked yet", and the question is asked
@@ -1504,7 +1521,8 @@ async function demo() {
     otherSender,
     `שם האירוע: בדיקת תאריך\nתאריך: ${inDays(20)}\nשעה: 20:30\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/8`
   );
-  const otherKey = awaitingPublishChoice.get(otherSender).options
+  await openDayQuestion(otherSender);
+  const otherKey = awaitingDailyChoice.get(otherSender).options
     .find((o) => o.date === null).key;
   const askedDate = await routeMessage(otherSender, otherKey);
   if (!askedDate.includes("איזה תאריך")) throw new Error('"another date" should ask for a date');
@@ -1518,7 +1536,7 @@ async function demo() {
   if (!acceptedDate.includes("נשלח אותו להודעה היומית")) {
     throw new Error("a valid future date should be accepted");
   }
-  if (awaitingPublishChoice.has(otherSender)) {
+  if (awaitingDailyChoice.has(otherSender)) {
     throw new Error("the question should close once a date is given");
   }
 
@@ -1529,8 +1547,9 @@ async function demo() {
     cancelSender,
     `שם האירוע: בדיקת ביטול\nתאריך: ${inDays(20)}\nשעה: 20:40\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/7`
   );
+  await openDayQuestion(cancelSender);
   await routeMessage(cancelSender, "ביטול");
-  if (awaitingPublishChoice.has(cancelSender)) {
+  if (awaitingDailyChoice.has(cancelSender)) {
     throw new Error('"ביטול" must clear an open publish-day question');
   }
 
@@ -1539,6 +1558,9 @@ async function demo() {
   const persisted = JSON.parse(fs.readFileSync(TEST_STATE_FILE, "utf8"));
   if (!("awaitingPublishChoice" in persisted) || !("awaitingDailyChoice" in persisted)) {
     throw new Error("both publish-choice maps must be persisted across a restart");
+  }
+  if (!("awaitingConfirmation" in persisted)) {
+    throw new Error("an open confirm question must be persisted across a restart");
   }
 
   // The goodbye fires once per published event whose date has passed, and marks the
@@ -1827,7 +1849,8 @@ async function demo() {
     tapSender,
     `שם האירוע: בדיקת כפתור\nתאריך: ${inDays(20)}\nשעה: 20:50\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/5`
   );
-  if (!awaitingPublishChoice.has(tapSender)) {
+  await openDayQuestion(tapSender);
+  if (!awaitingDailyChoice.has(tapSender)) {
     throw new Error("the publish-day question should be open before testing a tap");
   }
   // routeMessage is what handleTwilio calls once it has normalised ButtonPayload into
@@ -2050,11 +2073,11 @@ async function demo() {
     throw new Error("a paid-or-unknown-price event with no contact should be asked for one");
   }
   const afterNo = await routeMessage(noLink, "אין");
-  if (!afterNo.includes("קיבלנו את האירוע")) {
+  if (!afterNo.includes(CONFIRM_PROMPT)) {
     throw new Error(`"אין" must be accepted as an answer to the link question, got: ${afterNo}`);
   }
-  if (!awaitingPublishChoice.has(noLink)) {
-    throw new Error('an event submitted with "אין" should get the normal receipt and publish-day question');
+  if (!awaitingConfirmation.has(noLink)) {
+    throw new Error('an event submitted with "אין" should be shown for confirmation like any other');
   }
   const noLinkRow = eventsStore.loadEvents(TEST_EVENTS_FILE).find((e) => e.event_name === "בלי קישור");
   if (!noLinkRow) throw new Error('the event answered with "אין" should be filed');
@@ -2067,6 +2090,7 @@ async function demo() {
       multi,
       `שם האירוע: כמה ימים ${i}\nתאריך: ${inDays(15)}\nשעה: 2${i}:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/m`
     );
+    await openDayQuestion(multi);
     const reply = await routeMessage(multi, answer);
     if (!reply.includes("נשלח אותו להודעה היומית")) {
       throw new Error(`"${answer}" should pick several days, got: ${reply}`);
@@ -2082,7 +2106,7 @@ async function demo() {
     const text = `שם האירוע: פעמיים\nתאריך: ${inDays(16)}\nשעה: 22:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/d`;
     await routeMessage(again, "2");
     await routeMessage(again, text);
-    await routeMessage(again, "ביטול"); // leave the publish-day question
+    await routeMessage(again, "1"); // confirm it
     await routeMessage(again, "2");
     const reply = await routeMessage(again, text);
     const copies = eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.event_name === "פעמיים");
@@ -2115,6 +2139,7 @@ async function demo() {
     badMulti,
     `שם האירוע: מספר שגוי\nתאריך: ${inDays(15)}\nשעה: 19:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/b`
   );
+  await openDayQuestion(badMulti);
   if (!(await routeMessage(badMulti, "1, 9")).includes("אפשר לבחור כמה")) {
     throw new Error("an answer with an out-of-range number should re-ask");
   }
@@ -2315,6 +2340,104 @@ async function demo() {
     CORRECTION_STUB.set("מחיר 80", { price: "80" });
     await applyCorrection(id, "מחיר 80");
     if (loadCorrections(TEST_EVENTS_FILE).length !== before + 1) throw new Error("organizer correction not recorded");
+  }
+
+  // --- The organizer confirms both versions before Stav sees the event ---
+  {
+    const eventsStore = require("./events-store");
+    const { outbox, awaitingConfirmation, sendDueConfirmReminders, previewMessages } = require("./server");
+    const sender = "whatsapp:+972500017101";
+    const submit = () => routeMessage(sender, "שם האירוע: אישור\nתאריך: 2099-02-01\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מסיבה\nקישור: https://x.co");
+    const find = () => eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.submitter === sender).pop();
+    const toAdmin = () => outbox.filter((m) => m.to === ADMIN);
+
+    outbox.length = 0;
+    await routeMessage(sender, "2");
+    const reply = await submit();
+    if (!reply.includes("1. כן")) throw new Error("the reply is the confirm prompt");
+    if (outbox.filter((m) => m.to === sender).length !== 3) throw new Error("received text and two previews");
+    if (find().status !== "awaiting_confirm" || toAdmin().length) throw new Error("Stav must not see it yet");
+    if (!find().confirm_asked_at) throw new Error("the time it was asked is stored");
+    const [short, ad] = previewMessages(find());
+    if (!short.text.includes("*לוח יומי") || !ad.text.includes("*מודעה גרפית") || !ad.text.includes("📅 *")) {
+      throw new Error("previews are labelled, and the ad has the bold long date");
+    }
+    if (!ad.text.includes("🗺")) throw new Error("the ad keeps its map line");
+
+    // a correction refreshes the previews and asks again; nothing reaches Stav
+    CORRECTION_STUB.set("השעה 21:00", { start_time: "21:00" });
+    outbox.length = 0;
+    if (!(await routeMessage(sender, "השעה 21:00")).includes("1. כן")) throw new Error("asks again");
+    if (find().start_time !== "21:00" || toAdmin().length) throw new Error("applied, Stav not told");
+    if (outbox.filter((m) => m.to === sender && m.text.includes("21:00")).length !== 2) throw new Error("both previews refreshed");
+    // text that changes nothing says so
+    if (!(await routeMessage(sender, "שלום")).includes("לא הצלחנו להבין")) throw new Error("unclear");
+    // an image that fails to download changes nothing and keeps the question open
+    await routeMessage(sender, "", ["https://example.test/flyer.jpg"]);
+    if (find().status !== "awaiting_confirm" || !awaitingConfirmation.has(sender)) throw new Error("question still open");
+
+    // idle for six hours: still answers the prompt, not the menu
+    lastActivity.set(sender, Date.now() - 6 * 60 * 60 * 1000);
+    const done = await routeMessage(sender, "1");
+    if (!done.includes("עבר לבדיקה") || find().status !== "submitted") throw new Error("confirmed after idle");
+    if (toAdmin().length !== 1) throw new Error("Stav gets it once");
+    if (awaitingConfirmation.has(sender)) throw new Error("the question closes");
+
+    // ביטול cancels instead of stranding it; תפריט only closes the question
+    await routeMessage(sender, "2");
+    await routeMessage(sender, "שם האירוע: שני\nתאריך: 2099-02-02\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מסיבה\nקישור: https://x.co");
+    await routeMessage(sender, "ביטול");
+    if (find().status !== "cancelled" || awaitingConfirmation.has(sender)) throw new Error("cancelled");
+    // Another sender from here, to stay under the rate limit.
+    const other = "whatsapp:+972500017103";
+    const findOther = () => eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.submitter === other).pop();
+    await routeMessage(other, "2");
+    await routeMessage(other, "שם האירוע: שלישי\nתאריך: 2099-02-04\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מסיבה\nקישור: https://x.co");
+    if (!(await routeMessage(other, "תפריט")).includes("מה תרצו לעשות")) throw new Error("menu");
+    if (findOther().status !== "awaiting_confirm" || awaitingConfirmation.has(other)) throw new Error("menu closes the question only");
+    // it waits on Stav's pending list under its own heading, not as one to review
+    const { formatPendingList } = require("./server");
+    const listing = formatPendingList(eventsStore.loadEvents(TEST_EVENTS_FILE));
+    const unconfirmedAt = listing.indexOf("מחכים לאישור של המפרסם");
+    if (unconfirmedAt === -1 || listing.indexOf("שלישי") < unconfirmedAt) throw new Error("listed under its own heading");
+    // sent in again, it is not filed twice: the versions come back and the question reopens
+    outbox.length = 0;
+    await routeMessage(other, "2");
+    const resent = await routeMessage(other, "שם האירוע: שלישי\nתאריך: 2099-02-04\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מסיבה\nקישור: https://x.co");
+    if (!resent.includes("1. כן") || !awaitingConfirmation.has(other) || toAdmin().length) throw new Error("question reopened, Stav not told");
+    if (eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.event_name === "שלישי").length !== 1) throw new Error("filed once");
+    await routeMessage(other, "תפריט");
+
+    // a new flyer with an announcement is the next event; the first stays pending
+    await routeMessage(other, "2");
+    await routeMessage(other, "שם האירוע: רביעי\nתאריך: 2099-02-05\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מסיבה\nקישור: https://x.co");
+    await routeMessage(other, "ערב חדש ב-12.03 בשעה 21:00, בר בזל, כניסה 40 ₪", ["https://example.test/flyer.jpg"]);
+    if (!activeSubmissions.has(other) || awaitingConfirmation.has(other)) throw new Error("a new submission starts");
+    if (findOther().status !== "awaiting_confirm") throw new Error("the first event stays pending");
+    await routeMessage(other, "ביטול");
+
+    // customer-mode replies are real text
+    adminMode.set(ADMIN, "customer");
+    await routeMessage(ADMIN, "2");
+    const customer = await routeMessage(ADMIN, "שם האירוע: בדיקה\nתאריך: 2099-02-03\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מסיבה\nקישור: https://x.co");
+    if (String(customer).includes("null") || !customer.includes("1. כן")) throw new Error("banner and text");
+    adminMode.delete(ADMIN);
+    awaitingConfirmation.delete(ADMIN);
+
+    // reminder: once, after three hours
+    const waiting = eventsStore.appendEvent(TEST_EVENTS_FILE, { event_name: "ישן", date: "2099-03-01", start_time: "20:00" }, "test", "whatsapp:+972500017102", []);
+    eventsStore.updateEvent(TEST_EVENTS_FILE, waiting, { status: "awaiting_confirm", confirm_asked_at: new Date(Date.now() - 4 * 3600e3).toISOString() });
+    outbox.length = 0;
+    await sendDueConfirmReminders();
+    await sendDueConfirmReminders();
+    if (outbox.filter((m) => m.text.includes("תזכורת")).length !== 1) throw new Error("one reminder");
+    if (!awaitingConfirmation.has("whatsapp:+972500017102")) throw new Error("the reminder reopens the question");
+    // a past-dated unconfirmed event expires, and its question goes with it
+    eventsStore.updateEvent(TEST_EVENTS_FILE, waiting, { date: "2020-01-01" });
+    const { expirePastEvents } = require("./server");
+    expirePastEvents(eventsStore.loadEvents(TEST_EVENTS_FILE));
+    if (eventsStore.findEvent(TEST_EVENTS_FILE, waiting).status !== "expired") throw new Error("expired");
+    if (awaitingConfirmation.has("whatsapp:+972500017102")) throw new Error("its question is dropped");
   }
 
   fs.unlinkSync(CORRECTIONS_FILE);

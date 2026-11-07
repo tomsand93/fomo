@@ -44,6 +44,11 @@ let lastSubmittedEventId = new Map(); // sender -> id of their most recent submi
 // getting an answer is hours, and Fly suspends this machine in between.
 let awaitingPublishChoice = new Map(); // sender -> { eventId, options, expectingDate }
 let awaitingDailyChoice = new Map(); // sender -> { eventId, options, expectingDate }, asked after approval
+// sender -> { eventId, unresolved }. The organizer has seen both versions and has not yet
+// confirmed them or said what to change. Deliberately left alone by clearSession and kept
+// out of hasSessionState: the answer can come hours later, and the idle sweep must not
+// turn a late "1" into a menu choice. unresolved is what Stav's notice flags once it goes.
+let awaitingConfirmation = new Map();
 let undeliveredAdminNotices = new Set(); // event ids whose review notice never reached the admin, surfaced on her next message
 let askedForClarification = new Set(); // senders already asked a clarifying question this submission, so we never ask twice
 let incompleteAttempts = new Map(); // sender -> consecutive turns still missing required fields, so a draft can't loop forever
@@ -87,6 +92,7 @@ function loadState() {
     lastSubmittedEventId = new Map(raw.lastSubmittedEventId || []);
     awaitingPublishChoice = new Map(raw.awaitingPublishChoice || []);
     awaitingDailyChoice = new Map(raw.awaitingDailyChoice || []);
+    awaitingConfirmation = new Map(raw.awaitingConfirmation || []);
     sentBoards = new Set(raw.sentBoards || []);
     sentReminders = new Set(raw.sentReminders || []);
     sentNudges = new Set(raw.sentNudges || []);
@@ -128,6 +134,7 @@ function writeStateNow() {
     lastSubmittedEventId: [...lastSubmittedEventId.entries()].slice(-50),
     awaitingPublishChoice: [...awaitingPublishChoice.entries()].slice(-50),
     awaitingDailyChoice: [...awaitingDailyChoice.entries()].slice(-50),
+    awaitingConfirmation: [...awaitingConfirmation.entries()].slice(-50),
     // Only the last few send-windows matter; older keys can never fire again.
     sentBoards: [...sentBoards].slice(-20),
     sentReminders: [...sentReminders].slice(-14),
@@ -710,14 +717,26 @@ async function flushPendingBoards() {
 // the pending list only knew "submitted", so these never showed up there.
 const AWAITING_REVIEW = new Set(["submitted", "needs_info"]);
 
+// An event the organizer never confirmed closes the same way, and so does its question.
 function expirePastEvents(events, today = todayIso()) {
-  const stale = events.filter((e) => AWAITING_REVIEW.has(e.status) && e.date && lastDay(e) < today);
+  const stale = events.filter(
+    (e) => (AWAITING_REVIEW.has(e.status) || e.status === "awaiting_confirm") && e.date && lastDay(e) < today
+  );
   for (const event of stale) {
     storeUpdateEvent(EVENTS_FILE, event.id, {
       status: "expired",
       notes: `${event.notes} | פג תוקף: התאריך עבר`.trim(),
     });
   }
+  const staleIds = new Set(stale.map((e) => String(e.id)));
+  let droppedQuestion = false;
+  for (const [sender, pending] of awaitingConfirmation) {
+    if (staleIds.has(String(pending.eventId))) {
+      awaitingConfirmation.delete(sender);
+      droppedQuestion = true;
+    }
+  }
+  if (droppedQuestion) saveState();
   sweepPastFlyers(events, today);
   // Detached on purpose: callers use the returned list synchronously, and a slow
   // sequence of thank-yous must not hold up expiring the rows. The rows are marked
@@ -1822,7 +1841,8 @@ async function forwardEventToAdmin(id, event, sender, unresolved = [], flyer = "
 // The same event submitted again — retried by its submitter, or sent by a second
 // organiser — used to become a second row, a second review for Stav and, once both were
 // approved, two identical lines on the board (#69/#71, #73/#74, 21/10/2026). The copy
-// already on file is kept; the new one is not saved.
+// already on file is kept; the new one is not saved. CANCELLABLE_STATUSES includes
+// awaiting_confirm, so an event still waiting on its organizer counts as on file.
 function findDuplicateEvent(event) {
   return loadEvents(EVENTS_FILE).find((other) => CANCELLABLE_STATUSES.has(other.status) && isSameEvent(other, event));
 }
@@ -1845,6 +1865,15 @@ async function acknowledgeDuplicate(sender, existing, image = "") {
   saveState();
   const own = existing.submitter === sender;
   const newFlyer = own && image ? replaceFlyer(existing, image) : "";
+
+  // Their own event, still waiting on their confirmation: Stav hasn't seen it, so she is
+  // not told. Show them the versions again and reopen the question.
+  if (own && existing.status === "awaiting_confirm") {
+    awaitingConfirmation.set(sender, { eventId: existing.id, unresolved: [] });
+    recentlyCompleted.delete(sender);
+    saveState();
+    return reshowPreviews(sender, existing.id);
+  }
 
   // Someone else's submission matched: tell Stav, so a false match — two real events
   // at one address and hour — can still be added by hand. Their image is shown to her
@@ -1976,6 +2005,126 @@ async function applyCorrection(id, text, { byAdmin = false } = {}) {
   return { changed, event: storeFindEvent(EVENTS_FILE, id) };
 }
 
+// --- The organizer confirms both versions before Stav sees the event ---
+const RECEIVED_TEXT = "קיבלנו את האירוע! 🎉\n\nככה הוא ייראה בקבוצה, בשתי גרסאות 👇";
+const CONFIRM_PROMPT_TEXT = "הכול נכון?\n1. כן, שלחו לבדיקה\n\nמשהו לא נכון? פשוט כתבו כאן מה לשנות ✏";
+const CONFIRMED_TEXT = "מעולה! האירוע עבר לבדיקה של סתיו. נעדכן אתכם כשיאושר 🙌";
+const CORRECTION_UNCLEAR_TEXT = "לא הצלחנו להבין מה לשנות. כתבו למשל: \"המחיר הוא 50\".";
+const confirmReminderText = (name) => `תזכורת: האירוע "${name}" עדיין מחכה לאישור שלכם.\nענו 1 כדי לשלוח אותו לבדיקה, או כתבו מה לשנות.`;
+const CONFIRM_RE = /^(1|כן|אישור|מאשר|מאשרת|מאושר|אשר|נכון)[\s!.]*$/;
+const CONFIRM_REMINDER_AFTER_MS = 3 * 60 * 60 * 1000;
+const CONFIRM_REMINDER_NOTE = "נשלחה תזכורת אישור";
+// The labels from the mockup. The ad's names the flyer only when there is one.
+const PREVIEW_SHORT_LABEL = "*לוח יומי · מודעה מקוצרת*";
+const PREVIEW_AD_LABEL = "*מודעה גרפית מורחבת*";
+const PREVIEW_AD_FLYER_LABEL = "*מודעה גרפית מורחבת · כולל פלייר*";
+
+// Both versions as the group would get them: the board line, and the ad with its flyer.
+// The ad's posting day isn't known yet, so it carries the bold long date. Stav's review
+// notice uses the same pair.
+function previewMessages(event) {
+  const dateLine = event.date && isValidDate(event.date) ? `*${dateLineFor(event)}*` : "";
+  const ad = formatLong(event, { ...SLOT_LINKS, mapFor: mapLink, dateLine });
+  return [
+    { text: `${PREVIEW_SHORT_LABEL}\n\n${formatShort(event, SLOT_LINKS)}`, mediaUrl: "" },
+    { text: `${ad.mediaUrl ? PREVIEW_AD_FLYER_LABEL : PREVIEW_AD_LABEL}\n\n${ad.text}`, mediaUrl: ad.mediaUrl },
+  ];
+}
+
+async function sendPreviews(sender, event) {
+  for (const { text, mediaUrl } of previewMessages(event)) {
+    await sendToSubmitter(sender, text, mediaUrl);
+  }
+}
+
+// After a change: the updated versions, then the question again. The reminder clock
+// restarts, since this is a fresh ask.
+async function reshowPreviews(sender, id) {
+  storeUpdateEvent(EVENTS_FILE, id, { confirm_asked_at: new Date().toISOString() });
+  await sendPreviews(sender, storeFindEvent(EVENTS_FILE, id));
+  return CONFIRM_PROMPT_TEXT;
+}
+
+// The answer to the confirm prompt. Returns null when the question no longer applies
+// (Stav acted on the event by its id, or it was cancelled), so the message is routed as
+// if it had never been asked.
+async function handleConfirmation(sender, text, mediaUrls) {
+  const pending = awaitingConfirmation.get(sender);
+  const event = storeFindEvent(EVENTS_FILE, pending.eventId);
+  if (!event || event.status !== "awaiting_confirm") {
+    awaitingConfirmation.delete(sender);
+    saveState();
+    return null;
+  }
+  const trimmed = text.trim();
+
+  if (mediaUrls.length) {
+    // A poster with its own announcement is the next event. This one stays on Stav's
+    // pending list, unconfirmed, and the reminder asks about it again.
+    if (trimmed && looksLikeEventAnnouncement(trimmed)) {
+      awaitingConfirmation.delete(sender);
+      startSubmission(sender);
+      const reply = await handleActiveSubmission(sender, text, mediaUrls);
+      return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
+    }
+    let image;
+    try {
+      image = await fetchMediaAsDataUrl(mediaUrls[0]);
+    } catch (err) {
+      console.error("failed to fetch a replacement flyer:", err);
+      return MEDIA_FETCH_FAILED_TEXT;
+    }
+    replaceFlyer(event, image);
+    return reshowPreviews(sender, event.id);
+  }
+
+  if (CONFIRM_RE.test(trimmed)) {
+    awaitingConfirmation.delete(sender);
+    storeUpdateEvent(EVENTS_FILE, event.id, { status: "submitted" });
+    recentlyCompleted.add(sender);
+    lastSubmittedEventId.set(sender, event.id);
+    saveState();
+    const stored = storeFindEvent(EVENTS_FILE, event.id);
+    await forwardEventToAdmin(event.id, stored, sender, pending.unresolved || [], stored.flyer);
+    return CONFIRMED_TEXT;
+  }
+
+  if (!trimmed) return CONFIRM_PROMPT_TEXT;
+  if (text.length > MAX_MESSAGE_LENGTH) return MESSAGE_TOO_LONG_TEXT;
+  if (isRateLimited(sender)) return RATE_LIMITED_TEXT;
+  const { changed } = await applyCorrection(event.id, trimmed);
+  if (!changed.length) return `${CORRECTION_UNCLEAR_TEXT}\n\n${CONFIRM_PROMPT_TEXT}`;
+  return reshowPreviews(sender, event.id);
+}
+
+// An organizer who never answers is reminded once, three hours after being asked. The
+// event never reaches Stav on its own: it waits on her pending list until it expires.
+// Someone mid-draft or mid-question is skipped for now, so the reminder's "1" can't
+// land in that other conversation; a later sweep reminds them.
+async function sendDueConfirmReminders(now = Date.now()) {
+  const today = todayIso();
+  const due = loadEvents(EVENTS_FILE).filter(
+    (e) =>
+      e.status === "awaiting_confirm" &&
+      e.submitter &&
+      e.confirm_asked_at &&
+      now - Date.parse(e.confirm_asked_at) > CONFIRM_REMINDER_AFTER_MS &&
+      !(e.notes || "").includes(CONFIRM_REMINDER_NOTE) &&
+      (!e.date || lastDay(e) >= today)
+  );
+  for (const event of due) {
+    const sender = event.submitter;
+    if (activeSubmissions.has(sender) || activeInquiries.has(sender)) continue;
+    // Noted before the send, so a failed or slow send is never repeated.
+    storeUpdateEvent(EVENTS_FILE, event.id, { notes: `${event.notes || ""} | ${CONFIRM_REMINDER_NOTE}`.replace(/^ \| /, "") });
+    if (!awaitingConfirmation.has(sender)) {
+      awaitingConfirmation.set(sender, { eventId: event.id, unresolved: [] });
+      saveState();
+    }
+    await sendToSubmitter(sender, confirmReminderText(event.event_name));
+  }
+}
+
 // Approval tells the submitter three things in order: it is live, it is already on
 // the board and discoverable, and — if they have not already chosen a day — which
 // day they would like it in the group message.
@@ -2095,11 +2244,14 @@ function formatPendingList(events) {
   // Past-dated submissions are never worth showing: they can't be published, so listing
   // them only invites a decision that has no effect. The daily sweep closes them; this
   // filter keeps them out of the list in between sweeps.
-  const pending = events.filter((e) => AWAITING_REVIEW.has(e.status) && (!e.date || lastDay(e) >= today));
-  if (!pending.length) return "אין אירועים ממתינים כרגע.";
-  return pending
-    .map((e) => `#${e.id} ${e.event_name} — ${e.date} ${e.start_time}`)
-    .join("\n");
+  const upcoming = (e) => !e.date || lastDay(e) >= today;
+  const line = (e) => `#${e.id} ${e.event_name} — ${e.date} ${e.start_time}`;
+  const pending = events.filter((e) => AWAITING_REVIEW.has(e.status) && upcoming(e));
+  // Not hers to review yet, but she should see who hasn't confirmed.
+  const unconfirmed = events.filter((e) => e.status === "awaiting_confirm" && upcoming(e));
+  const parts = [pending.length ? pending.map(line).join("\n") : "אין אירועים ממתינים כרגע."];
+  if (unconfirmed.length) parts.push(["⏳ מחכים לאישור של המפרסם:", ...unconfirmed.map(line)].join("\n"));
+  return parts.join("\n\n");
 }
 
 // Explicit id ("אשר 6"), or bare ("אשר") as a WhatsApp reply to the event's own notice.
@@ -2560,7 +2712,7 @@ const INTENT_CONFIRM_TEXT = `רגע, רק לוודא — מה תרצו?
 // matched by phone number, from the menu ("5"), by saying so ("בטל אירוע"), or when the
 // classifier hears it. A bare "ביטול" still only exits whatever flow they are in.
 const CANCEL_EVENT_RE = /^(לבטל|בטל|ביטול|מבטל|מבטלת)\s+(את\s+)?(ה)?אירוע|^cancel (my )?event/i;
-const CANCELLABLE_STATUSES = new Set(["submitted", "needs_info", "published"]);
+const CANCELLABLE_STATUSES = new Set(["awaiting_confirm", "submitted", "needs_info", "published"]);
 const NO_EVENTS_TO_CANCEL_TEXT = "לא מצאנו אירועים קרובים שפרסמתם מהמספר הזה.";
 const CANCEL_KEPT_TEXT = "בסדר, לא ביטלנו כלום.";
 
@@ -2635,7 +2787,14 @@ async function cancelEvent(event, sender) {
   });
   if (undeliveredAdminNotices.delete(String(event.id))) saveState();
   if (lastButtonEventId === String(event.id)) { lastButtonEventId = ""; saveState(); }
+  const pending = awaitingConfirmation.get(sender);
+  if (pending && String(pending.eventId) === String(event.id)) {
+    awaitingConfirmation.delete(sender);
+    saveState();
+  }
   if (process.env.NODE_ENV === "test") return;
+  // Stav never saw an event its organizer had not confirmed, so there is nothing to tell her.
+  if (event.status === "awaiting_confirm") return;
   // Boards and reminders skip it from now on by themselves. A post Stav already
   // forwarded to the group is the one thing the bot cannot take back, so she is told.
   const wasPublished = event.status === "published";
@@ -2849,45 +3008,20 @@ async function handleActiveSubmission(sender, text, mediaUrls, { rateCounted = f
   // Read the flyer before clearSession drops it.
   const firstImage = images[0] || "";
   clearSession(sender);
-  recentlyCompleted.add(sender);
   saveState();
   const { id } = appendEvent(event, "Twilio WhatsApp", sender);
   lastSubmittedEventId.set(sender, id);
-  const flyer = persistFlyer(id, firstImage);
-  await forwardEventToAdmin(id, event, sender, unresolved, flyer);
-  // The receipt confirms what was captured; the question that follows is the one
-  // decision the submitter still owns. Asked now, while they are still in the
-  // conversation — the same question after approval often lands outside WhatsApp's
-  // 24h window and is never seen.
-  const receipt = formatSubmissionReceipt(event, flyer);
-  if (event.date && isValidDate(event.date)) {
-    const options = publishDayOptions(event.date);
-    awaitingPublishChoice.set(sender, { eventId: id, options, expectingDate: false });
-    saveState();
-    return `${receipt}\n\n${publishChoiceText(event, options)}`;
-  }
-  return receipt;
-}
-
-// A bare "we got it" gave the submitter nothing to check against, so a misread date or
-// location only surfaced after publication — or never. Echo back what was actually
-// extracted: wrong fields are obvious at a glance, and the next message can correct them.
-function formatSubmissionReceipt(event, flyer = "") {
-  const day = /^\d{4}-\d{2}-\d{2}$/.test(event.date || "");
-  const lines = [
-    "קיבלנו את האירוע! 🎉 הוא נכנס לבדיקה לפני פרסום.",
-    "",
-    "זה מה שקלטנו:",
-    event.event_name ? `📌 ${event.event_name}` : null,
-    day ? `📅 ${longDate(event.date)}${event.start_time ? ` בשעה ${event.start_time}` : ""}` : null,
-    event.location ? `📍 ${event.location}` : null,
-    event.price ? `💸 ${event.price}` : null,
-    event.contact_link ? `🔗 ${event.contact_link}` : null,
-    flyer ? "📷 הפלייר צורף" : null,
-    "",
-    'משהו לא נכון? פשוט כתבו לנו כאן מה לתקן.',
-  ];
-  return lines.filter((line) => line !== null).join("\n");
+  persistFlyer(id, firstImage);
+  // Stav is not told yet. The organizer sees exactly what the group would get, and
+  // confirms or corrects it first (handleConfirmation).
+  storeUpdateEvent(EVENTS_FILE, id, { status: "awaiting_confirm", confirm_asked_at: new Date().toISOString() });
+  awaitingConfirmation.set(sender, { eventId: id, unresolved });
+  saveState();
+  // The previews are outbound sends, because a webhook reply carries one message and no
+  // media. Awaited, so they land before the prompt that goes back as the reply.
+  await sendToSubmitter(sender, RECEIVED_TEXT);
+  await sendPreviews(sender, storeFindEvent(EVENTS_FILE, id));
+  return CONFIRM_PROMPT_TEXT;
 }
 
 // When the group message should go out. Options whose day has already passed are
@@ -3085,6 +3219,7 @@ ${MENU_TEXT}`;
 function senderFlow(sender) {
   if (activeSubmissions.has(sender)) return "submission";
   if (activeInquiries.has(sender)) return "inquiry";
+  if (awaitingConfirmation.has(sender)) return "confirm";
   if (awaitingPublishChoice.has(sender) || awaitingDailyChoice.has(sender)) return "publish-choice";
   if (awaitingCancelChoice.has(sender)) return "cancel";
   // Its own tag so drop-off at the confirmation is visible in interactions.jsonl.
@@ -3172,9 +3307,21 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
   }
 
   if (CANCEL_KEYWORDS.has(lowerTrimmed) || MENU_KEYWORDS.has(lowerTrimmed)) {
+    // Both close an open confirm question. "ביטול" also cancels its event, which would
+    // otherwise sit unconfirmed until it expired; "תפריט" leaves it on Stav's list.
+    const pending = awaitingConfirmation.get(sender);
+    let cancelled = "";
+    if (pending) {
+      awaitingConfirmation.delete(sender);
+      const waiting = storeFindEvent(EVENTS_FILE, pending.eventId);
+      if (CANCEL_KEYWORDS.has(lowerTrimmed) && waiting && waiting.status === "awaiting_confirm") {
+        await cancelEvent(waiting, sender);
+        cancelled = `האירוע "${waiting.event_name}" בוטל ולא יופיע יותר בלוח ובהודעות.\n\n`;
+      }
+    }
     clearSession(sender);
     saveState();
-    return MENU_TEXT;
+    return `${cancelled}${MENU_TEXT}`;
   }
 
   if (awaitingCancelChoice.has(sender)) {
@@ -3206,6 +3353,13 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
 
   if (activeSubmissions.has(sender)) {
     return handleActiveSubmission(sender, text, mediaUrls);
+  }
+
+  // Above the publish-choice and recentlyCompleted branches: while this is open, "1" is
+  // the confirmation and any other text is a change to the event.
+  if (awaitingConfirmation.has(sender)) {
+    const reply = await handleConfirmation(sender, text, mediaUrls);
+    if (reply !== null) return reply;
   }
 
   // Must sit above the recentlyCompleted branch below: a bare "2" answering the
@@ -3530,6 +3684,9 @@ if (require.main === module) {
   // Fly suspending the machine.
   setInterval(sendDueEventReminders, BOARD_CHECK_INTERVAL_MS).unref();
   setInterval(sendDueWeeklyNudge, BOARD_CHECK_INTERVAL_MS).unref();
+  setInterval(() => {
+    sendDueConfirmReminders().catch((err) => console.error("failed to send confirm reminders:", err));
+  }, BOARD_CHECK_INTERVAL_MS).unref();
   // Keeps the click and interaction logs from growing without bound on a small volume.
   setInterval(() => {
     pruneOlderThan(LOG_RETENTION_DAYS);
@@ -3542,6 +3699,11 @@ module.exports = {
   applyCorrection,
   sendToSubmitter,
   outbox,
+  previewMessages,
+  sendDueConfirmReminders,
+  formatPendingList,
+  expirePastEvents,
+  get awaitingConfirmation() { return awaitingConfirmation; },
   buildSlotPosts,
   adPost,
   adsDue,
