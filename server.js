@@ -2044,6 +2044,11 @@ async function notifySubmitter(sender, text) {
 async function applyCorrection(id, text, { byAdmin = false } = {}) {
   const event = storeFindEvent(EVENTS_FILE, id);
   if (!event) return { changed: [], event: null };
+  return writeCorrection(event, await correctionUpdates(event, text), { byAdmin });
+}
+
+// What the text would change, without writing it: the fields it really changes, valid.
+async function correctionUpdates(event, text) {
   const proposed = await extractEventModule.extractCorrection(event, text, todayIso());
   const updates = {};
   for (const key of FIELD_KEYS) {
@@ -2053,6 +2058,11 @@ async function applyCorrection(id, text, { byAdmin = false } = {}) {
     if (next === (event[key] || "") || !fieldIsValid(key, next)) continue;
     updates[key] = next;
   }
+  return updates;
+}
+
+function writeCorrection(event, updates, { byAdmin = false } = {}) {
+  const id = event.id;
   const changed = Object.keys(updates);
   if (!changed.length) return { changed, event };
   storeUpdateEvent(EVENTS_FILE, id, updates);
@@ -2131,9 +2141,7 @@ async function handleConfirmation(sender, text, mediaUrls) {
     // pending list, unconfirmed, and the reminder asks about it again.
     if (trimmed && looksLikeEventAnnouncement(trimmed)) {
       awaitingConfirmation.delete(sender);
-      startSubmission(sender);
-      const reply = await handleActiveSubmission(sender, text, mediaUrls);
-      return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
+      return startNextSubmission(sender, text, mediaUrls);
     }
     // A caption is a correction too ("new poster, and it's at 21:00"). Shown back
     // unapplied, the organizer would take the change as made. Guarded before the
@@ -2166,11 +2174,38 @@ async function handleConfirmation(sender, text, mediaUrls) {
   }
 
   if (!trimmed) return CONFIRM_PROMPT_TEXT;
+  // Their next event pasted as text is not a change to this one: applied as a correction
+  // it overwrote the event still waiting for their "1". Like a poster with its own
+  // announcement, it starts a new submission, and this one stays on Stav's pending list,
+  // unconfirmed, for the reminder to ask about again.
+  if (looksLikeNewAnnouncement(trimmed)) {
+    awaitingConfirmation.delete(sender);
+    return startNextSubmission(sender, text, []);
+  }
   const refused = correctionRefusal(sender, text);
   if (refused) return refused;
-  const { changed } = await applyCorrection(event.id, trimmed);
+  const updates = await correctionUpdates(event, trimmed);
+  // A new name and a new date is a different event, not a fix to this one.
+  if (updates.event_name && updates.date) {
+    awaitingConfirmation.delete(sender);
+    return startNextSubmission(sender, text, []);
+  }
+  const { changed } = writeCorrection(event, updates);
   if (!changed.length) return `${CORRECTION_UNCLEAR_TEXT}\n\n${CONFIRM_PROMPT_TEXT}`;
   return reshowPreviews(sender, event.id);
+}
+
+// Text that reads as a whole new announcement. The length floor keeps a short correction
+// that happens to name a time and a price ("21:00, כניסה 40 ₪") a correction.
+function looksLikeNewAnnouncement(trimmed) {
+  return trimmed.length >= ANNOUNCEMENT_MIN_LENGTH && looksLikeEventAnnouncement(trimmed);
+}
+
+// The message opens a new submission, and is its first message.
+async function startNextSubmission(sender, text, mediaUrls) {
+  startSubmission(sender);
+  const reply = await handleActiveSubmission(sender, text, mediaUrls);
+  return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
 }
 
 // The guards in front of a correction's model call, whether the text came alone or as
@@ -2501,11 +2536,10 @@ async function handleAdChoice(sender, text, mediaUrls) {
     return chooseAdWindow(sender, stored, open.window, local);
   }
 
-  // A flyer at any other step is the next event, as everywhere else.
-  if (hasUnambiguousSubmissionSignal(mediaUrls)) {
-    startSubmission(sender);
-    const reply = await handleActiveSubmission(sender, text, mediaUrls);
-    return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
+  // A flyer at any other step is the next event, as everywhere else, and so is a whole
+  // announcement pasted as text: it is not a correction for Stav.
+  if (hasUnambiguousSubmissionSignal(mediaUrls) || (!mediaUrls.length && looksLikeNewAnnouncement(trimmed))) {
+    return startNextSubmission(sender, text, mediaUrls);
   }
 
   if (!trimmed) return adQuestionText(open);

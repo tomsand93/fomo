@@ -2792,6 +2792,54 @@ async function demo() {
     pendingBoards.delete(key);
   }
 
+  // --- The next event pasted as text starts a new submission, at the confirm and ad questions ---
+  {
+    const eventsStore = require("./events-store");
+    const announcement = "ערב סטנדאפ חדש ביום שישי 12.12 בשעה 21:00 בבר הקטן, רחוב הנמל 20 חיפה. כניסה 40 ₪, כרטיסים בקישור https://tix.example/abc — מוזמנים כולם!";
+    if (announcement.length < 120) throw new Error("the announcement must be long enough to count");
+    const submitFirst = async (sender, name, date) => {
+      await routeMessage(sender, "2");
+      await routeMessage(sender, `שם האירוע: ${name}\nתאריך: ${date}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מסיבה\nקישור: https://x.co`);
+      return eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.submitter === sender).pop().id;
+    };
+    const row = (id) => eventsStore.findEvent(TEST_EVENTS_FILE, id);
+
+    // at the confirm question: an announcement is the next event, the first stays pending
+    const pasting = "whatsapp:+972500017403";
+    const firstId = await submitFirst(pasting, "ראשון", "2099-06-01");
+    const reply = await routeMessage(pasting, announcement);
+    if (!reply.includes("נראה ששיתפתם") || !activeSubmissions.has(pasting)) throw new Error("an announcement starts a new submission");
+    if (row(firstId).status !== "awaiting_confirm" || row(firstId).event_name !== "ראשון") throw new Error("the first event is left as it was, awaiting confirmation");
+    await routeMessage(pasting, "ביטול");
+
+    // a short correction that would change both the name and the date is the next event too
+    const renaming = "whatsapp:+972500017404";
+    const renamedId = await submitFirst(renaming, "שני", "2099-06-03");
+    CORRECTION_STUB.set("ערב ג'אז ב-12.12", { event_name: "ערב ג'אז", date: "2099-12-12" });
+    const renamed = await routeMessage(renaming, "ערב ג'אז ב-12.12");
+    if (!renamed.includes("נראה ששיתפתם") || !activeSubmissions.has(renaming)) throw new Error("a new name and date start a new submission");
+    if (row(renamedId).event_name !== "שני" || row(renamedId).date !== "2099-06-03") throw new Error("the first event keeps its name and date");
+    await routeMessage(renaming, "ביטול");
+    // a change to one of them is still a correction
+    const fixing = "whatsapp:+972500017405";
+    const fixedId = await submitFirst(fixing, "שלישי", "2099-06-05");
+    CORRECTION_STUB.set("התאריך 2.6", { date: "2099-06-02" });
+    await routeMessage(fixing, "התאריך 2.6");
+    if (row(fixedId).date !== "2099-06-02" || !awaitingConfirmation.has(fixing)) throw new Error("a date alone is applied");
+    await routeMessage(fixing, "ביטול");
+
+    // at the ad question: an announcement starts a new submission and is not sent to Stav
+    const offered = "whatsapp:+972500017406";
+    await submitFirst(offered, "רביעי", "2099-06-07");
+    await openAdQuestion(offered);
+    if (!awaitingAdChoice.has(offered)) throw new Error("the ad question is open");
+    outbox.length = 0;
+    const next = await routeMessage(offered, announcement);
+    if (!next.includes("נראה ששיתפתם") || !activeSubmissions.has(offered)) throw new Error("an announcement at the ad question starts a new submission");
+    if (outbox.some((m) => m.to === ADMIN)) throw new Error("the announcement is not forwarded to Stav");
+    await routeMessage(offered, "ביטול");
+  }
+
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
