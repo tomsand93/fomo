@@ -2477,11 +2477,14 @@ async function adOfferTemplateApproved() {
   return Boolean(approvedTemplateSid(AD_OFFER_TEMPLATE));
 }
 
-// A held approval and offer, attached under the reply to the organizer's next message
-// once they are in no other conversation. One per message: one question can be open.
-// When the approval already went out, the offer comes under a line naming the event.
+// A held approval and offer, attached under the reply to the organizer's next message.
+// The approval asks nothing, so it comes at once, even mid-conversation; the offer waits
+// until they are in no other conversation, since its "1" would land in that question.
+// One offer per message: one question can be open. When the approval already went out,
+// the offer comes under a line naming the event.
 function deliverPendingAdOffer(sender, reply) {
-  if (!pendingAdOffers.size || inOpenConversation(sender)) return reply;
+  if (!pendingAdOffers.size) return reply;
+  const busy = inOpenConversation(sender);
   const local = israelClock(new Date());
   const events = loadEvents(EVENTS_FILE); // read once, not once per held offer
   for (const id of [...pendingAdOffers]) {
@@ -2496,6 +2499,21 @@ function deliverPendingAdOffer(sender, reply) {
     // Approved already, and no window left: there is nothing more to tell them.
     if (approved && !offer.offerText) {
       dropHeldOffer(id);
+      continue;
+    }
+    if (busy) {
+      if (approved) continue;
+      const withApproval = reply ? `${reply}\n\n${offer.approvalText}` : offer.approvalText;
+      if (withApproval.length >= WHATSAPP_MAX_CHARS) continue; // waits for a shorter reply
+      reply = withApproval;
+      // As notifyApproved does for a busy organizer: the offer stays held, marked so it
+      // comes later under the event's name rather than with the approval again.
+      if (offer.offerText) {
+        approvalAlreadySent.add(String(id));
+        saveState();
+      } else {
+        dropHeldOffer(id);
+      }
       continue;
     }
     const lead = approved ? HELD_OFFER_LEAD(event.event_name) : offer.approvalText;

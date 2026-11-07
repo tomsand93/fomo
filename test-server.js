@@ -2896,6 +2896,39 @@ async function demo() {
     awaitingAdChoice.delete(sender);
   }
 
+  // --- A held approval reaches a busy organizer at once; only the offer waits ---
+  {
+    const eventsStore = require("./events-store");
+    const sender = "whatsapp:+972500017408";
+    const seed = async (fields = {}) => {
+      const id = eventsStore.appendEvent(TEST_EVENTS_FILE, { event_name: "עסוק", date: "2099-05-10", start_time: "20:00", location: "מקום" }, "test", sender, []);
+      eventsStore.updateEvent(TEST_EVENTS_FILE, id, { status: "submitted", flyer: "f.jpg", ...fields });
+      lastInbound.set(sender, Date.now() - 25 * 3600e3);
+      outbox.length = 0;
+      await routeMessage(ADMIN, `אשר ${id}`);
+      if (outbox.some((m) => m.to === sender) || !pendingAdOffers.has(id)) throw new Error("closed window: both held");
+      return id;
+    };
+
+    let id = await seed();
+    const busy = await routeMessage(sender, "1"); // opens an inquiry
+    if (!activeInquiries.has(sender)) throw new Error("the sender is in an inquiry");
+    if (!busy.includes("אושר") || busy.includes("מודעה גרפית")) throw new Error(`the approval comes under the reply, without the offer, got: ${busy}`);
+    if (!pendingAdOffers.has(id) || awaitingAdChoice.has(sender)) throw new Error("the offer is still held");
+    const again = await routeMessage(sender, "ביטול");
+    if (!again.includes("מודעה גרפית") || again.includes("אושר 🎉") || !again.includes('"עסוק"')) {
+      throw new Error("once free, the offer comes under the event's name, without the approval again");
+    }
+    if (pendingAdOffers.has(id) || !awaitingAdChoice.has(sender)) throw new Error("the offer is delivered and opens");
+    awaitingAdChoice.delete(sender);
+
+    // with no offer to make, the approval is all there is, and nothing stays held
+    id = await seed({ start_time: "" });
+    const only = await routeMessage(sender, "1");
+    if (!only.includes("אושר") || pendingAdOffers.has(id)) throw new Error("the approval alone is delivered, and nothing is held");
+    await routeMessage(sender, "ביטול");
+  }
+
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });
