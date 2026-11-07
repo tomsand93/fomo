@@ -2748,6 +2748,50 @@ async function demo() {
     awaitingAdChoice.delete(sender);
   }
 
+  // --- A confirm or a flush removes only its own posts from a shared board key ---
+  {
+    const { pendingBoards, confirmBoardDelivery, flushPendingBoards } = require("./server");
+    const key = "2099-01-01:18:00";
+    const delivered = async () => ({ status: "delivered" });
+    const texts = () => (pendingBoards.get(key) || []).map((post) => post.text).join();
+
+    // a late ad queued under the board's key before the board's delivery came back
+    const board = { text: "board" };
+    const lateAd = { text: "late ad", isAd: true, eventId: "77" };
+    pendingBoards.set(key, [board]);
+    pendingBoards.set(key, [...pendingBoards.get(key), lateAd]);
+    await confirmBoardDelivery(key, "SMboard", [board], delivered);
+    if (texts() !== "late ad") throw new Error(`the board's confirm leaves the late ad queued, got: ${texts()}`);
+    await confirmBoardDelivery(key, "SMlate", [lateAd], delivered);
+    if (pendingBoards.has(key)) throw new Error("the key goes once it is empty");
+
+    // a post queued under the key while a flush is sending survives the flush
+    const queued = { text: "queued" };
+    const arriving = { text: "arriving" };
+    pendingBoards.set(key, [queued]);
+    const sent = [];
+    await flushPendingBoards(async (post) => {
+      sent.push(post.text);
+      if (post === queued) pendingBoards.set(key, [...pendingBoards.get(key), arriving]);
+    });
+    if (sent.join() !== "queued" || texts() !== "arriving") throw new Error(`the flush keeps what arrived meanwhile, got: ${texts()}`);
+
+    // a flush that fails part-way keeps only what did not go out
+    const first = { text: "first" };
+    const second = { text: "second" };
+    pendingBoards.set(key, [first, second]);
+    await flushPendingBoards(async (post) => {
+      if (post === second) throw new Error("simulated send failure");
+    });
+    if (texts() !== "second") throw new Error(`only the unsent posts stay, got: ${texts()}`);
+    await flushPendingBoards(async () => {});
+    if (pendingBoards.has(key)) throw new Error("a full flush empties the key");
+    // without an injected sender, the suite never sends
+    pendingBoards.set(key, [{ text: "x" }]);
+    if ((await flushPendingBoards()) !== 0 || texts() !== "x") throw new Error("no real send under test");
+    pendingBoards.delete(key);
+  }
+
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });

@@ -526,11 +526,12 @@ async function sendPostsToStav(key, posts) {
     // their flyers): she forwards each one as is, and a single joined message had her
     // cutting it apart by hand (29/10/2026).
     //
-    // A late-ad key is the minute it went, so it can meet a batch still queued under the
-    // same key; the two are kept together rather than one overwriting the other.
+    // A late-ad key is the window's start, the same as that window's slot key, so it can
+    // meet a batch still queued under it; the two are kept together rather than one
+    // overwriting the other, and each confirm or flush removes only its own posts.
     pendingBoards.set(key, [...(pendingBoards.get(key) || []), ...posts]);
     saveState();
-    confirmBoardDelivery(key, firstSid);
+    confirmBoardDelivery(key, firstSid, posts);
     return true;
   } catch (err) {
     console.error(`failed to send the ${key} messages:`, err);
@@ -607,11 +608,25 @@ function markAdSent(id) {
   storeUpdateEvent(EVENTS_FILE, id, { ad_sent_at: new Date().toISOString() });
 }
 
+// Takes the given posts (by identity) off the key's queue, and the key once it is empty.
+// A key can hold more than one batch (a late ad meeting its window's board), so deleting
+// or overwriting the whole key dropped a batch that was still undelivered.
+function removeQueuedPosts(key, posts) {
+  const queued = pendingBoards.get(key);
+  if (!queued) return;
+  const done = new Set(posts);
+  const rest = queued.filter((post) => !done.has(post));
+  if (rest.length) pendingBoards.set(key, rest);
+  else pendingBoards.delete(key);
+}
+
 // Mirrors confirmAdminNotification: poll detached, and on a non-delivery leave the board
-// queued so the next message from Stav re-sends it inside her reopened window.
-async function confirmBoardDelivery(key, sid) {
+// queued so the next message from Stav re-sends it inside her reopened window. posts is
+// the batch this sid started; only those leave the queue. getStatus is injectable so the
+// suite can confirm without asking Twilio.
+async function confirmBoardDelivery(key, sid, posts, getStatus = getMessageStatus) {
   try {
-    const status = await getMessageStatus(sid);
+    const status = await getStatus(sid);
     const outsideWindow = Number(status.error_code) === WHATSAPP_OUTSIDE_WINDOW_ERROR;
     if (UNDELIVERED_STATUSES.has(status.status) || outsideWindow) {
       console.error(
@@ -623,7 +638,7 @@ async function confirmBoardDelivery(key, sid) {
       await sendSlotReadyPing(key);
       return;
     }
-    pendingBoards.delete(key);
+    removeQueuedPosts(key, posts);
     saveState();
   } catch (err) {
     console.error(`failed to confirm delivery of ${key} board:`, err);
@@ -684,14 +699,20 @@ async function sendSlotReadyPing(key) {
 let flushingBoards = null;
 
 // Resolves to how many boards went out, so a tap on the slot-ready button can say so.
-async function flushPendingBoards() {
-  if (process.env.NODE_ENV === "test" || !pendingBoards.size) return 0;
+// sendPost is injectable so the suite can flush without sending; without it, a test run
+// sends nothing.
+async function flushPendingBoards(sendPost = null) {
+  if ((process.env.NODE_ENV === "test" && !sendPost) || !pendingBoards.size) return 0;
+  const send = sendPost || sendSlotPost;
   if (flushingBoards) return flushingBoards;
   flushingBoards = (async () => {
     let sent = 0;
     const today = israelClock(new Date()).date;
-    for (const [key, posts] of [...pendingBoards.entries()]) {
-      if (!pendingBoards.has(key)) continue; // sent by an earlier flush already
+    for (const key of [...pendingBoards.keys()]) {
+      // Read as the key comes up, not up front: a confirm during an earlier key's sends
+      // may already have taken some of these off.
+      const posts = pendingBoards.get(key);
+      if (!posts) continue; // sent by an earlier flush already
       // A board from a day that has passed headlines "what's on today" for yesterday;
       // forwarding it would mislead the group, so it is dropped, not sent late.
       if (key.slice(0, 10) < today) {
@@ -701,21 +722,23 @@ async function flushPendingBoards() {
         for (const post of posts) {
           if (post.isAd && post.eventId) storeUpdateEvent(EVENTS_FILE, post.eventId, { ad_sent_at: "" });
         }
-        pendingBoards.delete(key);
+        removeQueuedPosts(key, posts);
         continue;
       }
+      // posts is a snapshot: a batch queued under this key while these sends are awaited
+      // is not part of it, and stays queued for the next flush.
       let done = 0;
       try {
         for (const post of posts) {
-          await sendSlotPost(post);
+          await send(post);
           done += 1;
         }
-        pendingBoards.delete(key);
+        removeQueuedPosts(key, posts);
         sent += 1;
       } catch (err) {
         console.error(`failed to re-send ${key} board:`, err);
         // Only what didn't go out stays queued, so the next flush doesn't repeat posts.
-        if (done > 0) pendingBoards.set(key, posts.slice(done));
+        removeQueuedPosts(key, posts.slice(0, done));
       }
     }
     saveState();
@@ -4075,6 +4098,9 @@ module.exports = {
   sendGoodbyes,
   get awaitingAdChoice() { return awaitingAdChoice; },
   get pendingAdOffers() { return pendingAdOffers; },
+  get pendingBoards() { return pendingBoards; },
+  confirmBoardDelivery,
+  flushPendingBoards,
   _setAdOfferSender(fn) { adOfferSender = fn; },
   offerFor,
   boardSlotFor,
