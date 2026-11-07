@@ -68,6 +68,9 @@ let noticeSidToEventId = new Map(); // Twilio message sid of a review notice -> 
 // message text: "2" is both a menu choice and (previously) a reject command. She declares
 // which hat she's wearing instead. Anyone who isn't the admin is always a customer.
 let adminMode = new Map(); // ADMIN_SENDER -> "admin" | "customer"
+// The event id Stav is editing in her own words after "ערוך", "" when no edit is open.
+// Persisted: her answer is a separate webhook, and Fly suspends this machine in between.
+let awaitingAdminEdit = "";
 let lastActivity = new Map(); // sender -> ms timestamp of last inbound message, for idle expiry
 // sender -> { eventId, eventName, at } of the reminder they were last sent. Persisted
 // like everything else here: the reply comes minutes to hours later, and Fly suspends
@@ -112,6 +115,7 @@ function loadState() {
     offeredEscape = new Set(raw.offeredEscape || []);
     noticeSidToEventId = new Map(raw.noticeSidToEventId || []);
     adminMode = new Map(raw.adminMode || []);
+    awaitingAdminEdit = raw.awaitingAdminEdit || "";
     lastActivity = new Map(raw.lastActivity || []);
     recentlyReminded = new Map(raw.recentlyReminded || []);
     awaitingCancelChoice = new Map(raw.awaitingCancelChoice || []);
@@ -156,6 +160,7 @@ function writeStateNow() {
     // Bounded: only recent notices need to stay resolvable by reply.
     noticeSidToEventId: [...noticeSidToEventId].slice(-50),
     adminMode: [...adminMode.entries()],
+    awaitingAdminEdit,
     lastActivity: [...lastActivity.entries()],
     // Bounded: only a recent reminder can still be replied to.
     recentlyReminded: [...recentlyReminded.entries()].slice(-50),
@@ -1199,6 +1204,8 @@ function clearSession(sender) {
   awaitingPublishChoice.delete(sender);
   awaitingDailyChoice.delete(sender);
   awaitingCancelChoice.delete(sender);
+  // An edit left open would swallow her next message, in either role.
+  if (sender === ADMIN_SENDER) awaitingAdminEdit = "";
 }
 
 // A conversation that goes quiet is abandoned, not paused. Without this a half-finished
@@ -1219,7 +1226,8 @@ function hasSessionState(sender) {
     recentlyCompleted.has(sender) ||
     awaitingPublishChoice.has(sender) ||
     awaitingDailyChoice.has(sender) ||
-    awaitingIntentConfirm.has(sender)
+    awaitingIntentConfirm.has(sender) ||
+    (sender === ADMIN_SENDER && Boolean(awaitingAdminEdit))
   );
 }
 
@@ -1269,6 +1277,11 @@ const CUSTOMER_SERVICE_TEXT = "לשירות לקוחות פנו לסתיו: +972
 // dropped the text — a correction to a date or price was silently thrown away. Forward it
 // to Stav instead and say so, so the submitter knows their fix landed.
 const AMENDMENT_FORWARDED_TEXT = "העברנו את התוספת לסתיו, היא תעדכן את האירוע לפני הפרסום.";
+// A correction applied while the event is still under review, naming what changed.
+function amendmentAppliedText(changed) {
+  const labels = changed.map((key) => FIELD_LABEL_FOR_KEY.get(key) || key).join(", ");
+  return `עדכנו באירוע: ${labels} ✏\nסתיו תקבל את הגרסה המעודכנת לבדיקה.`;
+}
 
 // A follow-up right after a submission is either a question about it ("when will this be
 // published?") or a correction to it ("actually it's tomorrow"). Only the correction
@@ -1462,9 +1475,9 @@ function appendEvent(event, source, sender) {
 }
 
 // What Stav approves is what the group gets, so the notice shows exactly that: the
-// board line and the daily message, rendered by the same two functions that produce
-// the real thing. It used to be a field dump — labelled name/date/time lines — which
-// meant a misparsed price or an awkward description only became visible after
+// daily-board line and the ad, the same two renderings the organizer confirmed
+// (previewRenderings). It used to be a field dump — labelled name/date/time lines —
+// which meant a misparsed price or an awkward description only became visible after
 // publication, when the fix costs a correction and a re-send.
 //
 // The raw fields are gone deliberately: everything in them is visible in one of the
@@ -1476,19 +1489,21 @@ function formatEventForReview(id, event, sender, unresolved = []) {
     ? `⚠ לא הובהר: ${unresolved.join(" | ")}`
     : "";
 
-  const links = { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) };
+  const { short, ad } = previewRenderings(event);
   return [
     `אירוע חדש לבדיקה #${id}`,
     `נשלח מ: ${sender}`,
     uncertaintyNote || null,
     "",
-    "— כך זה ייראה בלוח השבועי —",
-    formatShort(event, links),
+    "— לוח יומי (מקוצר) —",
+    short,
     "",
-    "— כך זה ייראה בהודעה היומית —",
-    formatLong(event, links).text,
+    // Names the flyer only when there is one, as the organizer's preview does.
+    ad.mediaUrl ? "— מודעה גרפית (מורחבת, עם הפלייר) —" : "— מודעה גרפית (מורחבת) —",
+    ad.text,
     "",
     `לאישור: אשר ${id}`,
+    `לעריכה: ערוך ${id}`,
     `לדחייה: דחה ${id} [סיבה]`,
   ].filter((line) => line !== null).join("\n");
 }
@@ -2037,11 +2052,15 @@ const PREVIEW_AD_FLYER_LABEL = "*מודעה גרפית מורחבת · כולל 
 // Both versions as the group would get them: the board line, and the ad with its flyer.
 // The ad's posting day isn't known yet, so it carries the bold long date. Stav's review
 // notice uses the same pair.
-function previewMessages(event) {
+function previewRenderings(event) {
   const dateLine = event.date && isValidDate(event.date) ? `*${dateLineFor(event)}*` : "";
-  const ad = formatLong(event, { ...SLOT_LINKS, mapFor: mapLink, dateLine });
+  return { short: formatShort(event, SLOT_LINKS), ad: formatLong(event, { ...SLOT_LINKS, mapFor: mapLink, dateLine }) };
+}
+
+function previewMessages(event) {
+  const { short, ad } = previewRenderings(event);
   return [
-    { text: `${PREVIEW_SHORT_LABEL}\n\n${formatShort(event, SLOT_LINKS)}`, mediaUrl: "" },
+    { text: `${PREVIEW_SHORT_LABEL}\n\n${short}`, mediaUrl: "" },
     { text: `${ad.mediaUrl ? PREVIEW_AD_FLYER_LABEL : PREVIEW_AD_LABEL}\n\n${ad.text}`, mediaUrl: ad.mediaUrl },
   ];
 }
@@ -2225,6 +2244,7 @@ const ADMIN_HELP_TEXT = `פקודות ניהול:
 ממתינים - רשימת אירועים ממתינים לבדיקה
 צפיות - כמה צפיות יש לקישורים של האירועים
 צפיות [מספר] - פירוט לאירוע אחד
+ערוך [מספר] - לשנות אירוע במילים שלך (הבוט ישאל מה לשנות)
 תקן [מספר] [שדה]: [ערך] - לתקן פרט באירוע (הבוט ילמד מהתיקון)
 
 שדות לתיקון: שם, תאריך, שעה, שעת סיום, מיקום, קטגוריה, מחיר, מארגן, קישור, איש קשר, תיאור
@@ -2248,6 +2268,7 @@ const FIELD_LABELS = new Map([
   ["איש קשר", "contact_person"],
   ["תיאור", "description"],
 ]);
+const FIELD_LABEL_FOR_KEY = new Map([...FIELD_LABELS].map(([label, key]) => [key, label]));
 
 const CORRECT_COMMAND_RE = /^תקן\s*#?(\d+)\s+([^:]+):\s*(.*)$/s;
 
@@ -2305,7 +2326,11 @@ const ADMIN_COMMAND_RE = /^(אשר|דחה)(?:\s*#?(\d+))?\s*(.*)$/;
 // The subset of admin commands unambiguous enough to run from customer mode: a bare
 // button payload, or approve/reject with an id. Not ADMIN_COMMAND_RE itself, which
 // accepts any text that merely starts with "אשר".
-const ADMIN_ONLY_COMMAND_RE = /^(?:(?:אשר|דחה)(?:\s*#?\d+.*)?|ממתינים|שלח|תקן\s*#?\d+.*)$/s;
+const ADMIN_ONLY_COMMAND_RE = /^(?:(?:אשר|דחה)(?:\s*#?\d+.*)?|ממתינים|שלח|תקן\s*#?\d+.*|ערוך(?:\s*#?\d+)?\s*)$/s;
+// "ערוך 42", or a bare "ערוך" as a reply to the notice. Opens an edit; her next message
+// says what to change.
+const EDIT_COMMAND_RE = /^ערוך(?:\s*#?(\d+))?\s*$/;
+const editAskText = (id) => `מה לשנות באירוע #${id}? כתבו במילים שלכם.`;
 
 // Approving and rejecting are irreversible from the submitter's point of view - they get a
 // "your event was published/declined" message either way - so the target is never guessed.
@@ -2375,12 +2400,66 @@ function formatViewStats(idArg) {
   ].join("\n");
 }
 
+// A command that closes an open edit instead of being read as one.
+function isAdminCommand(trimmed) {
+  return ADMIN_ONLY_COMMAND_RE.test(trimmed) || trimmed === "צפיות" || trimmed.startsWith("צפיות ");
+}
+
+// Her answer to "ערוך": applied like any correction, and recorded so the extractor
+// learns. Unclear or refused text keeps the edit open and asks again.
+async function handleAdminEdit(id, text) {
+  const trimmed = text.trim();
+  const askAgain = (reply) => {
+    awaitingAdminEdit = id;
+    saveState();
+    return reply;
+  };
+  if (!trimmed) return askAgain(editAskText(id));
+  if (text.length > MAX_MESSAGE_LENGTH) return askAgain(MESSAGE_TOO_LONG_TEXT);
+  const { changed, event } = await applyCorrection(id, trimmed, { byAdmin: true });
+  if (!event) return `לא נמצא אירוע #${id}.`;
+  if (!changed.length) return askAgain(`${CORRECTION_UNCLEAR_TEXT}\n\n${editAskText(id)}`);
+  const [short, ad] = previewMessages(event);
+  return [`עודכן ✏ #${id}. ככה זה נראה עכשיו:`, short.text, ad.text, `לאישור: אשר ${id}`].join("\n\n");
+}
+
 async function handleAdminMessage(text, repliedSid = "") {
   const trimmed = text.trim();
   // Her message just reopened the 24h WhatsApp window, so any board Twilio dropped with
   // 63016 can finally be delivered. Detached: a slow re-send must not delay her reply.
   const flushing = flushPendingBoards();
   const banner = missedNoticesBanner(loadEvents(EVENTS_FILE));
+
+  // An open edit takes her next message, unless it is a command: any command closes the
+  // edit and runs as usual. Only the strict command forms count, so an edit that starts
+  // with a command word ("דחה ל-21:00", postpone to 21:00) is still an edit. "ביטול"
+  // closes it here because the customer keyword branch runs after this handler.
+  if (awaitingAdminEdit) {
+    const editId = awaitingAdminEdit;
+    awaitingAdminEdit = "";
+    saveState();
+    if (CANCEL_KEYWORDS.has(trimmed.toLowerCase())) {
+      return `${banner}העריכה של אירוע #${editId} בוטלה, לא שיניתי כלום.`;
+    }
+    if (!isAdminCommand(trimmed)) return `${banner}${await handleAdminEdit(editId, text)}`;
+  }
+
+  const edit = trimmed.match(EDIT_COMMAND_RE);
+  if (edit) {
+    const id = resolveEventId(edit[1], repliedSid);
+    if (!id) {
+      return `${banner}לא ברור לאיזה אירוע הכוונה — לא שיניתי כלום.\nענו על הודעת האירוע עם "ערוך", או כתבו "ערוך [מספר]".\n\n${formatPendingList(loadEvents(EVENTS_FILE))}`;
+    }
+    if (!storeFindEvent(EVENTS_FILE, id)) {
+      return `${banner}לא נמצא אירוע #${id}.\n\n${formatPendingList(loadEvents(EVENTS_FILE))}`;
+    }
+    // Editing it means she saw it. lastButtonEventId is not consumed: opening an edit
+    // decides nothing about the event.
+    undeliveredAdminNotices.delete(String(id));
+    awaitingAdminEdit = id;
+    saveState();
+    return `${banner}${editAskText(id)}`;
+  }
 
   // A tap on the slot-ready button. Waits for the flush, so this reply lands after the
   // boards instead of above them.
@@ -3330,7 +3409,8 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
     // customer mode. In customer mode "אשר 42" was forwarded to her as an amendment to
     // event #42 (25/09/2026), and ten taps on the review template's "אשר" button each got
     // the customer menu (16/09/2026) — she tests and reviews on the same phone.
-    if (adminMode.get(sender) !== "customer" || ADMIN_ONLY_COMMAND_RE.test(trimmed)) {
+    // An open "ערוך" takes her next message in customer mode too: she asked for it.
+    if (adminMode.get(sender) !== "customer" || ADMIN_ONLY_COMMAND_RE.test(trimmed) || awaitingAdminEdit) {
       state.inAdminModeReply = true;
       return handleAdminMessage(text, repliedSid);
     }
@@ -3483,6 +3563,25 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
       // date fix ("תאמת שזה מחר") never reached Stav. Anything with content gets forwarded
       // as an amendment; only an empty/media-only message falls back to the old notice.
       if (lastId && trimmed && !looksLikeQuestion(trimmed)) {
+        // Still waiting on Stav: the correction is applied, and she gets the updated
+        // notice rather than a fragment to apply by hand. The flag goes back on so a
+        // second correction lands the same way. After approval nothing changes on its own.
+        const last = storeFindEvent(EVENTS_FILE, lastId);
+        if (last && last.status === "submitted") {
+          const refused = correctionRefusal(sender, text);
+          if (refused) {
+            recentlyCompleted.add(sender);
+            saveState();
+            return refused;
+          }
+          const { changed, event } = await applyCorrection(lastId, trimmed);
+          if (changed.length) {
+            await forwardEventToAdmin(lastId, event, sender, [], event.flyer);
+            recentlyCompleted.add(sender);
+            saveState();
+            return amendmentAppliedText(changed);
+          }
+        }
         await forwardAmendmentToAdmin(lastId, trimmed, sender);
         return AMENDMENT_FORWARDED_TEXT;
       }
@@ -3784,6 +3883,8 @@ module.exports = {
   get activeInquiries() { return activeInquiries; },
   get activeInquiryHistories() { return activeInquiryHistories; },
   get recentlyCompleted() { return recentlyCompleted; },
+  get lastSubmittedEventId() { return lastSubmittedEventId; },
+  get awaitingAdminEdit() { return awaitingAdminEdit; },
   get undeliveredAdminNotices() { return undeliveredAdminNotices; },
   get adminMode() { return adminMode; },
   get lastActivity() { return lastActivity; },

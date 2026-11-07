@@ -1348,11 +1348,11 @@ async function demo() {
     description: "ערב הופעות", flyer: "", slug: "rv12",
   };
   const notice = formatEventForReview(77, reviewEvent, "whatsapp:+972500009777", ["המחיר לא ברור"]);
-  if (!notice.includes("בלוח השבועי")) {
-    throw new Error("the review notice must label the weekly-board preview");
+  if (!notice.includes("— לוח יומי (מקוצר) —") || notice.includes("שבועי")) {
+    throw new Error("the review notice must label the daily-board preview");
   }
-  if (!notice.includes("בהודעה היומית")) {
-    throw new Error("the review notice must label the daily-message preview");
+  if (!notice.includes("— מודעה גרפית (מורחבת") || !notice.includes("לעריכה: ערוך 77")) {
+    throw new Error("the review notice must label the ad preview and offer the edit");
   }
   // The SHORT line joins with " · "; the LONG block has its own date line. Both being
   // present is what proves two distinct renderings, not one repeated.
@@ -1364,8 +1364,10 @@ async function demo() {
   if (!notice.includes("🕗 21:00-23:00 · 🎫 70 ₪")) {
     throw new Error("the review notice must contain the long daily rendering");
   }
-  if (notice.includes("📅 20.10")) {
-    throw new Error("the daily preview must not repeat the date — the heading carries it");
+  // The ad as the organizer previewed it: it goes out on its own, so it carries the
+  // bold long date.
+  if (!notice.includes("📅 *")) {
+    throw new Error("the ad preview carries its bold long date, as the organizer saw it");
   }
   if (notice.includes("👤 מאיה")) {
     throw new Error("the long preview must match the group post, which has no contact person");
@@ -2503,6 +2505,79 @@ async function demo() {
     if (String(awaitingConfirmation.get(busy).eventId) !== String(busyId)) throw new Error("and it points at its own event");
     awaitingConfirmation.delete(busy);
     awaitingConfirmation.delete(asking);
+  }
+
+  // --- Stav's review notice, and editing an event in her own words ---
+  {
+    const eventsStore = require("./events-store");
+    const { lastSubmittedEventId } = require("./server");
+    const sender = "whatsapp:+972500017201";
+    const id = eventsStore.appendEvent(
+      TEST_EVENTS_FILE,
+      { event_name: "עריכה", date: "2099-04-01", start_time: "20:00", end_time: "", location: "מקום, חיפה", category: "", price: "", organizer: "", contact_link: "", description: "" },
+      "Twilio WhatsApp", sender, []
+    );
+    eventsStore.updateEvent(TEST_EVENTS_FILE, id, { status: "submitted" });
+    const find = () => eventsStore.findEvent(TEST_EVENTS_FILE, id);
+    const notice = formatEventForReview(id, find(), "x");
+    if (notice.includes("שבועי") || !notice.includes("לוח יומי") || !notice.includes(`ערוך ${id}`)) throw new Error("notice labels");
+
+    if (!(await routeMessage(ADMIN, `ערוך ${id}`)).includes("מה לשנות")) throw new Error("asks what to change");
+    // text that changes nothing says so and keeps the edit open
+    if (!(await routeMessage(ADMIN, "שלום")).includes("לא הצלחנו להבין")) throw new Error("unclear edit");
+    CORRECTION_STUB.set("תיאור חדש", { description: "תיאור חדש" });
+    const edited = await routeMessage(ADMIN, "תיאור חדש");
+    if (!edited.includes("עודכן") || !edited.includes(`אשר ${id}`)) throw new Error("shows the result");
+    if (!edited.includes("*לוח יומי") || !edited.includes("*מודעה גרפית") || !edited.includes("תיאור חדש")) throw new Error("both updated previews");
+    if (edited.length > 1600) throw new Error("the edit result fits in one message");
+    if (find().description !== "תיאור חדש") throw new Error("saved");
+    // the edit is closed: her next text is not another edit
+    CORRECTION_STUB.set("תיאור שלישי", { description: "תיאור שלישי" });
+    await routeMessage(ADMIN, "תיאור שלישי");
+    if (find().description !== "תיאור חדש") throw new Error("one edit per ערוך");
+
+    // a real command outranks an open edit, and תקן still works
+    await routeMessage(ADMIN, `ערוך ${id}`);
+    await routeMessage(ADMIN, "ממתינים");
+    if (find().description !== "תיאור חדש") throw new Error("command is not an edit");
+    await routeMessage(ADMIN, `תקן ${id} מחיר: 30`);
+    if (find().price !== "30") throw new Error("תקן works");
+    // a bare ערוך with no event to point at changes nothing
+    if (!(await routeMessage(ADMIN, "ערוך")).includes("לא ברור לאיזה אירוע")) throw new Error("bare ערוך asks which");
+
+    // customer mode still reaches ערוך, and her next message goes to the edit
+    adminMode.set(ADMIN, "customer");
+    if (!(await routeMessage(ADMIN, `ערוך ${id}`)).includes("מה לשנות")) throw new Error("admin-only command");
+    if ((await routeMessage(ADMIN, "ביטול")).includes("מה תרצו לעשות")) throw new Error("ביטול closes the edit, not the customer menu");
+    await routeMessage(ADMIN, "תיאור שלישי");
+    if (find().description !== "תיאור חדש") throw new Error("ביטול closed it");
+    adminMode.delete(ADMIN);
+    // switching role closes an open edit
+    await routeMessage(ADMIN, `ערוך ${id}`);
+    await routeMessage(ADMIN, "לקוח");
+    await routeMessage(ADMIN, "תיאור שלישי");
+    if (find().description !== "תיאור חדש") throw new Error("a role switch closes the edit");
+    await routeMessage(ADMIN, "ניהול");
+    adminMode.delete(ADMIN);
+
+    // an organizer correction during review updates the event and Stav's notice
+    recentlyCompleted.add(sender);
+    lastSubmittedEventId.set(sender, id);
+    CORRECTION_STUB.set("המחיר 40", { price: "40" });
+    outbox.length = 0;
+    await routeMessage(sender, "המחיר 40");
+    if (find().price !== "40") throw new Error("applied during review");
+    if (!outbox.some((m) => m.to === ADMIN && m.text.includes("40"))) throw new Error("Stav sees the update");
+    // a second correction works too
+    CORRECTION_STUB.set("השעה 21:00 בערב", { start_time: "21:00" });
+    outbox.length = 0;
+    await routeMessage(sender, "השעה 21:00 בערב");
+    if (find().start_time !== "21:00" || !outbox.some((m) => m.to === ADMIN && m.text.includes("21:00"))) throw new Error("second correction");
+    // a follow-up that changes nothing is still forwarded, as before
+    if (!recentlyCompleted.has(sender)) throw new Error("still open for a follow-up");
+    outbox.length = 0;
+    const forwarded = await routeMessage(sender, "תודה רבה");
+    if (!forwarded.includes("העברנו את התוספת")) throw new Error("unchanged text is forwarded to Stav");
   }
 
   fs.unlinkSync(CORRECTIONS_FILE);
