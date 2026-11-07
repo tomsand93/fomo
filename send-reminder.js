@@ -74,8 +74,9 @@ function reminderTemplateSid() {
 
 // Was this recipient's 24h window open at `now`?
 //
-// lastActivity is the server's record of each sender's last inbound message, which is
-// exactly what Meta measures the window from. Unknown counts as closed: assuming open
+// lastInbound is the server's record of each sender's last inbound message, which is
+// exactly what Meta measures the window from. Not lastActivity: the idle sweep clears
+// that after 5h, long before the window shuts. Unknown counts as closed: assuming open
 // is the failure mode that loses messages silently.
 function windowIsOpen(lastInboundMs, now = Date.now()) {
   if (!lastInboundMs) return false;

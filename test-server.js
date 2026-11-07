@@ -31,7 +31,7 @@ process.env.PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://test.fomo.
 // The flyer-and-text pairing window, shortened so the suite does not sit in it.
 process.env.PAIR_WAIT_MS = "50";
 
-const { receiveInbound, looksLikeEventAnnouncement, routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, goodbyeText, goodbyeMessage, sendGoodbyes, mapsUrl, mapLink, awaitingAdChoice, pendingAdOffers, offerFor, activeSubmissions, awaitingIntentConfirm, offeredEscape, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS, outbox, awaitingConfirmation } = require("./server");
+const { receiveInbound, looksLikeEventAnnouncement, routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, goodbyeText, goodbyeMessage, sendGoodbyes, mapsUrl, mapLink, awaitingAdChoice, pendingAdOffers, offerFor, activeSubmissions, awaitingIntentConfirm, offeredEscape, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, lastInbound, IDLE_TIMEOUT_MS, outbox, awaitingConfirmation } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -2567,7 +2567,7 @@ async function demo() {
     const row = (id) => eventsStore.findEvent(TEST_EVENTS_FILE, id);
 
     // two separate messages, nothing posted to Stav at approval
-    lastActivity.set(sender, Date.now());
+    lastInbound.set(sender, Date.now());
     let id = await seed();
     if (outbox.filter((m) => m.to === sender).length !== 2) throw new Error("approval then offer");
     if (outbox.some((m) => m.to === ADMIN && m.mediaUrl)) throw new Error("no flyer post at approval");
@@ -2637,7 +2637,7 @@ async function demo() {
     if (row(id).ad_window) throw new Error("expired offer");
 
     // closed window, no template: held, then attached to their next reply
-    lastActivity.set(sender, Date.now() - 25 * 3600e3);
+    lastInbound.set(sender, Date.now() - 25 * 3600e3);
     id = await seed();
     if (outbox.some((m) => m.to === sender) || !pendingAdOffers.has(id)) throw new Error("held");
     const next = await routeMessage(sender, "תפריט");
@@ -2650,7 +2650,7 @@ async function demo() {
     // closed window, fomo_ad_offer approved: the template carries it
     interactive._setApprovedTemplates(new Map([["fomo_ad_offer", "HXad"]]));
     try {
-      lastActivity.set(sender, Date.now() - 25 * 3600e3);
+      lastInbound.set(sender, Date.now() - 25 * 3600e3);
       id = await seed();
       const sent = outbox.filter((m) => m.to === sender);
       if (sent.length !== 1 || sent[0].template !== "fomo_ad_offer" || pendingAdOffers.has(id)) throw new Error("one template send");
@@ -2662,7 +2662,7 @@ async function demo() {
 
     // in another conversation: the approval goes at once, since it asks nothing; only
     // the offer waits, so its "1" cannot land in the other question
-    lastActivity.set(sender, Date.now());
+    lastInbound.set(sender, Date.now());
     await routeMessage(sender, "1"); // an inquiry
     id = await seed();
     const toSender = outbox.filter((m) => m.to === sender);
@@ -2678,7 +2678,7 @@ async function demo() {
     awaitingAdChoice.delete(sender);
 
     // in another conversation, and no window left: the approval still goes at once
-    lastActivity.set(sender, Date.now());
+    lastInbound.set(sender, Date.now());
     await routeMessage(sender, "1"); // an inquiry
     id = await seed({ date: "2020-01-01" });
     const noOffer = outbox.filter((m) => m.to === sender);
@@ -2686,6 +2686,35 @@ async function demo() {
       throw new Error("with no offer, a busy organizer gets the approval at once and nothing is held");
     }
     await routeMessage(sender, "ביטול");
+  }
+
+  // --- The 24h WhatsApp window outlives the 5h idle sweep ---
+  {
+    const eventsStore = require("./events-store");
+    const { expireIdleSessions } = require("./server");
+    const sender = "whatsapp:+972500017401";
+    await routeMessage(sender, "תפריט");
+    if (!lastInbound.has(sender)) throw new Error("every inbound message records its time");
+    if (!("lastInbound" in JSON.parse(fs.readFileSync(TEST_STATE_FILE, "utf8")))) throw new Error("lastInbound is persisted");
+
+    // six hours ago: the idle sweep forgets the session, but the window is still open
+    lastActivity.set(sender, Date.now() - 6 * 3600e3);
+    lastInbound.set(sender, Date.now() - 6 * 3600e3);
+    expireIdleSessions();
+    if (lastActivity.has(sender) || !lastInbound.has(sender)) throw new Error("only lastActivity is swept at 5h");
+    const id = eventsStore.appendEvent(TEST_EVENTS_FILE, { event_name: "חלון", date: "2099-05-10", start_time: "20:00", location: "מקום" }, "test", sender, []);
+    eventsStore.updateEvent(TEST_EVENTS_FILE, id, { status: "submitted", flyer: "f.jpg" });
+    outbox.length = 0;
+    await routeMessage(ADMIN, `אשר ${id}`);
+    if (outbox.filter((m) => m.to === sender).length !== 2 || pendingAdOffers.has(id)) {
+      throw new Error("a 6h-old window is open: the approval and the offer go at once");
+    }
+    awaitingAdChoice.delete(sender);
+
+    // past 24h it is pruned too
+    lastInbound.set(sender, Date.now() - 25 * 3600e3);
+    expireIdleSessions();
+    if (lastInbound.has(sender)) throw new Error("lastInbound is pruned after 24h");
   }
 
   fs.unlinkSync(CORRECTIONS_FILE);

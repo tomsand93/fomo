@@ -212,9 +212,15 @@ async function run() {
   store.addReminder({ sender: SENDER, eventId: "7", eventName: "מסיבה", eventDate: EVENT_DATE, eventTime: "20:00" });
   store.addReminder({ sender: SENDER, eventId: "8", eventName: "הופעה", eventDate: EVENT_DATE, eventTime: "23:00" });
 
+  // The 24h window is read from lastInbound, which outlives the 5h idle sweep that
+  // clears lastActivity.
+  const seenAt = Date.now() - 6 * 3600e3;
+  server.lastInbound.set(SENDER, seenAt);
+  server.lastActivity.delete(SENDER);
   // 17:00 local: event 7 (20:00) is 3h away, event 8 (23:00) is 6h away.
   await server.sendDueEventReminders(at("14:00"), okDeliver);
   check("only the event inside its window fires", sent.map((s) => s.eventName), ["מסיבה"]);
+  check("the reminder reads the window from lastInbound", sent[0].lastInboundMs, seenAt);
 
   // Running again in the same window must not send a second time.
   await server.sendDueEventReminders(at("14:10"), okDeliver);
@@ -402,14 +408,17 @@ async function run() {
   const wed = (hhmm, day = 26) => new Date(`2026-08-${day}T${hhmm}:00Z`);
   const nudged = [];
   const wordings = [];
-  const recordNudge = async (sender, _lastInbound, variant) => { nudged.push(sender); wordings.push(variant.id); };
+  const inboundSeen = new Map();
+  const recordNudge = async (sender, lastInboundMs, variant) => { nudged.push(sender); wordings.push(variant.id); inboundSeen.set(sender, lastInboundMs); };
   const allApproved = () => true;
 
   await server6.sendDueWeeklyNudge(wed("14:55"), recordNudge, allApproved);
   check("not before 18:00", nudged.length, 0);
   await server6.sendDueWeeklyNudge(new Date("2026-08-25T15:00:00Z"), recordNudge, allApproved);
   check("not on a Tuesday at 18:00", nudged.length, 0);
+  server6.lastInbound.set(PUBLISHER_A, 4242);
   await server6.sendDueWeeklyNudge(wed("15:00"), recordNudge, allApproved);
+  check("the nudge reads the window from lastInbound", inboundSeen.get(PUBLISHER_A), 4242);
   check("every publisher once, never Stav, a blank, or a never-published submitter",
     nudged, [PUBLISHER_A, PUBLISHER_B, PUBLISHER_D]);
   check("everyone gets the same wording that week", new Set(wordings).size, 1);

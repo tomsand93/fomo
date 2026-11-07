@@ -83,6 +83,11 @@ let adminMode = new Map(); // ADMIN_SENDER -> "admin" | "customer"
 // Persisted: her answer is a separate webhook, and Fly suspends this machine in between.
 let awaitingAdminEdit = "";
 let lastActivity = new Map(); // sender -> ms timestamp of last inbound message, for idle expiry
+// sender -> ms timestamp of last inbound message, for the 24h WhatsApp window. Its own map
+// because the idle sweep drops lastActivity after 5h, which read a 5-24h-old open window as
+// closed and held approvals that could have gone out. Pruned only once the window is shut.
+let lastInbound = new Map();
+const LAST_INBOUND_TTL_MS = 24 * 60 * 60 * 1000;
 // sender -> { eventId, eventName, at } of the reminder they were last sent. Persisted
 // like everything else here: the reply comes minutes to hours later, and Fly suspends
 // this machine in between, so an in-memory note would be gone before it is read.
@@ -131,6 +136,7 @@ function loadState() {
     adminMode = new Map(raw.adminMode || []);
     awaitingAdminEdit = raw.awaitingAdminEdit || "";
     lastActivity = new Map(raw.lastActivity || []);
+    lastInbound = new Map(raw.lastInbound || []);
     recentlyReminded = new Map(raw.recentlyReminded || []);
     awaitingCancelChoice = new Map(raw.awaitingCancelChoice || []);
   } catch (err) {
@@ -177,6 +183,7 @@ function writeStateNow() {
     adminMode: [...adminMode.entries()],
     awaitingAdminEdit,
     lastActivity: [...lastActivity.entries()],
+    lastInbound: [...lastInbound.entries()],
     // Bounded: only a recent reminder can still be replied to.
     recentlyReminded: [...recentlyReminded.entries()].slice(-50),
   };
@@ -966,7 +973,7 @@ async function sendDueWeeklyNudge(now = new Date(), deliver = deliverNudge, isAp
 
   for (const sender of nudgeRecipients(loadEvents(EVENTS_FILE))) {
     try {
-      await deliver(sender, lastActivity.get(sender) || 0, variant);
+      await deliver(sender, lastInbound.get(sender) || 0, variant);
     } catch (err) {
       console.error(`failed to send the weekly nudge to ${sender}:`, err);
     }
@@ -1109,7 +1116,7 @@ async function sendDueEventReminders(now = new Date(), deliver = deliverReminder
         eventName: event.event_name,
         startTime: event.start_time,
         location: event.location,
-        lastInboundMs: lastActivity.get(reminder.sender) || 0,
+        lastInboundMs: lastInbound.get(reminder.sender) || 0,
       });
       if (result.ok) {
         remindersStore.markReminder(
@@ -1249,6 +1256,11 @@ function expireIdleSessions(now = Date.now()) {
       changed = true;
     }
     lastActivity.delete(sender);
+    changed = true;
+  }
+  for (const [sender, seenAt] of lastInbound) {
+    if (now - seenAt < LAST_INBOUND_TTL_MS) continue;
+    lastInbound.delete(sender);
     changed = true;
   }
   if (changed) saveState();
@@ -2336,7 +2348,7 @@ function adQuestionText(open) {
 // would land in that other question.
 async function notifyApproved(sender, id, event) {
   const offer = offerFor(event, israelClock(new Date()));
-  const open = windowIsOpen(lastActivity.get(sender) || 0);
+  const open = windowIsOpen(lastInbound.get(sender) || 0);
   const busy = inOpenConversation(sender);
 
   if (open) {
@@ -3531,6 +3543,7 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
   // and acting on an hours-old draft is exactly what this is meant to prevent.
   expireIdleSessions();
   lastActivity.set(sender, Date.now());
+  lastInbound.set(sender, Date.now());
   // An ad offer this old no longer captures a digit; the message is routed normally.
   if (awaitingAdChoice.has(sender) && !adChoiceIsOpen(sender)) {
     awaitingAdChoice.delete(sender);
@@ -4026,6 +4039,7 @@ module.exports = {
   get undeliveredAdminNotices() { return undeliveredAdminNotices; },
   get adminMode() { return adminMode; },
   get lastActivity() { return lastActivity; },
+  get lastInbound() { return lastInbound; },
   rememberNotice,
   // Exported so the routes can be exercised against a real listener in tests.
   server,
