@@ -2193,7 +2193,7 @@ async function demo() {
   }
 
   // --- The daily board and booked ads at the slots ---
-  const { lateAds, todayPage, eventLandingPage } = require("./server");
+  const { lateAds, adPost, todayPage, eventLandingPage } = require("./server");
   {
     const base = { status: "published", location: "מקום", price: "20 ₪", slug: "s", contact_link: "", daily_days: "" };
     const today = { ...base, id: "1", event_name: "היום בערב", date: "2026-11-05", start_time: "20:00" };
@@ -2222,11 +2222,22 @@ async function demo() {
     const satEarly = { ...early, date: "2026-11-07", start_time: "11:00" };
     if (buildSlotPosts([satEarly], "2026-11-07", "18:00").length !== 1) throw new Error("covered by 12:00");
     // late ads: unsent after handoff and before the event; not before handoff, not after start
-    const local = (date, hour) => ({ date, hour, minute: 0, day: 5 });
+    const local = (date, hour, minute = 0) => ({ date, hour, minute, day: 5 });
     if (lateAds([morningAd], local("2026-11-06", 11)).length !== 1) throw new Error("late ad found");
     if (lateAds([morningAd], local("2026-11-06", 9)).length !== 0) throw new Error("before handoff");
     if (lateAds([{ ...morningAd, date: "2026-11-06", start_time: "10:30" }], local("2026-11-06", 11)).length !== 0) throw new Error("event started");
     if (lateAds([{ ...morningAd, ad_window: "decline" }], local("2026-11-06", 11)).length !== 0) throw new Error("declined");
+    // A late ad goes only while a window is open (handoff to end) that still starts
+    // before the event; otherwise it waits for the next one.
+    if (lateAds([morningAd], local("2026-11-06", 14)).length !== 0) throw new Error("no window is open at 14:00");
+    const tonight = { ...morningAd, date: "2026-11-06", start_time: "20:00" };
+    const [evening] = lateAds([tonight], local("2026-11-06", 17, 55));
+    if (!evening || evening.window.key !== "evening") throw new Error("a missed morning ad goes in the evening window");
+    if (!adPost(evening.event, "2026-11-06", evening.window.key).text.includes("*הערב!*")) throw new Error("dated for the evening window");
+    if (lateAds([tonight], local("2026-11-06", 23, 30)).length !== 0) throw new Error("nothing goes at 23:30");
+    if (lateAds([{ ...tonight, start_time: "18:00" }], local("2026-11-06", 17, 55)).length !== 0) {
+      throw new Error("a window that does not start before the event is no window for it");
+    }
     // pages
     const page = todayPage([today], "2026-11-05");
     if (!page.includes('property="og:title"') || !page.includes("היום בערב")) throw new Error("today page");

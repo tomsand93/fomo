@@ -6,7 +6,7 @@ const { URLSearchParams } = require("url");
 const { loadEvents, makeBoard, digestEvents } = require("./make-digest");
 const { israelClock, todayIso, addDays, dayOfWeek, longDate, isReminderDue, isReminderMissed } = require("./clock");
 const { isFreeEntry, entranceLabel, formatShort, formatLong } = require("./format-event");
-const { AD_WINDOWS, adDateLine } = require("./ad-windows");
+const { AD_WINDOWS, availableWindows, adDateLine } = require("./ad-windows");
 const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent, lastDay, runsOn, isSameEvent } = require("./events-store");
 const extractEventModule = require("./extract-event");
 const intentModule = require("./classify-intent");
@@ -288,8 +288,6 @@ const SLOT_LINKS = { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) };
 // forwards as is.
 const MAX_BOARD_CHARS = 1500;
 
-const pad2 = (n) => String(n).padStart(2, "0");
-
 // The earlier slot that already ran today, if any — the weekend's 12:00 before its 18:00.
 // The 10:00 ads slot never carries the board, so it is not an earlier board.
 function earlierSlotToday(localDate, slot) {
@@ -391,22 +389,29 @@ function buildSlotPosts(events, localDate, slot = "", links = SLOT_LINKS) {
   return [{ text: intro.join("\n") }, ...posts.map(forwardable)];
 }
 
-// Booked ads whose handoff has passed with the ad still not handed to Stav, while the
-// event is ahead: the machine slept through the slot, the slot failed, a past-day board
-// holding the ad was dropped, or the booking came in after its window's handoff. "Ahead"
-// is measured as availableWindows measures it: a multi-day event against its start time
-// on its last day.
+// Booked ads whose handoff has passed with the ad still not handed to Stav: the machine
+// slept through the slot, the slot failed, a past-day board holding the ad was dropped,
+// or the booking came in after its window's handoff. Each comes back as
+// { event, window }, with window the ad window open right now (from its handoff to its
+// end) that still starts before the event, by availableWindows' rule. With no such
+// window the ad is not late-sent now: it waits for the next one, or never goes if none
+// is left before the event. So a late ad never reaches Stav outside 09:50-13:00 or
+// 17:50-21:00.
 function lateAds(events, local) {
-  const now = `${local.date} ${pad2(local.hour)}:${pad2(local.minute)}`;
-  return events
-    .filter((event) => {
-      if (event.status !== "published" || event.ad_sent_at || !event.ad_date || !event.start_time) return false;
-      const window = AD_WINDOWS.find((entry) => entry.key === event.ad_window);
-      if (!window) return false;
-      const handoff = `${event.ad_date} ${pad2(window.sendHour)}:${pad2(window.sendMinute)}`;
-      return handoff <= now && now < `${lastDay(event)} ${event.start_time}`;
-    })
-    .sort((a, b) => `${a.date} ${a.start_time}`.localeCompare(`${b.date} ${b.start_time}`));
+  const order = (key) => AD_WINDOWS.findIndex((entry) => entry.key === key);
+  const late = [];
+  for (const event of events) {
+    if (event.status !== "published" || event.ad_sent_at || !event.ad_date) continue;
+    if (order(event.ad_window) < 0) continue; // not booked, or declined
+    const window = availableWindows(event, local).find((entry) => entry.openNow && entry.date === local.date);
+    if (!window) continue;
+    // The booked handoff has passed: an earlier day, or today at a window no later than
+    // the open one.
+    const handoffPassed = event.ad_date < local.date ||
+      (event.ad_date === local.date && order(event.ad_window) <= order(window.key));
+    if (handoffPassed) late.push({ event, window });
+  }
+  return late.sort((a, b) => `${a.event.date} ${a.event.start_time}`.localeCompare(`${b.event.date} ${b.event.start_time}`));
 }
 
 // The Twilio balance is prepaid; at zero the account is suspended and the bot goes
@@ -510,9 +515,11 @@ async function sendPostsToStav(key, posts) {
 }
 
 // Hands Stav every late ad (lateAds) in one batch, under a note saying they are late.
-// Keyed `${date}:${HH:MM}` like a slot, because sendSlotReadyPing reads the time back
-// with key.slice(11). Runs one at a time: the interval and a fresh booking can both call
-// it, and two runs reading the file before either marks ad_sent_at would send twice.
+// Keyed `${date}:${window start}`, the same key as that window's slot, because
+// sendSlotReadyPing reads the time back with key.slice(11); a batch still queued under
+// it is kept alongside (sendPostsToStav). Runs one at a time: the interval and a fresh
+// booking can both call it, and two runs reading the file before either marks
+// ad_sent_at would send twice.
 let lateAdsRun = Promise.resolve();
 
 function sendLateAds(now = new Date()) {
@@ -528,24 +535,21 @@ async function sendLateAdsNow(now) {
   const queued = new Set(
     [...pendingBoards.values()].flat().filter((post) => post.isAd).map((post) => String(post.eventId))
   );
-  const late = lateAds(loadEvents(EVENTS_FILE), local).filter((event) => !queued.has(String(event.id)));
+  const late = lateAds(loadEvents(EVENTS_FILE), local).filter(({ event }) => !queued.has(String(event.id)));
   if (!late.length) return;
 
-  // The date line is worked out for when the ad actually goes: from the evening handoff
-  // on it reads as tonight's.
-  const evening = AD_WINDOWS.find((entry) => entry.key === "evening");
-  const minutes = local.hour * 60 + local.minute;
-  const windowKey = minutes >= evening.sendHour * 60 + evening.sendMinute ? "evening" : "morning";
-  const posts = late.map((event) => ({ ...adPost(event, local.date, windowKey), label: adLabel(event) }));
+  // Only one window is open at a time, so every late ad shares it. The date line is
+  // worked out for that window, the one the ad actually goes in.
+  const { window } = late[0];
+  const posts = late.map(({ event }) => ({ ...adPost(event, local.date, window.key), label: adLabel(event) }));
   const note = [
-    `⏰ ${late.length === 1 ? "מודעה באיחור" : `${late.length} מודעות באיחור`} — להעביר לקבוצה כבר עכשיו, ${postCount(posts.length)}, לפי הסדר:`,
+    `⏰ ${late.length === 1 ? "מודעה באיחור" : `${late.length} מודעות באיחור`} — להעביר לקבוצה כבר עכשיו, בחלון ה${window.label} (${window.start}-${window.end}), ${postCount(posts.length)}, לפי הסדר:`,
     "",
     ...posts.map((post, i) => `${i + 1}. ${post.label}`),
     "",
     "כל ההודעות שמתחת לזו — להעביר כמו שהן.",
   ].join("\n");
-  const key = `${local.date}:${pad2(local.hour)}:${pad2(local.minute)}`;
-  await sendPostsToStav(key, [{ text: note }, ...posts.map(forwardable)]);
+  await sendPostsToStav(`${local.date}:${window.start}`, [{ text: note }, ...posts.map(forwardable)]);
 }
 
 // Twilio attaches one image per message, so an ad goes as its own post. A failed image
