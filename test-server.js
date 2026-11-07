@@ -1014,7 +1014,6 @@ async function demo() {
   // daily_days no longer promotes a later event into the daily digest (the daily board
   // shows today's events only); the promoted-message tests were removed with that.
   const { digestFlyerEvents } = require("./make-digest");
-  const { longDate } = require("./clock");
   const promotedEvents = [
     { status: "published", event_name: "היום", date: "2026-10-14", start_time: "21:00", location: "חיפה" },
     { status: "published", event_name: "בעוד שבוע", date: "2026-10-21", start_time: "20:00", location: "חיפה", daily_days: "2026-10-14", flyer: "f.jpg" },
@@ -1024,6 +1023,26 @@ async function demo() {
   if (digestFlyerEvents(promotedEvents, "2026-10-14").length) throw new Error("a later event's flyer must not follow today's digest");
   const { buildSlotPosts } = require("./server");
 
+  // The slot sends today's events as their own message.
+  const { makeDailyParts } = require("./make-digest");
+  const parts = makeDailyParts(promotedEvents, "2026-10-14");
+  if (!parts.today.includes("היום בחיפה") || parts.today.includes("בעוד שבוע")) {
+    throw new Error("the today message holds only today's events");
+  }
+  const onlyLater = makeDailyParts(promotedEvents.slice(1, 2), "2026-10-14");
+  if (onlyLater.today !== "") throw new Error("an empty today message is skipped");
+
+  // The slot opens with a note naming each message that follows, for Stav only.
+  const slotPosts = buildSlotPosts(promotedEvents.slice(1, 2), "2026-10-14", "18:00");
+  if (slotPosts.length !== 2) throw new Error("no events today: the note and the board");
+  const note = slotPosts[0].text;
+  // Each message is named by its own first line, the thing Stav actually sees in the chat.
+  if (!note.includes(`1. "${slotPosts[1].text.split("\n")[0]}"`)) {
+    throw new Error(`the note should name each message by its title, got: ${note}`);
+  }
+  if (!note.includes("אין אירועים שמתקיימים היום")) {
+    throw new Error(`the note should say there is nothing today, got: ${note}`);
+  }
 
   // An event with an unsent flyer goes as its own image post, not also inside the text.
   {
