@@ -14,7 +14,8 @@ const intentModule = require("./classify-intent");
 const { addCorrection, buildCorrectionGuidance } = require("./corrections-store");
 const answerInquiryModule = require("./answer-inquiry");
 const { sendWhatsApp, getMessageStatus, postForm, splitBody } = require("./send-whatsapp");
-const { fetchMediaAsDataUrl } = require("./fetch-media");
+// Called through the module object, so the suite can stub a successful download.
+const fetchMediaModule = require("./fetch-media");
 const { saveFlyer, flyerPath, contentTypeFor, deleteFlyer } = require("./flyer-store");
 const { logClick, logInteraction, clickStats, pruneOlderThan } = require("./clicks-store");
 const { sendChoice, renderNumbered, approvedTemplateSid, ensureTemplates } = require("./send-interactive");
@@ -1883,6 +1884,14 @@ async function acknowledgeDuplicate(sender, existing, image = "") {
   if (newFlyer) {
     notice = `🖼 ${existing.flyer ? "פלייר חדש" : "פלייר"} לאירוע #${existing.id} (${existing.event_name}), מ: ${sender}\n${existing.flyer ? "הוחלף באירוע" : "צורף לאירוע"}, ויישלח בהודעה היומית הבאה שהאירוע מופיע בה.`;
     noticeImage = flyerUrl(newFlyer);
+  } else if (!own && existing.status === "awaiting_confirm") {
+    // Stav has not seen this one: its organizer has not confirmed it yet. Someone else
+    // sending it is no confirmation, but she can approve it herself.
+    notice = `🔁 אירוע #${existing.id} (${existing.event_name}) נשלח גם מ: ${sender}\nהוא עדיין מחכה לאישור של מי ששלח אותו. אפשר לאשר אותו כבר עכשיו: אשר ${existing.id}`;
+    if (image) {
+      notice += "\nהתמונה שצירפו מצורפת כאן, והפלייר של האירוע לא הוחלף.";
+      noticeImage = flyerUrl(saveFlyer(image, `${existing.id}-offered`));
+    }
   } else if (!own) {
     notice = `🔁 אירוע #${existing.id} (${existing.event_name}) נשלח שוב, מ: ${sender}\nלא נוסף כאירוע חדש.`;
     if (image) {
@@ -1890,12 +1899,18 @@ async function acknowledgeDuplicate(sender, existing, image = "") {
       noticeImage = flyerUrl(saveFlyer(image, `${existing.id}-offered`));
     }
   }
-  if (notice && process.env.NODE_ENV !== "test") {
+  if (notice && process.env.NODE_ENV === "test") {
+    outbox.push({ to: ADMIN_SENDER, text: notice, mediaUrl: noticeImage });
+  } else if (notice) {
     try {
       await sendWhatsApp(ADMIN_SENDER, notice, noticeImage);
     } catch (err) {
       console.error(`failed to tell the admin about a duplicate of event #${existing.id}:`, err);
     }
+  }
+
+  if (!own && existing.status === "awaiting_confirm") {
+    return "האירוע הזה כבר אצלנו ומחכה לאישור של מי ששלח אותו. העברנו את זה לסתיו.";
   }
 
   if (newFlyer) {
@@ -2067,15 +2082,23 @@ async function handleConfirmation(sender, text, mediaUrls) {
       const reply = await handleActiveSubmission(sender, text, mediaUrls);
       return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
     }
+    // A caption is a correction too ("new poster, and it's at 21:00"). Shown back
+    // unapplied, the organizer would take the change as made. Guarded before the
+    // download, so a refused caption leaves the flyer as it was.
+    const refused = trimmed ? correctionRefusal(sender, text) : "";
+    if (refused) return refused;
     let image;
     try {
-      image = await fetchMediaAsDataUrl(mediaUrls[0]);
+      image = await fetchMediaModule.fetchMediaAsDataUrl(mediaUrls[0]);
     } catch (err) {
       console.error("failed to fetch a replacement flyer:", err);
       return MEDIA_FETCH_FAILED_TEXT;
     }
     replaceFlyer(event, image);
-    return reshowPreviews(sender, event.id);
+    const changed = trimmed ? (await applyCorrection(event.id, trimmed)).changed : [];
+    // The flyer changed either way, so the previews always come back.
+    const prompt = await reshowPreviews(sender, event.id);
+    return trimmed && !changed.length ? `${CORRECTION_UNCLEAR_TEXT}\n\n${prompt}` : prompt;
   }
 
   if (CONFIRM_RE.test(trimmed)) {
@@ -2090,17 +2113,40 @@ async function handleConfirmation(sender, text, mediaUrls) {
   }
 
   if (!trimmed) return CONFIRM_PROMPT_TEXT;
-  if (text.length > MAX_MESSAGE_LENGTH) return MESSAGE_TOO_LONG_TEXT;
-  if (isRateLimited(sender)) return RATE_LIMITED_TEXT;
+  const refused = correctionRefusal(sender, text);
+  if (refused) return refused;
   const { changed } = await applyCorrection(event.id, trimmed);
   if (!changed.length) return `${CORRECTION_UNCLEAR_TEXT}\n\n${CONFIRM_PROMPT_TEXT}`;
   return reshowPreviews(sender, event.id);
 }
 
+// The guards in front of a correction's model call, whether the text came alone or as
+// an image caption. Returns the refusal, or "" to go ahead.
+function correctionRefusal(sender, text) {
+  if (text.length > MAX_MESSAGE_LENGTH) return MESSAGE_TOO_LONG_TEXT;
+  if (isRateLimited(sender)) return RATE_LIMITED_TEXT;
+  return "";
+}
+
 // An organizer who never answers is reminded once, three hours after being asked. The
 // event never reaches Stav on its own: it waits on her pending list until it expires.
-// Someone mid-draft or mid-question is skipped for now, so the reminder's "1" can't
-// land in that other conversation; a later sweep reminds them.
+// Deferred, without the note, while the sender is in any other conversation (a draft,
+// an inquiry, another open question, or the confirm question for a different event):
+// the reminder's "1" would land there, or confirm the wrong event. A later sweep sends it.
+function busyForConfirmReminder(sender, eventId) {
+  const open = awaitingConfirmation.get(sender);
+  if (open && String(open.eventId) !== String(eventId)) return true;
+  return (
+    activeSubmissions.has(sender) ||
+    activeInquiries.has(sender) ||
+    awaitingDailyChoice.has(sender) ||
+    awaitingPublishChoice.has(sender) ||
+    awaitingCancelChoice.has(sender) ||
+    awaitingIntentConfirm.has(sender) ||
+    offeredEscape.has(sender)
+  );
+}
+
 async function sendDueConfirmReminders(now = Date.now()) {
   const today = todayIso();
   const due = loadEvents(EVENTS_FILE).filter(
@@ -2114,7 +2160,7 @@ async function sendDueConfirmReminders(now = Date.now()) {
   );
   for (const event of due) {
     const sender = event.submitter;
-    if (activeSubmissions.has(sender) || activeInquiries.has(sender)) continue;
+    if (busyForConfirmReminder(sender, event.id)) continue;
     // Noted before the send, so a failed or slow send is never repeated.
     storeUpdateEvent(EVENTS_FILE, event.id, { notes: `${event.notes || ""} | ${CONFIRM_REMINDER_NOTE}`.replace(/^ \| /, "") });
     if (!awaitingConfirmation.has(sender)) {
@@ -2850,7 +2896,7 @@ async function handleActiveSubmission(sender, text, mediaUrls, { rateCounted = f
     const remainingSlots = Math.max(0, MAX_IMAGES_PER_EVENT - images.length);
     const urlsToFetch = mediaUrls.slice(0, remainingSlots);
     try {
-      const fetched = await Promise.all(urlsToFetch.map(fetchMediaAsDataUrl));
+      const fetched = await Promise.all(urlsToFetch.map((url) => fetchMediaModule.fetchMediaAsDataUrl(url)));
       images.push(...fetched);
       activeSubmissionImages.set(sender, images);
       saveState();

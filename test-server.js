@@ -2375,6 +2375,28 @@ async function demo() {
     // an image that fails to download changes nothing and keeps the question open
     await routeMessage(sender, "", ["https://example.test/flyer.jpg"]);
     if (find().status !== "awaiting_confirm" || !awaitingConfirmation.has(sender)) throw new Error("question still open");
+    // a downloaded image becomes the flyer, and its caption is applied as a correction
+    const fetchMedia = require("./fetch-media");
+    const realFetch = fetchMedia.fetchMediaAsDataUrl;
+    fetchMedia.fetchMediaAsDataUrl = async () => flyerDataUrl;
+    try {
+      outbox.length = 0;
+      const plain = await routeMessage(sender, "", ["https://example.test/flyer.jpg"]);
+      const firstFlyer = find().flyer;
+      if (!plain.includes("1. כן") || !firstFlyer) throw new Error("an image alone becomes the flyer");
+      if (!outbox.filter((m) => m.to === sender)[1].mediaUrl) throw new Error("the ad preview carries the new flyer");
+      CORRECTION_STUB.set("והשעה 22:00", { start_time: "22:00" });
+      outbox.length = 0;
+      const otherImage = `data:image/png;base64,${Buffer.concat([pngBytes, Buffer.from([1])]).toString("base64")}`;
+      fetchMedia.fetchMediaAsDataUrl = async () => otherImage;
+      const captioned = await routeMessage(sender, "והשעה 22:00", ["https://example.test/flyer2.jpg"]);
+      if (!captioned.includes("1. כן") || captioned.includes("לא הצלחנו להבין")) throw new Error("the caption is applied");
+      if (find().start_time !== "22:00" || find().flyer === firstFlyer) throw new Error("caption and flyer both applied");
+      if (outbox.filter((m) => m.to === sender && m.text.includes("22:00")).length !== 2) throw new Error("previews show the caption's change");
+      if (toAdmin().length) throw new Error("Stav still not told");
+    } finally {
+      fetchMedia.fetchMediaAsDataUrl = realFetch;
+    }
 
     // idle for six hours: still answers the prompt, not the menu
     lastActivity.set(sender, Date.now() - 6 * 60 * 60 * 1000);
@@ -2406,6 +2428,18 @@ async function demo() {
     const resent = await routeMessage(other, "שם האירוע: שלישי\nתאריך: 2099-02-04\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מסיבה\nקישור: https://x.co");
     if (!resent.includes("1. כן") || !awaitingConfirmation.has(other) || toAdmin().length) throw new Error("question reopened, Stav not told");
     if (eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.event_name === "שלישי").length !== 1) throw new Error("filed once");
+    // someone else sending it is not its confirmation; Stav hears it is waiting, and can approve it
+    const stranger = "whatsapp:+972500017104";
+    outbox.length = 0;
+    await routeMessage(stranger, "2");
+    const strangerReply = await routeMessage(stranger, "שם האירוע: שלישי\nתאריך: 2099-02-04\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מסיבה\nקישור: https://x.co");
+    if (strangerReply !== "האירוע הזה כבר אצלנו ומחכה לאישור של מי ששלח אותו. העברנו את זה לסתיו.") throw new Error(`stranger told it waits, got: ${strangerReply}`);
+    const waitingId = findOther().id;
+    if (toAdmin().length !== 1 || !toAdmin()[0].text.includes(`אשר ${waitingId}`) || toAdmin()[0].text.includes("לא נוסף")) {
+      throw new Error("Stav told it waits for its organizer, with the approve command");
+    }
+    if (findOther().status !== "awaiting_confirm" || awaitingConfirmation.has(stranger)) throw new Error("not confirmed by a stranger");
+    if (eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.event_name === "שלישי").length !== 1) throw new Error("still filed once");
     await routeMessage(other, "תפריט");
 
     // a new flyer with an announcement is the next event; the first stays pending
@@ -2438,6 +2472,37 @@ async function demo() {
     expirePastEvents(eventsStore.loadEvents(TEST_EVENTS_FILE));
     if (eventsStore.findEvent(TEST_EVENTS_FILE, waiting).status !== "expired") throw new Error("expired");
     if (awaitingConfirmation.has("whatsapp:+972500017102")) throw new Error("its question is dropped");
+
+    // The reminder waits while the sender has another conversation open: the confirm
+    // question for another event, or the day question. Deferred, not dropped.
+    const busy = "whatsapp:+972500017105";
+    const asking = "whatsapp:+972500017106";
+    const overdue = (name, who) => {
+      const rowId = eventsStore.appendEvent(TEST_EVENTS_FILE, { event_name: name, date: "2099-03-02", start_time: "20:00" }, "test", who, []);
+      eventsStore.updateEvent(TEST_EVENTS_FILE, rowId, { status: "awaiting_confirm", confirm_asked_at: new Date(Date.now() - 4 * 3600e3).toISOString() });
+      return rowId;
+    };
+    const busyId = overdue("עסוק", busy);
+    const askingId = overdue("נשאל", asking);
+    awaitingConfirmation.set(busy, { eventId: "99999", unresolved: [] });
+    awaitingDailyChoice.set(asking, { eventId: "99998", options: [], expectingDate: false });
+    const remindersTo = (who) => outbox.filter((m) => m.to === who && m.text.includes("תזכורת")).length;
+    const noted = (rowId) => eventsStore.findEvent(TEST_EVENTS_FILE, rowId).notes.includes("נשלחה תזכורת אישור");
+    outbox.length = 0;
+    await sendDueConfirmReminders();
+    if (remindersTo(busy) || noted(busyId) || String(awaitingConfirmation.get(busy).eventId) !== "99999") {
+      throw new Error("a reminder must not point 1 at another event's question");
+    }
+    if (remindersTo(asking) || noted(askingId) || awaitingConfirmation.has(asking)) {
+      throw new Error("a reminder must not take over the day question");
+    }
+    awaitingConfirmation.delete(busy);
+    awaitingDailyChoice.delete(asking);
+    await sendDueConfirmReminders();
+    if (remindersTo(busy) !== 1 || remindersTo(asking) !== 1) throw new Error("sent once the other questions close");
+    if (String(awaitingConfirmation.get(busy).eventId) !== String(busyId)) throw new Error("and it points at its own event");
+    awaitingConfirmation.delete(busy);
+    awaitingConfirmation.delete(asking);
   }
 
   fs.unlinkSync(CORRECTIONS_FILE);
