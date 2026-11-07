@@ -38,7 +38,7 @@ function availableWindows(event, local) {
 // "tomorrow"; anything further out carries the full date.
 function adDateLine(event, postDate, windowKey) {
   if (runsOn(event, postDate)) {
-    return event.start_time >= "17:00" ? "*הערב!*" : "*היום!*";
+    return windowKey === "evening" || event.start_time >= "17:00" ? "*הערב!*" : "*היום!*";
   }
   if (addDays(postDate, 1) === event.date) return `*מחר!* ${longDate(event.date)}`;
   return `*${longDate(event.date)}*`;

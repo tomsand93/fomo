@@ -54,6 +54,10 @@ assert.ok(adDateLine(sat, "2026-11-06", "evening").startsWith("*מחר!* "));
 assert.ok(adDateLine(sat, "2026-11-05", "evening").startsWith("*יום"));
 assert.strictEqual(adDateLine(ev("2026-11-05", "20:00", { end_date: "2026-11-07" }), "2026-11-06", "evening"), "*הערב!*");
 
+// a running multi-day event that started early, posted in the evening window, is tonight
+assert.strictEqual(adDateLine(ev("2026-11-05", "12:00", { end_date: "2026-11-07" }), "2026-11-06", "evening"), "*הערב!*");
+assert.strictEqual(adDateLine(ev("2026-11-05", "12:00", { end_date: "2026-11-07" }), "2026-11-06", "morning"), "*היום!*");
+
 assert.strictEqual(windowPhrase({ date: "2026-11-05", key: "evening" }, "2026-11-05"), "היום בערב");
 assert.strictEqual(windowPhrase({ date: "2026-11-06", key: "morning" }, "2026-11-05"), "מחר בבוקר");
 assert.ok(windowPhrase({ date: "2026-11-07", key: "evening" }, "2026-11-05").endsWith("בערב"));
