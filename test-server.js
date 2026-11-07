@@ -2840,6 +2840,62 @@ async function demo() {
     await routeMessage(offered, "ביטול");
   }
 
+  // --- Natural answers at the ad question: no declines, yes and questions re-ask, a date is a date ---
+  {
+    const eventsStore = require("./events-store");
+    const sender = "whatsapp:+972500017407";
+    const seed = async () => {
+      const id = eventsStore.appendEvent(TEST_EVENTS_FILE, { event_name: "טבעי", date: "2099-05-10", start_time: "20:00", location: "מקום" }, "test", sender, []);
+      eventsStore.updateEvent(TEST_EVENTS_FILE, id, { status: "submitted", flyer: "f.jpg" });
+      lastInbound.set(sender, Date.now());
+      await routeMessage(ADMIN, `אשר ${id}`);
+      if (!awaitingAdChoice.has(sender)) throw new Error("the offer is open");
+      outbox.length = 0;
+      return id;
+    };
+    const row = (id) => eventsStore.findEvent(TEST_EVENTS_FILE, id);
+    const toAdmin = () => outbox.filter((m) => m.to === ADMIN);
+
+    for (const no of ["לא", "לא תודה", "לא צריך", "no"]) {
+      const id = await seed();
+      const reply = await routeMessage(sender, no);
+      if (row(id).ad_window !== "decline" || awaitingAdChoice.has(sender)) throw new Error(`"${no}" declines`);
+      if (!reply.includes("אין בעיה") || toAdmin().length) throw new Error(`"${no}" is not sent to Stav`);
+    }
+
+    let id = await seed();
+    for (const yes of ["כן", "בטח", "yes"]) {
+      const reply = await routeMessage(sender, yes);
+      if (!reply.includes("1.") || reply.includes("העברנו") || toAdmin().length) throw new Error(`"${yes}" asks again, unforwarded`);
+      if (!awaitingAdChoice.has(sender) || row(id).ad_window) throw new Error(`"${yes}" books nothing`);
+    }
+    const question = await routeMessage(sender, "מתי זה יתפרסם?");
+    if (!question.includes("1.") || question.includes("העברנו") || toAdmin().length) throw new Error("a question is answered with the question again");
+    // a change asked as a question is still a correction, and reaches Stav
+    const change = await routeMessage(sender, "אפשר לשנות את המחיר ל-50?");
+    if (!change.includes("העברנו") || toAdmin().length !== 1 || !toAdmin()[0].text.includes("המחיר ל-50")) {
+      throw new Error("a change phrased as a question is forwarded");
+    }
+
+    // a date at the offer step goes the "another date" way
+    const [y, m, d] = inDays(14).split("-");
+    const typed = `${Number(d)}.${Number(m)}.${y}`;
+    outbox.length = 0;
+    const dated = await routeMessage(sender, typed);
+    const open = awaitingAdChoice.get(sender);
+    if (!dated.includes("בוקר או ערב") || open.step !== "window" || toAdmin().length) throw new Error(`a date at the offer step asks morning or evening, got: ${dated}`);
+    if (open.options.some((o) => o.date !== inDays(14))) throw new Error("the windows are that date's");
+    awaitingAdChoice.delete(sender);
+
+    // and at the pick step
+    id = await seed();
+    await routeMessage(sender, "2");
+    if (awaitingAdChoice.get(sender).step !== "pick") throw new Error("the window list is open");
+    const picked = await routeMessage(sender, typed);
+    if (!picked.includes("בוקר או ערב") || awaitingAdChoice.get(sender).step !== "window" || toAdmin().length) throw new Error("a date at the pick step asks morning or evening");
+    awaitingAdChoice.delete(sender);
+  }
+
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });

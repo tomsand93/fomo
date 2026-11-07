@@ -1991,9 +1991,14 @@ async function acknowledgeDuplicate(sender, existing, image = "") {
 // rather than being re-extracted: it's usually a fragment ("actually it's tomorrow") that
 // only means anything against the event it amends, and she's editing the row by hand anyway.
 async function forwardAmendmentToAdmin(id, text, sender) {
-  if (process.env.NODE_ENV === "test") return;
+  const body = `✏ תוספת לאירוע #${id}\nמאת: ${sender}\n\n${text}`;
+  // Recorded under test, so the suite can tell a forwarded message from one kept back.
+  if (process.env.NODE_ENV === "test") {
+    outbox.push({ to: ADMIN_SENDER, text: body, mediaUrl: "" });
+    return;
+  }
   try {
-    await sendWhatsApp(ADMIN_SENDER, `✏ תוספת לאירוע #${id}\nמאת: ${sender}\n\n${text}`);
+    await sendWhatsApp(ADMIN_SENDER, body);
   } catch (err) {
     console.error(`failed to forward amendment for event #${id}:`, err);
   }
@@ -2545,13 +2550,7 @@ async function handleAdChoice(sender, text, mediaUrls) {
   if (!trimmed) return adQuestionText(open);
 
   const picked = (open.options || []).find((option) => option.key === trimmed);
-  if (picked && picked.action === "decline") {
-    storeUpdateEvent(EVENTS_FILE, event.id, { ad_window: "decline" });
-    awaitingAdChoice.delete(sender);
-    saveState();
-    const board = boardSlotFor(event, local);
-    return NO_AD_TEXT(dayName(board ? board.date : event.date));
-  }
+  if (picked && picked.action === "decline") return declineAd(sender, event, local);
   if (picked && picked.action === "pick") {
     return askForWindow(sender, event, local, PICK_WINDOW_PROMPT);
   }
@@ -2563,7 +2562,9 @@ async function handleAdChoice(sender, text, mediaUrls) {
     return chooseAdWindow(sender, event, { date: picked.date, window: picked.window }, local);
   }
 
-  if (open.step === "date") {
+  // A date typed at the offer or the window list is the "another date" answer, given
+  // early: the organizer skipped the step that asks for it.
+  if (open.step === "date" || open.step === "offer" || open.step === "pick") {
     const date = parseUserDate(trimmed, local.date);
     if (date && date < local.date) return PAST_DATE_TEXT;
     if (date) {
@@ -2576,6 +2577,16 @@ async function handleAdChoice(sender, text, mediaUrls) {
     }
   }
 
+  // A plain no is the "no" option, at any step. A plain yes can't say which window, so
+  // the question is asked again. Neither is a correction for Stav.
+  if (AD_NO_RE.test(trimmed)) return declineAd(sender, event, local);
+  if (AD_YES_RE.test(trimmed)) return adQuestionText(open);
+  // A question about the ad or the event ("when does it go out?") has nothing for Stav
+  // to change, so it gets the question again. A change asked as a question ("can you
+  // change the price to 50?") is still a correction, and goes on to her below: a
+  // correction is never dropped.
+  if (looksLikeQuestion(trimmed) && !CHANGE_REQUEST_RE.test(trimmed)) return adQuestionText(open);
+
   // A number that is no option is a mistyped answer, not a correction for Stav.
   if (/^\d+[.)]?$/.test(trimmed)) return adQuestionText(open);
 
@@ -2583,6 +2594,21 @@ async function handleAdChoice(sender, text, mediaUrls) {
   // to Stav, and the question is asked again.
   await forwardAmendmentToAdmin(event.id, trimmed, sender);
   return `${AMENDMENT_AFTER_APPROVAL_TEXT}\n\n${adQuestionText(open)}`;
+}
+
+// Natural answers to the ad question, whole message only.
+const AD_NO_RE = /^(לא|לא,? תודה|לא צריך|no|no thanks)[\s!.]*$/i;
+const AD_YES_RE = /^(כן|בטח|yes)[\s!.]*$/i;
+// A question that asks for a change to the event, which Stav has to see.
+const CHANGE_REQUEST_RE = /לשנות|לתקן|לעדכן|להחליף|להוסיף|להוריד|להזיז|לדחות|להקדים|שינוי|תיקון|טעות|במקום/;
+
+// "No ad": recorded so the event is never offered again, and the question closes.
+function declineAd(sender, event, local) {
+  storeUpdateEvent(EVENTS_FILE, event.id, { ad_window: "decline" });
+  awaitingAdChoice.delete(sender);
+  saveState();
+  const board = boardSlotFor(event, local);
+  return NO_AD_TEXT(dayName(board ? board.date : event.date));
 }
 
 // The window list, freshly worked out. With nothing left, the question closes.
