@@ -31,7 +31,7 @@ process.env.PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://test.fomo.
 // The flyer-and-text pairing window, shortened so the suite does not sit in it.
 process.env.PAIR_WAIT_MS = "50";
 
-const { receiveInbound, looksLikeEventAnnouncement, routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, publishDayOptions, goodbyeText, goodbyeMessage, sendGoodbyes, mapsUrl, mapLink, awaitingPublishChoice, awaitingDailyChoice, activeSubmissions, awaitingIntentConfirm, offeredEscape, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS, outbox, awaitingConfirmation } = require("./server");
+const { receiveInbound, looksLikeEventAnnouncement, routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, goodbyeText, goodbyeMessage, sendGoodbyes, mapsUrl, mapLink, awaitingAdChoice, pendingAdOffers, offerFor, activeSubmissions, awaitingIntentConfirm, offeredEscape, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, IDLE_TIMEOUT_MS, outbox, awaitingConfirmation } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -93,9 +93,9 @@ function inDays(n) {
   return new Date(Date.now() + n * 864e5).toISOString().slice(0, 10);
 }
 
-// The publish-day question is no longer asked at submission, only after approval. This
-// confirms the sender's pending event and has Stav approve it, which opens that question.
-async function openDayQuestion(sender) {
+// Confirms the sender's pending event and has Stav approve it, which offers the ad. The
+// sender has just written, so their window is open and the question opens at once.
+async function openAdQuestion(sender) {
   const { eventId } = awaitingConfirmation.get(sender);
   await routeMessage(sender, "1");
   const mode = adminMode.get(ADMIN);
@@ -132,8 +132,8 @@ async function demo() {
 
   // The publish-day question is no longer asked at submission; the organizer confirms
   // both versions instead.
-  if (awaitingPublishChoice.has(sender)) {
-    throw new Error("a completed submission no longer asks which day to publish");
+  if (awaitingAdChoice.has(sender)) {
+    throw new Error("a completed submission asks nothing about an ad before approval");
   }
   const confirmedReply = await routeMessage(sender, "1");
   if (!confirmedReply.includes("עבר לבדיקה")) throw new Error("confirming sends the event to review");
@@ -271,7 +271,7 @@ async function demo() {
 
   // Acting on the event clears the flag, so it isn't reported forever.
   const adminApprove = await routeMessage(ADMIN, `אשר ${missedId}`);
-  if (!adminApprove.includes("אושר ופורסם")) throw new Error("admin approval should publish the event");
+  if (!adminApprove.includes(`אירוע #${missedId} אושר.`)) throw new Error("admin approval should publish the event");
   if (undeliveredAdminNotices.has(missedId)) {
     throw new Error("acting on an event should clear its missed-notice flag");
   }
@@ -396,8 +396,8 @@ async function demo() {
     throw new Error("reply-based approval should publish the replied-to event");
   }
 
-  // An explicit id is unambiguous too. The approval above asked its submitter the day
-  // question; leave it first.
+  // An explicit id is unambiguous too. The approval above offered its submitter an ad;
+  // leave the question first.
   await routeMessage(replySubmitter, "תפריט");
   await routeMessage(replySubmitter, "2");
   await routeMessage(replySubmitter, "ערב יין שני, 6.6, כניסה חופשית");
@@ -405,7 +405,7 @@ async function demo() {
   const pending2 = eventsStore.loadEvents(TEST_EVENTS_FILE).filter((e) => e.status === "submitted");
   const explicitId = pending2[pending2.length - 1].id;
   const explicitApprove = await routeMessage(ADMIN, `אשר ${explicitId}`);
-  if (!explicitApprove.includes("אושר ופורסם")) throw new Error('"אשר <id>" should approve the named event');
+  if (!explicitApprove.includes(`אירוע #${explicitId} אושר.`)) throw new Error('"אשר <id>" should approve the named event');
 
   // REGRESSION (chat_history.txt:148-149): "2" meant the menu's "publish an event", but was
   // read as the reject shortcut and silently rejected event #10. Digits must never act.
@@ -1247,95 +1247,48 @@ async function demo() {
   if (slotsAt(6, 17, 50) !== "18:00") throw new Error("Saturday must also have the evening slot");
   if (slotsAt(1, 9, 50) !== "10:00" || slotsAt(6, 9, 50) !== "10:00") throw new Error("every day has the 10:00 ads slot");
 
-  // --- Phase 3: publish-day choice, approval flow, goodbye ---
+  // --- Phase 3: the ad question after approval, goodbye ---
 
-  // Options whose day has already passed are dropped, not offered and rejected, and
-  // the survivors are renumbered so the keys are always contiguous.
-  const near = publishDayOptions("2026-08-27", "2026-08-25"); // two days out
-  if (near.some((o) => o.label === "שבוע לפני")) {
-    throw new Error('"a week before" must not be offered for an event two days away');
-  }
-  const far = publishDayOptions("2026-09-04", "2026-08-25"); // ten days out
-  if (!far.some((o) => o.label === "שבוע לפני")) {
-    throw new Error('"a week before" must be offered for an event ten days away');
-  }
-  for (const options of [near, far]) {
-    options.forEach((option, i) => {
-      if (option.key !== String(i + 1)) {
-        throw new Error(`option keys must be contiguous 1..n, got ${option.key} at index ${i}`);
-      }
-    });
-    // The two escape hatches always come last, in this order: type a date, or decline
-    // outright. Declining must be offered — without it a submitter who only wants the
-    // weekly board has no way to say so.
-    if (options[options.length - 2].date !== null) {
-      throw new Error('the second-to-last option must be the free-form "another date"');
-    }
-    if (options[options.length - 1].date !== "decline") {
-      throw new Error("the last option must be declining the daily message");
-    }
-    // A date the submitter cannot act on is worse than one fewer choice.
-    for (const option of options) {
-      if (option.date !== null && option.date < "2026-08-25") {
-        throw new Error(`a publish day in the past must never be offered: ${option.date}`);
-      }
-    }
-  }
-  // For an event tomorrow, "day before" and "as soon as possible" are the same day;
-  // offering the same date twice looks broken.
-  const tomorrowOptions = publishDayOptions("2026-08-26", "2026-08-25");
-  const dates = tomorrowOptions.filter((o) => o.date).map((o) => o.date);
-  if (dates.length !== new Set(dates).size) {
-    throw new Error("publish-day options must not offer the same date twice");
-  }
-
-  // ORDERING REGRESSION: the choice handler must sit above the recentlyCompleted
-  // branch. A bare "2" answering the question would otherwise be read as a stray
-  // follow-up and forwarded to Stav as a correction to the event.
+  // ORDERING REGRESSION: the ad question must sit above the recentlyCompleted branch. A
+  // bare "3" answering it would otherwise be read as a stray follow-up and forwarded to
+  // Stav as a correction to the event.
   const choiceSender = "whatsapp:+972500009111";
   await routeMessage(choiceSender, "2");
   await routeMessage(
     choiceSender,
     `שם האירוע: בדיקת בחירה\nתאריך: ${inDays(20)}\nשעה: 20:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/9`
   );
-  await openDayQuestion(choiceSender);
-  if (!awaitingDailyChoice.has(choiceSender)) {
-    throw new Error("the publish-day question should be open after approval");
+  await openAdQuestion(choiceSender);
+  if (!awaitingAdChoice.has(choiceSender)) {
+    throw new Error("the ad question should be open after approval");
   }
-  const numericAnswer = await routeMessage(choiceSender, "2");
+  const numericAnswer = await routeMessage(choiceSender, "3");
   if (numericAnswer.includes("העברנו")) {
-    throw new Error("a numeric answer to the publish-day question must not be forwarded as an amendment");
+    throw new Error("a numeric answer to the ad question must not be forwarded as an amendment");
   }
-  if (!numericAnswer.includes("נשלח אותו להודעה היומית")) {
-    throw new Error("a numeric answer should be read as the chosen day");
-  }
-  const chosenRow = eventsStore.loadEvents(TEST_EVENTS_FILE)
-    .find((e) => e.event_name === "בדיקת בחירה");
-  if (chosenRow.daily_days !== inDays(19)) {
-    throw new Error(`"day before" should record the day before the event, got ${chosenRow.daily_days}`);
+  if (!numericAnswer.includes("אין בעיה")) {
+    throw new Error("a numeric answer should be read as the choice");
   }
 
-  // The sharper form of the same hazard: an answer that is NOT a menu digit. "2" would
-  // survive a mis-ordering by falling through to menu option 2, but a typed date has no
-  // such luck — below recentlyCompleted it is forwarded to Stav as a correction and the
-  // submitter's answer is lost.
+  // The sharper form of the same hazard: an answer that is NOT a menu digit. A typed date
+  // has no menu option to fall through to; below recentlyCompleted it is forwarded to Stav
+  // as a correction and the answer is lost.
   const dateAnswerSender = "whatsapp:+972500009555";
   await routeMessage(dateAnswerSender, "2");
   await routeMessage(
     dateAnswerSender,
     `שם האירוע: בדיקת סדר\nתאריך: ${inDays(20)}\nשעה: 20:10\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/6`
   );
-  await openDayQuestion(dateAnswerSender);
-  // Pick by intent, not position: the option list gained a decline entry at the end.
-  const lastKey = awaitingDailyChoice.get(dateAnswerSender).options
-    .find((o) => o.date === null).key;
-  await routeMessage(dateAnswerSender, lastKey); // choose "another date"
-  const typedDate = await routeMessage(dateAnswerSender, inDays(19));
+  await openAdQuestion(dateAnswerSender);
+  await routeMessage(dateAnswerSender, "2"); // pick a window
+  const otherDateKey = awaitingAdChoice.get(dateAnswerSender).options.find((o) => o.label === "תאריך אחר").key;
+  await routeMessage(dateAnswerSender, otherDateKey);
+  const typedDate = await routeMessage(dateAnswerSender, inDays(15));
   if (typedDate.includes("העברנו")) {
     throw new Error("a typed date answering the question must not be forwarded as an amendment");
   }
-  if (!typedDate.includes("נשלח אותו להודעה היומית")) {
-    throw new Error("a typed date should be recorded as the chosen day");
+  if (!typedDate.includes("בוקר") || !typedDate.includes("ערב")) {
+    throw new Error("a typed date should ask morning or evening");
   }
 
   // Stav approves what the group receives, so the review notice must show both
@@ -1489,31 +1442,25 @@ async function demo() {
     throw new Error("the inquiry prompt must tell the model it cannot send reminders");
   }
 
-  // Declining is an answer, not a failure to answer. Before this option existed, a
-  // submitter who only wanted the weekly board had no way to say so: a non-matching
-  // reply just re-asked, and ignoring it let the question expire silently.
+  // Declining is an answer: recorded, so the offer is never made twice.
   const declineSender = "whatsapp:+972500009666";
   await routeMessage(declineSender, "2");
   await routeMessage(
     declineSender,
     `שם האירוע: בדיקת סירוב\nתאריך: ${inDays(20)}\nשעה: 20:20\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/4`
   );
-  await openDayQuestion(declineSender);
-  const declineKey = awaitingDailyChoice.get(declineSender).options
-    .find((o) => o.date === "decline").key;
-  const declined = await routeMessage(declineSender, declineKey);
-  if (!declined.includes("בלוח השבועי בלבד")) {
-    throw new Error("declining should confirm the event stays on the weekly board only");
+  await openAdQuestion(declineSender);
+  const declined = await routeMessage(declineSender, "3");
+  if (!declined.includes("בלוח היומי") || declined.includes("שבועי")) {
+    throw new Error("declining should confirm the event is on the daily board");
   }
-  if (awaitingDailyChoice.has(declineSender)) {
+  if (awaitingAdChoice.has(declineSender)) {
     throw new Error("declining should close the question");
   }
-  // Recorded, not left empty: empty means "not asked yet", and the question is asked
-  // again after approval, so a decline must be remembered or it gets re-asked.
   const declinedRow = eventsStore.loadEvents(TEST_EVENTS_FILE)
     .find((e) => e.event_name === "בדיקת סירוב");
-  if (declinedRow.daily_days !== "decline") {
-    throw new Error(`declining must be recorded, got ${JSON.stringify(declinedRow.daily_days)}`);
+  if (declinedRow.ad_window !== "decline") {
+    throw new Error(`declining must be recorded, got ${JSON.stringify(declinedRow.ad_window)}`);
   }
 
   // "Another date" asks for a date and validates it rather than spending an LLM call.
@@ -1523,23 +1470,36 @@ async function demo() {
     otherSender,
     `שם האירוע: בדיקת תאריך\nתאריך: ${inDays(20)}\nשעה: 20:30\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/8`
   );
-  await openDayQuestion(otherSender);
-  const otherKey = awaitingDailyChoice.get(otherSender).options
-    .find((o) => o.date === null).key;
+  await openAdQuestion(otherSender);
+  await routeMessage(otherSender, "2");
+  const otherKey = awaitingAdChoice.get(otherSender).options.find((o) => o.label === "תאריך אחר").key;
   const askedDate = await routeMessage(otherSender, otherKey);
   if (!askedDate.includes("איזה תאריך")) throw new Error('"another date" should ask for a date');
-  if (!(await routeMessage(otherSender, "לא תאריך")).includes("איזה תאריך")) {
-    throw new Error("an unparseable date should re-ask, not crash or accept");
+  // Not a date: a correction like any other, forwarded, and the question asked again.
+  const notADate = await routeMessage(otherSender, "לא תאריך");
+  if (!notADate.includes("העברנו") || !notADate.includes("איזה תאריך")) {
+    throw new Error("text that is not a date is forwarded, then the date is asked again");
   }
   if (!(await routeMessage(otherSender, "2020-01-01")).includes("כבר עבר")) {
     throw new Error("a past date should be refused");
   }
-  const acceptedDate = await routeMessage(otherSender, inDays(18));
-  if (!acceptedDate.includes("נשלח אותו להודעה היומית")) {
-    throw new Error("a valid future date should be accepted");
+  if (!(await routeMessage(otherSender, inDays(40))).includes("אין חלון")) {
+    throw new Error("a date after the event has no window");
   }
-  if (awaitingDailyChoice.has(otherSender)) {
-    throw new Error("the question should close once a date is given");
+  const windowQuestion = await routeMessage(otherSender, inDays(18));
+  if (!windowQuestion.includes("1. בוקר") || !windowQuestion.includes("2. ערב")) {
+    throw new Error("a valid date should ask morning or evening");
+  }
+  // It has a flyer by now, so the pick books (without one the bot would ask for it).
+  const otherId = eventsStore.loadEvents(TEST_EVENTS_FILE).find((e) => e.event_name === "בדיקת תאריך").id;
+  eventsStore.updateEvent(TEST_EVENTS_FILE, otherId, { flyer: "f.jpg" });
+  const bookedOther = await routeMessage(otherSender, "2");
+  const otherRow = eventsStore.loadEvents(TEST_EVENTS_FILE).find((e) => e.event_name === "בדיקת תאריך");
+  if (!bookedOther.includes("סגור") || otherRow.ad_date !== inDays(18) || otherRow.ad_window !== "evening") {
+    throw new Error(`the evening of the typed date should be booked, got ${otherRow.ad_date} ${otherRow.ad_window}`);
+  }
+  if (awaitingAdChoice.has(otherSender)) {
+    throw new Error("the question should close once a window is booked");
   }
 
   // Cancelling mid-question must clear it, not strand the sender.
@@ -1549,17 +1509,19 @@ async function demo() {
     cancelSender,
     `שם האירוע: בדיקת ביטול\nתאריך: ${inDays(20)}\nשעה: 20:40\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/7`
   );
-  await openDayQuestion(cancelSender);
+  await openAdQuestion(cancelSender);
   await routeMessage(cancelSender, "ביטול");
-  if (awaitingDailyChoice.has(cancelSender)) {
-    throw new Error('"ביטול" must clear an open publish-day question');
+  if (awaitingAdChoice.has(cancelSender)) {
+    throw new Error('"ביטול" must clear an open ad question');
   }
 
-  // Both maps must persist: the gap between asking and answering spans hours and a
-  // Fly suspend.
+  // Both persist: the gap between offering and answering spans hours and a Fly suspend.
   const persisted = JSON.parse(fs.readFileSync(TEST_STATE_FILE, "utf8"));
-  if (!("awaitingPublishChoice" in persisted) || !("awaitingDailyChoice" in persisted)) {
-    throw new Error("both publish-choice maps must be persisted across a restart");
+  if (!("awaitingAdChoice" in persisted) || !("pendingAdOffers" in persisted)) {
+    throw new Error("the ad question and the held offers must be persisted across a restart");
+  }
+  if ("awaitingPublishChoice" in persisted || "awaitingDailyChoice" in persisted) {
+    throw new Error("the removed publish-day maps are no longer saved");
   }
   if (!("awaitingConfirmation" in persisted)) {
     throw new Error("an open confirm question must be persisted across a restart");
@@ -1774,7 +1736,7 @@ async function demo() {
   // With no approved template — which is the state today — every choice is plain text.
   interactive._setApprovedTemplates(new Map());
   await interactive.sendChoice("whatsapp:+972500001111", {
-    text: "שאלה", options: threeOptions, template: "fomo_publish_day",
+    text: "שאלה", options: threeOptions, template: "fomo_ad_offer",
   });
   if (!posted[0].Body || posted[0].ContentSid) {
     throw new Error("without an approved template the choice must be sent as text");
@@ -1784,9 +1746,9 @@ async function demo() {
   // caller, NOT derived from the question: every approved template has literal text with
   // {{1}} standing for a value inside it (Meta rejects a body that is only a parameter),
   // so deriving them produced the sentence nested inside itself.
-  interactive._setApprovedTemplates(new Map([["fomo_publish_day_v2", "HXquick"]]));
+  interactive._setApprovedTemplates(new Map([["fomo_ad_offer", "HXquick"]]));
   await interactive.sendChoice("whatsapp:+972500001111", {
-    text: "שאלה", options: threeOptions, template: "fomo_publish_day_v2",
+    text: "שאלה", options: threeOptions, template: "fomo_ad_offer",
     variables: { 1: "מסיבת קיץ" },
   });
   if (posted[1].ContentSid !== "HXquick") throw new Error("an approved template should be used");
@@ -1802,7 +1764,7 @@ async function demo() {
   // option keys line up exactly. Five options do not, so this must stay text — otherwise
   // someone taps "day before" and the bot records something else.
   await interactive.sendChoice("whatsapp:+972500001111", {
-    text: "שאלה", options: fiveOptions, template: "fomo_publish_day_v2",
+    text: "שאלה", options: fiveOptions, template: "fomo_ad_offer",
     variables: { 1: "מסיבת קיץ" },
   });
   if (posted[2].ContentSid) {
@@ -1815,15 +1777,15 @@ async function demo() {
     { key: "9", label: "ג", date: null },
   ];
   await interactive.sendChoice("whatsapp:+972500001111", {
-    text: "שאלה", options: wrongKeys, template: "fomo_publish_day_v2",
+    text: "שאלה", options: wrongKeys, template: "fomo_ad_offer",
     variables: { 1: "מסיבת קיץ" },
   });
   if (posted[3].ContentSid) {
     throw new Error("three options with the wrong keys must not use the template");
   }
   // The registry must describe the templates that actually exist.
-  if (interactive.templateButtonKeys("fomo_publish_day_v2").join() !== "1,2,3") {
-    throw new Error("fomo_publish_day_v2 buttons must be 1,2,3");
+  if (interactive.templateButtonKeys("fomo_ad_offer").join() !== "1,2,3") {
+    throw new Error("fomo_ad_offer buttons must be 1,2,3");
   }
   if (interactive.templateButtonKeys("fomo_review_event").length !== 3) {
     throw new Error("fomo_review_event must declare its three buttons");
@@ -1836,12 +1798,14 @@ async function demo() {
     return { sid: "SM_stub" };
   };
   await interactive.sendChoice("whatsapp:+972500001111", {
-    text: "שאלה", options: threeOptions, template: "fomo_publish_day",
+    text: "שאלה", options: threeOptions, template: "fomo_ad_offer",
   });
   if (!posted[posted.length - 1].Body) {
     throw new Error("a failed template send must fall back to text, not drop the message");
   }
   whatsappModule.postForm = realPostForm;
+  // Nothing after this point runs with an approved template unless it says so.
+  interactive._setApprovedTemplates(new Map());
 
   // Inbound: a button tap arrives as ButtonPayload rather than Body. Each button's id
   // is the option's key, so a tap and a typed digit must reach the router identically.
@@ -1851,14 +1815,15 @@ async function demo() {
     tapSender,
     `שם האירוע: בדיקת כפתור\nתאריך: ${inDays(20)}\nשעה: 20:50\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/5`
   );
-  await openDayQuestion(tapSender);
-  if (!awaitingDailyChoice.has(tapSender)) {
-    throw new Error("the publish-day question should be open before testing a tap");
+  await openAdQuestion(tapSender);
+  if (!awaitingAdChoice.has(tapSender)) {
+    throw new Error("the ad question should be open before testing a tap");
   }
   // routeMessage is what handleTwilio calls once it has normalised ButtonPayload into
   // text, so passing the key directly is the same path a tap takes.
+  // "1" is the soonest window; this event has no flyer, so the bot asks for one.
   const tapped = await routeMessage(tapSender, "1");
-  if (!tapped.includes("נשלח אותו להודעה היומית")) {
+  if (!tapped.includes("צריך פלייר")) {
     throw new Error("a button payload must be handled exactly like a typed number");
   }
 
@@ -2084,24 +2049,6 @@ async function demo() {
   const noLinkRow = eventsStore.loadEvents(TEST_EVENTS_FILE).find((e) => e.event_name === "בלי קישור");
   if (!noLinkRow) throw new Error('the event answered with "אין" should be filed');
 
-  // Several publish days in one answer, in the shapes real submitters used.
-  for (const [i, answer] of ["1 ו2", "2. 1.", "1, 2", "ביום האירוע + יום לפני"].entries()) {
-    const multi = `whatsapp:+97250000955${i}`;
-    await routeMessage(multi, "2");
-    await routeMessage(
-      multi,
-      `שם האירוע: כמה ימים ${i}\nתאריך: ${inDays(15)}\nשעה: 2${i}:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/m`
-    );
-    await openDayQuestion(multi);
-    const reply = await routeMessage(multi, answer);
-    if (!reply.includes("נשלח אותו להודעה היומית")) {
-      throw new Error(`"${answer}" should pick several days, got: ${reply}`);
-    }
-    const row = eventsStore.loadEvents(TEST_EVENTS_FILE).find((e) => e.event_name === `כמה ימים ${i}`);
-    if (row.daily_days !== [inDays(14), inDays(15)].join(",")) {
-      throw new Error(`"${answer}" should record both days, got ${row.daily_days}`);
-    }
-  }
   // The same event sent in again is acknowledged, not filed a second time.
   {
     const again = "whatsapp:+972500009570";
@@ -2134,17 +2081,19 @@ async function demo() {
     if (rowOf().flyer !== kept) throw new Error("another sender's image must not replace the flyer");
   }
 
-  // A number that is not an option must not be half-accepted.
+  // A number that is not an option asks again; it is no correction for Stav.
   const badMulti = "whatsapp:+972500009560";
   await routeMessage(badMulti, "2");
   await routeMessage(
     badMulti,
     `שם האירוע: מספר שגוי\nתאריך: ${inDays(15)}\nשעה: 19:00\nמיקום: בר בזל, מסדה 12, חיפה\nקטגוריה: מוזיקה\nקישור: https://x.co/b`
   );
-  await openDayQuestion(badMulti);
-  if (!(await routeMessage(badMulti, "1, 9")).includes("אפשר לבחור כמה")) {
+  await openAdQuestion(badMulti);
+  const badNumber = await routeMessage(badMulti, "9");
+  if (!badNumber.includes("1. כן") || badNumber.includes("העברנו") || !awaitingAdChoice.has(badMulti)) {
     throw new Error("an answer with an out-of-range number should re-ask");
   }
+  await routeMessage(badMulti, "תפריט");
 
   // Answering slowly, one field per message, must never hit the give-up limit.
   const stepwise = "whatsapp:+972500009570";
@@ -2476,7 +2425,7 @@ async function demo() {
     if (awaitingConfirmation.has("whatsapp:+972500017102")) throw new Error("its question is dropped");
 
     // The reminder waits while the sender has another conversation open: the confirm
-    // question for another event, or the day question. Deferred, not dropped.
+    // question for another event, or the ad question. Deferred, not dropped.
     const busy = "whatsapp:+972500017105";
     const asking = "whatsapp:+972500017106";
     const overdue = (name, who) => {
@@ -2487,7 +2436,7 @@ async function demo() {
     const busyId = overdue("עסוק", busy);
     const askingId = overdue("נשאל", asking);
     awaitingConfirmation.set(busy, { eventId: "99999", unresolved: [] });
-    awaitingDailyChoice.set(asking, { eventId: "99998", options: [], expectingDate: false });
+    awaitingAdChoice.set(asking, { eventId: "99998", step: "offer", askedAt: Date.now(), options: [] });
     const remindersTo = (who) => outbox.filter((m) => m.to === who && m.text.includes("תזכורת")).length;
     const noted = (rowId) => eventsStore.findEvent(TEST_EVENTS_FILE, rowId).notes.includes("נשלחה תזכורת אישור");
     outbox.length = 0;
@@ -2496,10 +2445,10 @@ async function demo() {
       throw new Error("a reminder must not point 1 at another event's question");
     }
     if (remindersTo(asking) || noted(askingId) || awaitingConfirmation.has(asking)) {
-      throw new Error("a reminder must not take over the day question");
+      throw new Error("a reminder must not take over the ad question");
     }
     awaitingConfirmation.delete(busy);
-    awaitingDailyChoice.delete(asking);
+    awaitingAdChoice.delete(asking);
     await sendDueConfirmReminders();
     if (remindersTo(busy) !== 1 || remindersTo(asking) !== 1) throw new Error("sent once the other questions close");
     if (String(awaitingConfirmation.get(busy).eventId) !== String(busyId)) throw new Error("and it points at its own event");
@@ -2578,6 +2527,147 @@ async function demo() {
     outbox.length = 0;
     const forwarded = await routeMessage(sender, "תודה רבה");
     if (!forwarded.includes("העברנו את התוספת")) throw new Error("unchanged text is forwarded to Stav");
+  }
+
+  // --- After approval: the ad offer, and booking it into a window ---
+  {
+    const eventsStore = require("./events-store");
+    const interactive = require("./send-interactive");
+    const fetchMedia = require("./fetch-media");
+    const { boardSlotFor } = require("./server");
+    const sender = "whatsapp:+972500017301";
+    const clock = { date: "2026-11-05", hour: 14, minute: 30, day: 4 };
+    const event = { id: "9", event_name: "יין", date: "2026-11-07", start_time: "20:00", flyer: "f.jpg" };
+
+    const offer = offerFor(event, clock);
+    if (!offer.offerText.includes("היום בערב") || !offer.offerText.includes("18:00")) throw new Error("names the real time");
+    if (offer.offerText.includes("שבועי")) throw new Error("no weekly board");
+    if (!offer.approvalText.includes("12:00")) throw new Error("names the board slot");
+    if (offer.options.map((o) => o.key).join() !== "1,2,3") throw new Error("the offer matches the fomo_ad_offer buttons");
+    // the 21:01 case: no offer, and the reason
+    const late = offerFor({ ...event, date: "2026-11-05", start_time: "22:00" }, { ...clock, hour: 21, minute: 1 });
+    if (late.offerText || !late.approvalText.includes("10:00")) throw new Error("no window");
+    if (!late.approvalText.includes("22:00") || late.approvalText.length > 1600) throw new Error("says why");
+
+    // The board slot: the first of the day's board slots, never the 10:00 ads slot; on
+    // the day itself only a slot still ahead that will carry the event.
+    const saturday = { date: "2026-11-07", hour: 13, minute: 0, day: 6 };
+    if (boardSlotFor(event, clock).slot !== "12:00") throw new Error("Saturday's first board is 12:00");
+    if (boardSlotFor({ ...event, date: "2026-11-09" }, clock).slot !== "18:00") throw new Error("a weekday's is 18:00");
+    if (boardSlotFor({ ...event, start_time: "14:00" }, saturday)) throw new Error("12:00 went out, and 18:00 leaves out a 14:00 event");
+    if (boardSlotFor({ ...event, start_time: "19:00" }, saturday).slot !== "18:00") throw new Error("an evening event is on 18:00");
+
+    const seed = async (fields = {}) => {
+      const id = eventsStore.appendEvent(TEST_EVENTS_FILE, { event_name: "יין", date: "2099-05-10", start_time: "20:00", location: "מקום" }, "test", sender, []);
+      eventsStore.updateEvent(TEST_EVENTS_FILE, id, { status: "submitted", flyer: "f.jpg", ...fields });
+      outbox.length = 0;
+      await routeMessage(ADMIN, `אשר ${id}`);
+      return id;
+    };
+    const row = (id) => eventsStore.findEvent(TEST_EVENTS_FILE, id);
+
+    // two separate messages, nothing posted to Stav at approval
+    lastActivity.set(sender, Date.now());
+    let id = await seed();
+    if (outbox.filter((m) => m.to === sender).length !== 2) throw new Error("approval then offer");
+    if (outbox.some((m) => m.to === ADMIN && m.mediaUrl)) throw new Error("no flyer post at approval");
+    if (outbox.some((m) => m.text.length > 1600)) throw new Error("each message fits");
+
+    // "1" books the first window
+    const yes = await routeMessage(sender, "1");
+    if (!yes.includes("סגור") || !row(id).ad_date || !row(id).ad_window) throw new Error("booked");
+    if (awaitingAdChoice.has(sender)) throw new Error("closed");
+
+    // "3" declines
+    id = await seed();
+    await routeMessage(sender, "3");
+    if (row(id).ad_window !== "decline") throw new Error("declined");
+
+    // "2" lists windows; a pick books that one
+    id = await seed();
+    const list = await routeMessage(sender, "2");
+    if (!list.includes("1.") || !list.includes("תאריך אחר")) throw new Error("window list, with more available");
+    const listed = awaitingAdChoice.get(sender).options;
+    if (listed.length !== 7 || listed[6].label !== "תאריך אחר" || !list.includes("7. תאריך אחר")) throw new Error("six windows at most");
+    const second = awaitingAdChoice.get(sender).options[1];
+    await routeMessage(sender, "2");
+    if (row(id).ad_window !== second.window || row(id).ad_date !== second.date) throw new Error("picked");
+
+    // a window that passed while they waited is not booked
+    id = await seed({ date: "2099-05-10" });
+    await routeMessage(sender, "2");
+    const open = awaitingAdChoice.get(sender);
+    open.options[0] = { ...open.options[0], date: "2020-01-01" };
+    const stale = await routeMessage(sender, "1");
+    if (!stale.includes("כבר עבר") || row(id).ad_window) throw new Error("stale window");
+    awaitingAdChoice.delete(sender);
+
+    // a correction during the question reaches Stav, and the question is repeated
+    id = await seed();
+    outbox.length = 0;
+    const fix = await routeMessage(sender, "אפשר לשנות את השעה ל-20:30?");
+    if (!fix.includes("העברנו") || !fix.includes("1.")) throw new Error("forwarded, then repeated");
+    if (row(id).start_time !== "20:00") throw new Error("nothing changes automatically");
+    awaitingAdChoice.delete(sender);
+
+    // no flyer: asks for one, and the image completes the booking
+    id = await seed({ flyer: "" });
+    if (!(await routeMessage(sender, "1")).includes("פלייר")) throw new Error("asks for a flyer");
+    if (row(id).ad_window) throw new Error("not booked without a flyer");
+    const realFetch = fetchMedia.fetchMediaAsDataUrl;
+    fetchMedia.fetchMediaAsDataUrl = async () => flyerDataUrl;
+    try {
+      const withFlyer = await routeMessage(sender, "", ["https://example.test/ad-flyer.jpg"]);
+      if (!withFlyer.includes("סגור") || !row(id).flyer || !row(id).ad_window) throw new Error("the image completes the booking");
+    } finally {
+      fetchMedia.fetchMediaAsDataUrl = realFetch;
+    }
+    if (awaitingAdChoice.has(sender)) throw new Error("closed after the flyer");
+
+    // one booking per event: a booked event's question no longer captures a digit
+    id = await seed();
+    eventsStore.updateEvent(TEST_EVENTS_FILE, id, { ad_date: "2099-05-09", ad_window: "morning" });
+    await routeMessage(sender, "3");
+    if (row(id).ad_window !== "morning" || awaitingAdChoice.has(sender)) throw new Error("one booking per event");
+
+    // an old offer no longer captures a digit
+    id = await seed();
+    awaitingAdChoice.get(sender).askedAt = Date.now() - 49 * 3600e3;
+    await routeMessage(sender, "1");
+    if (row(id).ad_window) throw new Error("expired offer");
+
+    // closed window, no template: held, then attached to their next reply
+    lastActivity.set(sender, Date.now() - 25 * 3600e3);
+    id = await seed();
+    if (outbox.some((m) => m.to === sender) || !pendingAdOffers.has(id)) throw new Error("held");
+    const next = await routeMessage(sender, "תפריט");
+    if (!next.includes("מודעה גרפית") || pendingAdOffers.has(id)) throw new Error("delivered on next message");
+    if (!next.includes("אושר") || !awaitingAdChoice.has(sender)) throw new Error("with the approval, and the question opens");
+    // the menu buttons would drop the offer under them, so the reply stays text
+    if (buttonReplyFor(next)) throw new Error("the menu with an offer under it is not sent as menu buttons");
+    awaitingAdChoice.delete(sender);
+
+    // closed window, fomo_ad_offer approved: the template carries it
+    interactive._setApprovedTemplates(new Map([["fomo_ad_offer", "HXad"]]));
+    try {
+      lastActivity.set(sender, Date.now() - 25 * 3600e3);
+      id = await seed();
+      const sent = outbox.filter((m) => m.to === sender);
+      if (sent.length !== 1 || sent[0].template !== "fomo_ad_offer" || pendingAdOffers.has(id)) throw new Error("one template send");
+      if (String(awaitingAdChoice.get(sender).eventId) !== String(id)) throw new Error("the question is open for it");
+    } finally {
+      interactive._setApprovedTemplates(new Map());
+    }
+    awaitingAdChoice.delete(sender);
+
+    // in another conversation: held, so the offer's "1" cannot land in it
+    lastActivity.set(sender, Date.now());
+    await routeMessage(sender, "1"); // an inquiry
+    id = await seed();
+    if (outbox.some((m) => m.to === sender) || !pendingAdOffers.has(id) || awaitingAdChoice.has(sender)) throw new Error("held while busy");
+    await routeMessage(sender, "ביטול");
+    if (pendingAdOffers.has(id) || !awaitingAdChoice.has(sender)) throw new Error("delivered once free");
+    awaitingAdChoice.delete(sender);
   }
 
   fs.unlinkSync(CORRECTIONS_FILE);

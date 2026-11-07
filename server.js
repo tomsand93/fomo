@@ -6,7 +6,7 @@ const { URLSearchParams } = require("url");
 const { loadEvents, makeBoard, digestEvents } = require("./make-digest");
 const { israelClock, todayIso, addDays, dayOfWeek, longDate, isReminderDue, isReminderMissed } = require("./clock");
 const { isFreeEntry, entranceLabel, formatShort, formatLong } = require("./format-event");
-const { AD_WINDOWS, availableWindows, adDateLine } = require("./ad-windows");
+const { AD_WINDOWS, availableWindows, adDateLine, windowPhrase } = require("./ad-windows");
 const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent, lastDay, runsOn, isSameEvent } = require("./events-store");
 const extractEventModule = require("./extract-event");
 const { FIELD_KEYS } = extractEventModule;
@@ -41,10 +41,17 @@ let activeInquiries = new Set(); // senders currently in the "ask about events" 
 let activeInquiryHistories = new Map(); // sender -> [{ role, content }] conversation so far in inquiry mode
 let recentlyCompleted = new Set(); // senders whose last action was a completed submission, for a softer follow-up
 let lastSubmittedEventId = new Map(); // sender -> id of their most recent submission, so a follow-up correction can be attached to it
-// Both survive a restart on purpose: the gap between asking which day to publish and
-// getting an answer is hours, and Fly suspends this machine in between.
-let awaitingPublishChoice = new Map(); // sender -> { eventId, options, expectingDate }
-let awaitingDailyChoice = new Map(); // sender -> { eventId, options, expectingDate }, asked after approval
+// Both survive a restart on purpose: the gap between offering an ad and getting an
+// answer is hours, and Fly suspends this machine in between.
+// sender -> { eventId, step, askedAt, options, prompt, window }. The ad offered after
+// approval, and the step of booking it: offer, pick, date, window or flyer. Left alone by
+// clearSession and kept out of hasSessionState, like awaitingConfirmation; it lapses after
+// AD_OFFER_TTL_MS instead.
+let awaitingAdChoice = new Map();
+// Event ids whose approval and ad offer have not reached the organizer: their window was
+// closed with no approved template, or they were in another conversation. Attached to
+// their next reply (deliverPendingAdOffer).
+let pendingAdOffers = new Set();
 // sender -> { eventId, unresolved }. The organizer has seen both versions and has not yet
 // confirmed them or said what to change. Deliberately left alone by clearSession and kept
 // out of hasSessionState: the answer can come hours later, and the idle sweep must not
@@ -94,8 +101,10 @@ function loadState() {
     activeInquiryHistories = new Map(raw.activeInquiryHistories || []);
     recentlyCompleted = new Set(raw.recentlyCompleted || []);
     lastSubmittedEventId = new Map(raw.lastSubmittedEventId || []);
-    awaitingPublishChoice = new Map(raw.awaitingPublishChoice || []);
-    awaitingDailyChoice = new Map(raw.awaitingDailyChoice || []);
+    // Older state also holds awaitingPublishChoice and awaitingDailyChoice, the removed
+    // publish-day question; they are ignored.
+    awaitingAdChoice = new Map(raw.awaitingAdChoice || []);
+    pendingAdOffers = new Set(raw.pendingAdOffers || []);
     awaitingConfirmation = new Map(raw.awaitingConfirmation || []);
     sentBoards = new Set(raw.sentBoards || []);
     sentReminders = new Set(raw.sentReminders || []);
@@ -137,8 +146,8 @@ function writeStateNow() {
     // Bounded like noticeSidToEventId: only a recent submission can still be amended,
     // and this map is never cleared per-sender (clearSession deliberately keeps it).
     lastSubmittedEventId: [...lastSubmittedEventId.entries()].slice(-50),
-    awaitingPublishChoice: [...awaitingPublishChoice.entries()].slice(-50),
-    awaitingDailyChoice: [...awaitingDailyChoice.entries()].slice(-50),
+    awaitingAdChoice: [...awaitingAdChoice.entries()].slice(-50),
+    pendingAdOffers: [...pendingAdOffers].slice(-100),
     awaitingConfirmation: [...awaitingConfirmation.entries()].slice(-50),
     // Only the last few send-windows matter; older keys can never fire again.
     sentBoards: [...sentBoards].slice(-20),
@@ -250,10 +259,6 @@ const BOARD_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 // 17:58 must still deliver, while one waking at 18:20 should skip rather than hand Stav
 // something she was meant to forward twenty minutes ago.
 const SEND_WINDOW_MINUTES = 15;
-// The Content template this bot expects for the publish-day question. Registering it
-// and getting Meta to approve it is a Twilio task, not a code one; until that happens
-// the name resolves to nothing and the question renders as a numbered list.
-const PUBLISH_DAY_TEMPLATE = "fomo_publish_day_v2";
 const LOG_RETENTION_DAYS = 90;
 const LOG_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // Both are persisted: sentBoards was previously in-memory only, so a restart inside the
@@ -1201,8 +1206,6 @@ function clearSession(sender) {
   activeInquiries.delete(sender);
   activeInquiryHistories.delete(sender);
   recentlyCompleted.delete(sender);
-  awaitingPublishChoice.delete(sender);
-  awaitingDailyChoice.delete(sender);
   awaitingCancelChoice.delete(sender);
   // An edit left open would swallow her next message, in either role.
   if (sender === ADMIN_SENDER) awaitingAdminEdit = "";
@@ -1224,8 +1227,6 @@ function hasSessionState(sender) {
     activeSubmissions.has(sender) ||
     activeInquiries.has(sender) ||
     recentlyCompleted.has(sender) ||
-    awaitingPublishChoice.has(sender) ||
-    awaitingDailyChoice.has(sender) ||
     awaitingIntentConfirm.has(sender) ||
     (sender === ADMIN_SENDER && Boolean(awaitingAdminEdit))
   );
@@ -1957,33 +1958,25 @@ async function forwardAmendmentToAdmin(id, text, sender) {
   }
 }
 
+// An event approved today after its last board: the board's short form, on its own, for
+// Stav to forward. No flyer: a flyer reaches the group only in a booked ad.
+async function sendShortToAdmin(id, event) {
+  const text = formatShort(event, SLOT_LINKS);
+  if (process.env.NODE_ENV === "test") {
+    outbox.push({ to: ADMIN_SENDER, text, mediaUrl: "" });
+    return;
+  }
+  try {
+    await sendWhatsApp(ADMIN_SENDER, text);
+  } catch (err) {
+    console.error(`failed to send event #${id} to the admin in short form:`, err);
+  }
+}
+
 // A ready-to-forward post for the group. Same LONG rendering the daily message uses,
 // so the group sees one consistent format however an event reaches it.
 function formatPublishedPost(event) {
   return formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), dateLine: dateLineFor(event), mapFor: mapLink }).text;
-}
-
-// Each event's flyer post reaches Stav once ever. It used to repeat at approval, at both
-// weekend slots and on every day the submitter chose, and she read it as the bot
-// re-sending everything (16/10/2026). Later boards still carry the event as text.
-function markFlyerSent(id) {
-  storeUpdateEvent(EVENTS_FILE, id, { flyer_sent_at: new Date().toISOString() });
-}
-
-async function sendPublishedPost(id, event) {
-  if (process.env.NODE_ENV === "test") return;
-  const rendered = formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), dateLine: dateLineFor(event), mapFor: mapLink });
-  const { text } = rendered;
-  const mediaUrl = event.flyer_sent_at ? "" : rendered.mediaUrl;
-  if (event.flyer && !rendered.mediaUrl) {
-    console.error(`event #${id} has a flyer but PUBLIC_BASE_URL is unset; sending text only`);
-  }
-  try {
-    await sendWhatsApp(ADMIN_SENDER, text, mediaUrl);
-    if (mediaUrl) markFlyerSent(id);
-  } catch (err) {
-    console.error(`failed to send published post for event #${id}:`, err);
-  }
 }
 
 // Everything the bot says in tests is collected here instead of sent.
@@ -2155,15 +2148,26 @@ function correctionRefusal(sender, text) {
 function busyForConfirmReminder(sender, eventId) {
   const open = awaitingConfirmation.get(sender);
   if (open && String(open.eventId) !== String(eventId)) return true;
+  return inOtherQuestion(sender);
+}
+
+// Every open conversation but the confirm question: a draft, an inquiry, or a question
+// whose next digit means something of its own.
+function inOtherQuestion(sender) {
   return (
     activeSubmissions.has(sender) ||
     activeInquiries.has(sender) ||
-    awaitingDailyChoice.has(sender) ||
-    awaitingPublishChoice.has(sender) ||
+    adChoiceIsOpen(sender) ||
     awaitingCancelChoice.has(sender) ||
     awaitingIntentConfirm.has(sender) ||
     offeredEscape.has(sender)
   );
+}
+
+// Any open conversation at all, the confirm question included. An ad offer waits while
+// this holds, so its "1" never lands in someone else's question.
+function inOpenConversation(sender) {
+  return awaitingConfirmation.has(sender) || inOtherQuestion(sender);
 }
 
 async function sendDueConfirmReminders(now = Date.now()) {
@@ -2190,50 +2194,319 @@ async function sendDueConfirmReminders(now = Date.now()) {
   }
 }
 
-// Approval tells the submitter three things in order: it is live, it is already on
-// the board and discoverable, and — if they have not already chosen a day — which
-// day they would like it in the group message.
-//
-// This message is the one most likely to fall outside the submitter's 24h WhatsApp
-// window, since it arrives whenever Stav gets round to reviewing. If it never
-// lands, the event is still on the board; only the optional group slot is missed.
-async function notifyApproved(sender, id, event) {
-  const alreadyChose = Boolean(event.daily_days);
-  const lines = [`האירוע שלכם "${event.event_name}" אושר ויפורסם 🎉`];
+// --- After approval: the graphic ad is offered, and booked into a window ---
+const AD_OFFER_TEMPLATE = "fomo_ad_offer";
+const AD_OFFER_TTL_MS = 48 * 60 * 60 * 1000;
+const NO_AD_WINDOW_TEXT = (start, next) => `האירוע מתחיל ב-${start}, והחלון הבא למודעות הוא ${next}, אז הפעם לא נוכל לפרסם עליו מודעה 🙏\n\nבפעם הבאה שלחו לפחות יום מראש, ונוכל לפרסם גם מודעה.`;
+const NO_AD_TEXT = (date) => `אין בעיה. האירוע יופיע בלוח היומי של ${date}.`;
+const ASK_FLYER_TEXT = "כדי לפרסם מודעה גרפית צריך פלייר. שלחו אותו כאן כתמונה.";
+const WINDOW_PASSED_TEXT = "החלון הזה כבר עבר. אלה האפשרויות שנשארו:";
+const AMENDMENT_AFTER_APPROVAL_TEXT = "העברנו את הבקשה לסתיו, היא תעדכן את האירוע.";
+const NO_WINDOW_LEFT_TEXT = "החלון הזה כבר עבר, ולא נשאר עוד חלון למודעה לפני שהאירוע מתחיל 🙏 האירוע יופיע בלוח היומי.";
+const BOARD_ALREADY_OUT_TEXT = "📋 הלוח היומי של היום כבר יצא, אז הוא יישלח לקבוצה בנפרד.";
+const PICK_WINDOW_PROMPT = "מתי לפרסם את המודעה?";
+const PAST_DATE_TEXT = "התאריך הזה כבר עבר. כתבו תאריך מהיום והלאה.";
+const MAX_LISTED_WINDOWS = 6;
+// Twilio refuses a WhatsApp message longer than this.
+const WHATSAPP_MAX_CHARS = 1600;
 
-  if (alreadyChose) {
-    await notifySubmitter(sender, lines.join("\n"));
-    return;
+// "שבת 7.11", the way the mockup names a day to the organizer.
+const dayName = (date) => longDate(date).replace(/^יום /, "");
+// "היום (חמישי 5.11)", "מחר (שישי 6.11)", or just "שבת 7.11".
+function dayLabel(date, today) {
+  if (date === today) return `היום (${dayName(date)})`;
+  if (date === addDays(today, 1)) return `מחר (${dayName(date)})`;
+  return dayName(date);
+}
+
+const localNow = (local) => `${local.date} ${String(local.hour).padStart(2, "0")}:${String(local.minute).padStart(2, "0")}`;
+
+// The daily board an approved event goes out on, { date, slot }: the first board slot of
+// its day, never the 10:00 ads slot. On the day itself only a slot whose handoff is still
+// ahead counts, and only if that board will carry the event (coveredByEarlierSlot leaves
+// a morning event out of the weekend's 18:00). Null once every board it could be on has
+// gone to Stav.
+function boardSlotFor(event, local) {
+  if (!event.date || !isValidDate(event.date)) return null;
+  const nowMinutes = local.hour * 60 + local.minute;
+  const first = event.date > local.date ? event.date : local.date;
+  for (let date = first; date <= lastDay(event); date = addDays(date, 1)) {
+    for (const entry of DAILY_SLOTS) {
+      if (entry.adsOnly || !entry.days.includes(dayOfWeek(date))) continue;
+      if (date === local.date) {
+        if (nowMinutes >= entry.sendHour * 60 + entry.sendMinute) continue;
+        if (coveredByEarlierSlot(event, date, entry.slot)) continue;
+      }
+      return { date, slot: entry.slot };
+    }
+  }
+  return null;
+}
+
+// The next ad window to open after now, whatever the event: what the organizer is told
+// when no window is left before their event.
+function nextAdWindow(local) {
+  const now = localNow(local);
+  for (let date = local.date; ; date = addDays(date, 1)) {
+    const window = AD_WINDOWS.find((w) => `${date} ${w.start}` > now);
+    if (window) return { ...window, date };
+  }
+}
+
+// The approval message and the ad offer, as two texts. The approval names the daily
+// board's date and slot. offerText is empty when no window is left before the event
+// (the approval then says why) or the event already has its one booking.
+function offerFor(event, local) {
+  const today = local.date;
+  const board = boardSlotFor(event, local);
+  const lines = [`האירוע שלכם "${event.event_name}" אושר 🎉`];
+  if (board) lines.push(`📋 הוא ייכנס ללוח היומי של *${dayName(board.date)}*, שיוצא לקבוצה ב-${board.slot}.`);
+  else if (runsOn(event, today)) lines.push(BOARD_ALREADY_OUT_TEXT);
+  const result = { approvalText: lines.join("\n"), offerText: "", options: [], prompt: "", phrase: "" };
+  if (event.ad_window) return result;
+
+  const windows = availableWindows(event, local);
+  if (!windows.length) {
+    // Said only while the event is still ahead: once it has started there is nothing
+    // to explain.
+    const start = event.start_time || "";
+    if (TIME_RE.test(start) && `${lastDay(event)} ${start}` > localNow(local)) {
+      const next = nextAdWindow(local);
+      const nextText = `${windowPhrase(next, today)} (${next.start}–${next.end})`;
+      result.approvalText += `\n\n${NO_AD_WINDOW_TEXT(start, nextText)}`;
+    }
+    return result;
   }
 
-  if (!event.date || !isValidDate(event.date)) {
-    await notifySubmitter(sender, lines.join("\n"));
-    return;
-  }
+  const first = windows[0];
+  const phrase = windowPhrase(first, today);
+  const options = [
+    { key: "1", label: `כן, בהקדם האפשרי: *${phrase}* (${first.start}–${first.end})`, date: first.date, window: first.key },
+    { key: "2", label: "כן, אבחר יום וחלון", action: "pick" },
+    { key: "3", label: "לא, רק בלוח היומי", action: "decline" },
+  ];
+  const prompt = `רוצים שנפרסם גם *מודעה גרפית מורחבת*${event.flyer ? " עם הפלייר" : ""}?`;
+  return { ...result, offerText: renderNumbered(prompt, options), options, prompt, phrase };
+}
 
-  const options = publishDayOptions(event.date);
-  awaitingDailyChoice.set(sender, { eventId: id, options, expectingDate: false });
+// Up to six windows, then "another date" when there are more.
+function windowOptions(windows, today) {
+  const options = windows.slice(0, MAX_LISTED_WINDOWS).map((w, i) => ({
+    key: String(i + 1),
+    label: `${dayLabel(w.date, today)} · ${w.label} ${w.start}–${w.end}`,
+    date: w.date,
+    window: w.key,
+  }));
+  if (windows.length > MAX_LISTED_WINDOWS) {
+    options.push({ key: String(options.length + 1), label: "תאריך אחר", action: "date" });
+  }
+  return options;
+}
+
+// The open question, lapsed ones aside. A lapsed one is not deleted here: the router
+// drops it on the sender's next message.
+function adChoiceIsOpen(sender) {
+  const open = awaitingAdChoice.get(sender);
+  return Boolean(open) && Date.now() - open.askedAt < AD_OFFER_TTL_MS;
+}
+
+function setAdStep(sender, eventId, step, fields = {}) {
+  awaitingAdChoice.set(sender, { eventId: String(eventId), step, askedAt: Date.now(), options: [], prompt: "", ...fields });
   saveState();
+}
 
-  // Unlike the question asked at submission time — which is a webhook reply, and TwiML
-  // carries no buttons — this one is an outbound send, so it can be tappable. Falls back
-  // to the same numbered list whenever no approved template is available.
-  if (process.env.NODE_ENV === "test") return;
-  const prompt = `${lines.join("\n")}\n\n${publishChoicePrompt()}`;
-  try {
-    // The template's body already says "your event X was approved… which day?", so its
-    // only variable is the name. `text` is the fallback wording, used when the option
-    // list does not match the template's fixed buttons — which is most of the time, since
-    // publishDayOptions returns up to six.
-    await sendChoice(sender, {
-      text: prompt,
-      options,
-      template: PUBLISH_DAY_TEMPLATE,
-      variables: { 1: event.event_name },
-    });
-  } catch (err) {
-    console.error("failed to send the approval notice:", err);
+function adQuestionText(open) {
+  if (open.step === "date") return ASK_OTHER_DATE_TEXT;
+  if (open.step === "flyer") return ASK_FLYER_TEXT;
+  return renderNumbered(open.prompt, open.options);
+}
+
+// Approval reaches the organizer as two messages: the approval with the board's date and
+// slot, then the ad offer. An open window gets both as text. A closed one can only take
+// the fomo_ad_offer template, which carries both; without it, or while the organizer is
+// in another conversation (the offer's "1" would land there), both wait in
+// pendingAdOffers for their next message.
+async function notifyApproved(sender, id, event) {
+  const offer = offerFor(event, israelClock(new Date()));
+  const open = windowIsOpen(lastActivity.get(sender) || 0);
+  const busy = inOpenConversation(sender);
+
+  if (open && (!busy || !offer.offerText)) {
+    await sendToSubmitter(sender, offer.approvalText);
+    if (offer.offerText) {
+      setAdStep(sender, id, "offer", { options: offer.options, prompt: offer.prompt });
+      await sendToSubmitter(sender, offer.offerText);
+    }
+    return;
   }
+
+  if (!open && !busy && offer.offerText && (await adOfferTemplateApproved())) {
+    setAdStep(sender, id, "offer", { options: offer.options, prompt: offer.prompt });
+    // The template's body has the approval and the question; text is the fallback.
+    const choice = {
+      text: `${offer.approvalText}\n\n${offer.prompt}`,
+      options: offer.options,
+      template: AD_OFFER_TEMPLATE,
+      variables: { 1: event.event_name, 2: offer.phrase },
+    };
+    if (process.env.NODE_ENV === "test") {
+      outbox.push({ to: sender, text: renderNumbered(choice.text, choice.options), mediaUrl: "", template: AD_OFFER_TEMPLATE });
+      return;
+    }
+    try {
+      await sendChoice(sender, choice);
+    } catch (err) {
+      console.error(`failed to send the ad offer for event #${id}:`, err);
+    }
+    return;
+  }
+
+  pendingAdOffers.add(String(id));
+  saveState();
+}
+
+async function adOfferTemplateApproved() {
+  if (process.env.NODE_ENV !== "test") await ensureTemplates();
+  return Boolean(approvedTemplateSid(AD_OFFER_TEMPLATE));
+}
+
+// A held approval and offer, attached under the reply to the organizer's next message
+// once they are in no other conversation. One per message: one question can be open.
+function deliverPendingAdOffer(sender, reply) {
+  if (!pendingAdOffers.size || inOpenConversation(sender)) return reply;
+  const local = israelClock(new Date());
+  const events = loadEvents(EVENTS_FILE); // read once, not once per held offer
+  for (const id of [...pendingAdOffers]) {
+    const event = events.find((candidate) => candidate.id === String(id));
+    if (!event || event.status !== "published" || !event.date || lastDay(event) < local.date) {
+      pendingAdOffers.delete(id);
+      saveState();
+      continue;
+    }
+    if (event.submitter !== sender) continue;
+    const offer = offerFor(event, local);
+    const extra = offer.offerText ? `${offer.approvalText}\n\n${offer.offerText}` : offer.approvalText;
+    const full = reply ? `${reply}\n\n${extra}` : extra;
+    if (full.length >= WHATSAPP_MAX_CHARS) return reply; // waits for a shorter reply
+    pendingAdOffers.delete(id);
+    if (offer.offerText) setAdStep(sender, id, "offer", { options: offer.options, prompt: offer.prompt });
+    saveState();
+    return full;
+  }
+  return reply;
+}
+
+// The answer to the ad question, at any step. Returns null when the question no longer
+// applies (lapsed, the event cancelled or already booked), so the message is routed as if
+// it had never been asked.
+async function handleAdChoice(sender, text, mediaUrls) {
+  const open = awaitingAdChoice.get(sender);
+  const event = storeFindEvent(EVENTS_FILE, open.eventId);
+  if (!event || event.status !== "published" || event.ad_window || !adChoiceIsOpen(sender)) {
+    awaitingAdChoice.delete(sender);
+    saveState();
+    return null;
+  }
+  const trimmed = text.trim();
+  const local = israelClock(new Date());
+
+  if (open.step === "flyer" && mediaUrls.length) {
+    let image;
+    try {
+      image = await fetchMediaModule.fetchMediaAsDataUrl(mediaUrls[0]);
+    } catch (err) {
+      console.error("failed to fetch the flyer for an ad:", err);
+      return MEDIA_FETCH_FAILED_TEXT;
+    }
+    replaceFlyer(event, image);
+    // A caption is still a correction, and goes to Stav like any other.
+    if (trimmed) await forwardAmendmentToAdmin(event.id, trimmed, sender);
+    const stored = storeFindEvent(EVENTS_FILE, event.id);
+    if (!stored.flyer) return ASK_FLYER_TEXT;
+    return chooseAdWindow(sender, stored, open.window, local);
+  }
+
+  // A flyer at any other step is the next event, as everywhere else.
+  if (hasUnambiguousSubmissionSignal(mediaUrls)) {
+    startSubmission(sender);
+    const reply = await handleActiveSubmission(sender, text, mediaUrls);
+    return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
+  }
+
+  if (!trimmed) return adQuestionText(open);
+
+  const picked = (open.options || []).find((option) => option.key === trimmed);
+  if (picked && picked.action === "decline") {
+    storeUpdateEvent(EVENTS_FILE, event.id, { ad_window: "decline" });
+    awaitingAdChoice.delete(sender);
+    saveState();
+    const board = boardSlotFor(event, local);
+    return NO_AD_TEXT(dayName(board ? board.date : event.date));
+  }
+  if (picked && picked.action === "pick") {
+    return askForWindow(sender, event, local, PICK_WINDOW_PROMPT);
+  }
+  if (picked && picked.action === "date") {
+    setAdStep(sender, event.id, "date");
+    return ASK_OTHER_DATE_TEXT;
+  }
+  if (picked && picked.window) {
+    return chooseAdWindow(sender, event, { date: picked.date, window: picked.window }, local);
+  }
+
+  if (open.step === "date") {
+    const date = parseUserDate(trimmed, local.date);
+    if (date && date < local.date) return PAST_DATE_TEXT;
+    if (date) {
+      const windows = availableWindows(event, local).filter((w) => w.date === date);
+      if (!windows.length) return `אין חלון למודעה ב${dayName(date)} לפני שהאירוע מתחיל. כתבו תאריך אחר.`;
+      const options = windows.map((w, i) => ({ key: String(i + 1), label: `${w.label} ${w.start}–${w.end}`, date: w.date, window: w.key }));
+      const prompt = `${dayLabel(date, local.date)}: בוקר או ערב?`;
+      setAdStep(sender, event.id, "window", { options, prompt });
+      return renderNumbered(prompt, options);
+    }
+  }
+
+  // A number that is no option is a mistyped answer, not a correction for Stav.
+  if (/^\d+[.)]?$/.test(trimmed)) return adQuestionText(open);
+
+  // Anything else is about the event. After approval nothing changes on its own: it goes
+  // to Stav, and the question is asked again.
+  await forwardAmendmentToAdmin(event.id, trimmed, sender);
+  return `${AMENDMENT_AFTER_APPROVAL_TEXT}\n\n${adQuestionText(open)}`;
+}
+
+// The window list, freshly worked out. With nothing left, the question closes.
+function askForWindow(sender, event, local, intro) {
+  const windows = availableWindows(event, local);
+  if (!windows.length) {
+    awaitingAdChoice.delete(sender);
+    saveState();
+    return NO_WINDOW_LEFT_TEXT;
+  }
+  const options = windowOptions(windows, local.date);
+  setAdStep(sender, event.id, "pick", { options, prompt: PICK_WINDOW_PROMPT });
+  return renderNumbered(intro, options);
+}
+
+// The windows are worked out again here, since the answer can come hours after the
+// question: a window that has passed meanwhile is not booked. Without a flyer the bot asks
+// for one first and books once it arrives.
+function chooseAdWindow(sender, event, choice, local) {
+  const window = availableWindows(event, local).find((w) => w.date === choice.date && w.key === choice.window);
+  if (!window) return askForWindow(sender, event, local, WINDOW_PASSED_TEXT);
+  if (!event.flyer) {
+    setAdStep(sender, event.id, "flyer", { window: { date: window.date, window: window.key } });
+    return ASK_FLYER_TEXT;
+  }
+  storeUpdateEvent(EVENTS_FILE, event.id, { ad_date: window.date, ad_window: window.key });
+  awaitingAdChoice.delete(sender);
+  saveState();
+  // A window already open hands the ad to Stav now rather than at the next slot.
+  // Detached: sendLateAds catches its own errors, and the organizer's reply must not wait.
+  sendLateAds();
+  const near = window.date === local.date || window.date === addDays(local.date, 1);
+  return `סגור ✅\nהמודעה תתפרסם בקבוצה *${windowPhrase(window, local.date)}*${near ? `: ${dayName(window.date)}` : ""}, בין ${window.start} ל-${window.end}.`;
 }
 
 const ADMIN_HELP_TEXT = `פקודות ניהול:
@@ -2517,23 +2790,20 @@ async function handleAdminMessage(text, repliedSid = "") {
       return `אירוע #${id} "${existing.event_name}" כבר עבר (${existing.date}) ולכן נסגר אוטומטית.\nאם התאריך השתנה: תקן ${id} תאריך: [תאריך חדש] ואז אשר ${id}.`;
     }
     storeUpdateEvent(EVENTS_FILE, id, { status: "published", published_at: todayIso() });
-    if (existing.submitter) {
-      await notifyApproved(existing.submitter, id, existing);
-    }
-    // The API can't post into a normal WhatsApp group (channels.md), so send the finished
-    // post for her to forward. An event happening today has missed its scheduled slot or
-    // is about to, so it goes out immediately and on its own — no publish time mentioned,
-    // because there isn't one to wait for.
     const publishedEvent = storeFindEvent(EVENTS_FILE, id) || existing;
-    if (publishedEvent.date === todayIso()) {
-      await sendPublishedPost(id, publishedEvent);
-      return `אירוע #${id} אושר ופורסם.\nהאירוע היום — שלחתי לך אותו עכשיו, אפשר להעביר לקבוצה.`;
+    if (existing.submitter) {
+      await notifyApproved(existing.submitter, id, publishedEvent);
     }
-    if (publishedEvent.flyer) {
-      await sendPublishedPost(id, publishedEvent);
-      return `אירוע #${id} אושר ופורסם.\nשלחתי לך את הפוסט עם התמונה — אפשר להעביר לקבוצה.`;
+    // Nothing goes to Stav at approval: the event reaches the group on its daily board,
+    // and as an ad only if the organizer books one. The exception is an event today whose
+    // last board has already gone out. It would never be listed, so she gets it now, in
+    // the board's short form, to forward on its own.
+    const local = israelClock(new Date());
+    if (runsOn(publishedEvent, local.date) && !boardSlotFor(publishedEvent, local)) {
+      await sendShortToAdmin(id, publishedEvent);
+      return `אירוע #${id} אושר.\nהלוח היומי של היום כבר יצא, אז שלחתי לך את האירוע עכשיו — אפשר להעביר לקבוצה.`;
     }
-    return `אירוע #${id} אושר ופורסם.`;
+    return `אירוע #${id} אושר.`;
   }
 
   // action === "דחה"
@@ -2747,8 +3017,9 @@ function buttonReplyFor(reply) {
   if (typeof reply !== "string" || !reply) return null;
 
   // The menu, whether it was reached by "cancel", an unrecognised message, or the
-  // customer-mode banner being prefixed to it.
-  if (reply.includes("1. לברר בנוגע לאירועים") && reply.includes("4. שירות לקוחות")) {
+  // customer-mode banner being prefixed to it. Only when it ends the reply: a held ad
+  // offer attached under it (deliverPendingAdOffer) would be lost under the template.
+  if (reply.includes("1. לברר בנוגע לאירועים") && reply.endsWith(MENU_TEXT)) {
     return {
       text: reply,
       options: MAIN_MENU_BUTTON_OPTIONS,
@@ -3149,69 +3420,6 @@ async function handleActiveSubmission(sender, text, mediaUrls, { rateCounted = f
   return CONFIRM_PROMPT_TEXT;
 }
 
-// When the group message should go out. Options whose day has already passed are
-// dropped rather than offered and rejected — "a week before" is meaningless for an
-// event three days away — and the survivors are renumbered so the keys are always
-// 1..n with no gaps. The shape is deliberately {key, label, date}: a quick-reply
-// button carries exactly this, so switching from typed numbers to taps later is a
-// rendering change and nothing more.
-// Distinguishes "no daily message" from "a date I haven't given you yet" (null). Both
-// are non-dates, so they need to be told apart where the answer is handled.
-const DECLINE_DAILY = "decline";
-
-function publishDayOptions(eventDate, today = todayIso()) {
-  const candidates = [
-    { label: "ביום האירוע", date: eventDate },
-    { label: "יום לפני", date: addDays(eventDate, -1) },
-    { label: "שבוע לפני", date: addDays(eventDate, -7) },
-    { label: "בהקדם האפשרי", date: today },
-  ].filter((option) => option.date >= today && option.date <= eventDate);
-
-  // Distinct dates only: for an event tomorrow, "day before" and "as soon as
-  // possible" are the same day, and offering it twice looks broken.
-  const seen = new Set();
-  const unique = candidates.filter((option) => {
-    if (seen.has(option.date)) return false;
-    seen.add(option.date);
-    return true;
-  });
-
-  const options = unique.map((option, i) => ({ ...option, key: String(i + 1) }));
-  options.push({ key: String(options.length + 1), label: "תאריך אחר", date: null });
-  // Declining has to be one of the choices. Without it every option picked a date, so a
-  // submitter who only wanted the weekly board could not say so: anything that was not
-  // an option key just re-asked the question, and ignoring it left the draft to expire
-  // half an hour later. "No" is an answer, not a failure to answer.
-  options.push({ key: String(options.length + 1), label: "לא, רק בלוח השבועי", date: DECLINE_DAILY });
-  return options;
-}
-
-function renderOptions(options) {
-  return options.map((option) => `${option.key}. ${option.label}`).join("\n");
-}
-
-const PUBLISH_CHOICE_INTRO = `רוצים שנפרסם אותו גם בהודעה היומית בקבוצה? באיזה יום?`;
-
-// Everything the submitter is told once their event is in: it is already on the
-// board, other people can find it by asking the bot, and here is the one decision
-// left. Requirement order matters — board first, then the question.
-//
-// Split from its options so the same copy can be a numbered list in a webhook reply
-// (TwiML carries no buttons) and tappable buttons in an outbound send.
-function publishChoicePrompt() {
-  return [
-    "📋 האירוע נכנס אוטומטית ללוח השבועי שלנו,",
-    "וגם מי ששואל את הבוט על אירועים בעיר יגלה אותו.",
-    "",
-    PUBLISH_CHOICE_INTRO,
-  ].join("\n");
-}
-
-function publishChoiceText(event, options) {
-  return `${publishChoicePrompt()}\n${renderOptions(options)}`;
-}
-
-const NO_DAILY_TEXT = "אין בעיה — האירוע יופיע בלוח השבועי בלבד.";
 const ASK_OTHER_DATE_TEXT = 'איזה תאריך? כתבו בפורמט DD-MM-YY (למשל 14-09-26).';
 
 function goodbyeText() {
@@ -3220,101 +3428,6 @@ function goodbyeText() {
     "תהנו באירוע שלכם 🎉",
     "לא לשכוח שאפשר גם לדבר עם הבוט שלנו ולברר על אירועים",
   ].join("\n");
-}
-
-// Records the chosen days on the event. Closes the question unless the submitter also
-// picked "another date", in which case it stays open for that date.
-function recordDailyDays(sender, pending, dates, map, { askForOtherDate = false } = {}) {
-  const event = storeFindEvent(EVENTS_FILE, pending.eventId);
-  if (event) {
-    const days = new Set((event.daily_days || "").split(",").filter((d) => d && d !== DECLINE_DAILY));
-    for (const date of dates) days.add(date);
-    storeUpdateEvent(EVENTS_FILE, pending.eventId, { daily_days: [...days].sort().join(",") });
-  }
-  if (askForOtherDate) map.set(sender, { ...pending, expectingDate: true });
-  else map.delete(sender);
-  saveState();
-  const when = [...dates].sort().map(longDate).join(", ");
-  const done = `סגור — נשלח אותו להודעה היומית ב-${when}. 🙌`;
-  return askForOtherDate ? `${done}\n\n${ASK_OTHER_DATE_TEXT}` : done;
-}
-
-function recordDailyDay(sender, pending, date, map) {
-  return recordDailyDays(sender, pending, [date], map);
-}
-
-// Which options an answer picks. Submitters regularly want more than one day and say so
-// in every shape: "1 ו2", "2. 3.", "1, 2 ,3 ,5", "יום לפני + בהקדם האפשרי" — each of
-// which the old exact-key match rejected by re-showing the same list (four of the first
-// test users, 17-24/09/2026). Digits count only when every number in the answer is a
-// real key, so a typed date like "16-9-2026" is never read as options 16 and 9.
-function pickDayOptions(options, answer) {
-  const exact = options.find((option) => option.key === answer);
-  if (exact) return [exact];
-
-  const numbers = answer.match(/\d+/g) || [];
-  if (numbers.length && numbers.every((n) => options.some((option) => option.key === n))) {
-    return options.filter((option) => numbers.includes(option.key));
-  }
-  if (numbers.length) return [];
-
-  return options.filter((option) => answer.includes(option.label));
-}
-
-// Shared by both questions: the one asked right after submission and the one asked
-// again after Stav approves. Same options, same parsing, different map.
-function handleDayChoice(sender, trimmed, map) {
-  const pending = map.get(sender);
-
-  if (pending.expectingDate) {
-    const date = parseUserDate(trimmed);
-    if (!date) {
-      return ASK_OTHER_DATE_TEXT;
-    }
-    if (date < todayIso()) {
-      return "התאריך הזה כבר עבר. כתבו תאריך מהיום והלאה.";
-    }
-    return recordDailyDay(sender, pending, date, map);
-  }
-
-  const picked = pickDayOptions(pending.options, trimmed);
-  if (!picked.length) {
-    // Not a menu key. Rather than scold, re-show the options — a submitter who
-    // typed a sentence here is answering the question, just not in the shape asked.
-    return `${PUBLISH_CHOICE_INTRO}\n${renderOptions(pending.options)}\n\n(אפשר לבחור כמה, למשל: 1,2)`;
-  }
-
-  // Several days: record every real date, and ask for the extra one if "another date"
-  // was among them. "No daily message" alongside actual days is outvoted by the days.
-  if (picked.length > 1) {
-    const dates = picked.map((option) => option.date).filter((date) => date && date !== DECLINE_DAILY);
-    const wantsOther = picked.some((option) => option.date === null);
-    if (dates.length) return recordDailyDays(sender, pending, dates, map, { askForOtherDate: wantsOther });
-    if (wantsOther) {
-      map.set(sender, { ...pending, expectingDate: true });
-      saveState();
-      return ASK_OTHER_DATE_TEXT;
-    }
-  }
-  const chosen = picked[0];
-
-  if (chosen.date === DECLINE_DAILY) {
-    // Recorded rather than left empty. Empty means "not asked yet", and the question is
-    // asked a second time after approval — so without a marker, someone who declined at
-    // submission would be asked the same thing again days later.
-    storeUpdateEvent(EVENTS_FILE, pending.eventId, { daily_days: DECLINE_DAILY });
-    map.delete(sender);
-    saveState();
-    return NO_DAILY_TEXT;
-  }
-
-  if (chosen.date === null) {
-    map.set(sender, { ...pending, expectingDate: true });
-    saveState();
-    return ASK_OTHER_DATE_TEXT;
-  }
-
-  return recordDailyDay(sender, pending, chosen.date, map);
 }
 
 const ADMIN_MODE_KEYWORDS = new Set(["ניהול", "admin"]);
@@ -3345,7 +3458,7 @@ function senderFlow(sender) {
   if (activeSubmissions.has(sender)) return "submission";
   if (activeInquiries.has(sender)) return "inquiry";
   if (awaitingConfirmation.has(sender)) return "confirm";
-  if (awaitingPublishChoice.has(sender) || awaitingDailyChoice.has(sender)) return "publish-choice";
+  if (adChoiceIsOpen(sender)) return "ad-choice";
   if (awaitingCancelChoice.has(sender)) return "cancel";
   // Its own tag so drop-off at the confirmation is visible in interactions.jsonl.
   if (awaitingIntentConfirm.has(sender)) return "intent-confirm";
@@ -3366,11 +3479,14 @@ async function routeMessage(sender, text, mediaUrls = [], repliedSid = "") {
   });
 
   const reply = await routeMessageInner(sender, text, mediaUrls, repliedSid, state);
-  const full = state.inCustomerModeReply
+  const banner = state.inCustomerModeReply
     ? `${CUSTOMER_MODE_BANNER}\n\n${reply}`
     : state.inAdminModeReply
     ? `${ADMIN_MODE_BANNER}\n\n${reply}`
     : reply;
+  // An approval and ad offer that could not be sent are attached under this reply, once
+  // the sender is in no other conversation. Never under Stav's admin replies.
+  const full = !state.inAdminModeReply && typeof banner === "string" ? deliverPendingAdOffer(sender, banner) : banner;
 
   // The full reply, not just its length. Reconstructing replies from the code worked in
   // theory, but reviewing the first test run meant guessing which message each length
@@ -3388,6 +3504,11 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
   // and acting on an hours-old draft is exactly what this is meant to prevent.
   expireIdleSessions();
   lastActivity.set(sender, Date.now());
+  // An ad offer this old no longer captures a digit; the message is routed normally.
+  if (awaitingAdChoice.has(sender) && !adChoiceIsOpen(sender)) {
+    awaitingAdChoice.delete(sender);
+    saveState();
+  }
 
   // The admin declares which role she's in rather than having it guessed from her text.
   // Guessing is what made "2" (menu: publish an event) reject an event instead.
@@ -3445,6 +3566,8 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
         cancelled = `האירוע "${waiting.event_name}" בוטל ולא יופיע יותר בלוח ובהודעות.\n\n`;
       }
     }
+    // Both close an open ad question too, which clearSession leaves alone.
+    awaitingAdChoice.delete(sender);
     clearSession(sender);
     saveState();
     return `${cancelled}${MENU_TEXT}`;
@@ -3488,24 +3611,12 @@ async function routeMessageInner(sender, text, mediaUrls = [], repliedSid = "", 
     if (reply !== null) return reply;
   }
 
-  // Must sit above the recentlyCompleted branch below: a bare "2" answering the
-  // publish-day question would otherwise be read as a stray follow-up and forwarded
-  // to Stav as a correction to the event.
-  // A flyer here is the next event, not an answer. It used to be dropped and the day
-  // options re-shown. The question is closed unanswered, which leaves daily_days empty
-  // so it is asked again at approval.
-  if ((awaitingPublishChoice.has(sender) || awaitingDailyChoice.has(sender)) && hasUnambiguousSubmissionSignal(mediaUrls)) {
-    startSubmission(sender);
-    const reply = await handleActiveSubmission(sender, text, mediaUrls);
-    return `${LIKELY_EVENT_DETECTED_TEXT}\n\n${reply}`;
-  }
-
-  if (awaitingPublishChoice.has(sender)) {
-    return handleDayChoice(sender, trimmed, awaitingPublishChoice);
-  }
-
-  if (awaitingDailyChoice.has(sender)) {
-    return handleDayChoice(sender, trimmed, awaitingDailyChoice);
+  // Below the draft and the confirm question, which outrank it, and above the
+  // recentlyCompleted branch: a bare "3" answering the ad question would otherwise be read
+  // as a stray follow-up and forwarded to Stav as a correction to the event.
+  if (awaitingAdChoice.has(sender)) {
+    const reply = await handleAdChoice(sender, text, mediaUrls);
+    if (reply !== null) return reply;
   }
 
   if (activeInquiries.has(sender)) {
@@ -3899,18 +4010,19 @@ module.exports = {
   parseUserDate,
   ASK_OTHER_DATE_TEXT,
   buttonReplyFor,
-  // Pure, so the schedule and the choice list can be tested without sending anything.
+  // Pure, so the schedule can be tested without sending anything.
   isDue,
   slotsDueAt,
   PENDING_REMINDER_SLOT,
-  publishDayOptions,
   goodbyeText,
   goodbyeMessage,
   mapsUrl,
   mapLink,
   sendGoodbyes,
-  get awaitingPublishChoice() { return awaitingPublishChoice; },
-  get awaitingDailyChoice() { return awaitingDailyChoice; },
+  get awaitingAdChoice() { return awaitingAdChoice; },
+  get pendingAdOffers() { return pendingAdOffers; },
+  offerFor,
+  boardSlotFor,
   DAILY_SLOTS,
   SEND_WINDOW_MINUTES,
   expireIdleSessions,
