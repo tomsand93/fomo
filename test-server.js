@@ -80,6 +80,10 @@ function stubExtract(conversationText) {
 
 extractEventModule.extractEvent = async (conversationText) => stubExtract(conversationText);
 
+// A correction is read from the text alone; the map says what each text changes.
+const CORRECTION_STUB = new Map();
+extractEventModule.extractCorrection = async (event, text) => ({ ...(CORRECTION_STUB.get(String(text).trim()) || {}) });
+
 // Dates relative to the real clock: hardcoded ones rot into the past and the publish-day
 // options (which drop past days) change under the test.
 function inDays(n) {
@@ -2286,6 +2290,31 @@ async function demo() {
     const page = todayPage([today], "2026-11-05");
     if (!page.includes('property="og:title"') || !page.includes("היום בערב")) throw new Error("today page");
     if (!eventLandingPage(today).includes('property="og:title"')) throw new Error("event page tags");
+  }
+
+  {
+    const eventsStore = require("./events-store");
+    const { applyCorrection } = require("./server");
+    const id = eventsStore.appendEvent(
+      TEST_EVENTS_FILE,
+      { event_name: "תיקון", date: "2099-01-01", start_time: "20:00", end_time: "", location: "מקום, חיפה", category: "", price: "60", organizer: "", contact_link: "", description: "" },
+      "Twilio WhatsApp", "whatsapp:+972500017001", []
+    );
+    CORRECTION_STUB.set("המחיר 50", { price: "50" });
+    const fixed = await applyCorrection(id, "המחיר 50");
+    if (fixed.changed.join() !== "price" || fixed.event.price !== "50") throw new Error("correction applied");
+    // an invalid value is dropped, and unknown text changes nothing
+    CORRECTION_STUB.set("תאריך גרוע", { date: "not-a-date" });
+    if ((await applyCorrection(id, "תאריך גרוע")).changed.length) throw new Error("invalid value dropped");
+    if ((await applyCorrection(id, "שלום")).changed.length) throw new Error("nothing to change");
+    // Stav's corrections teach the extractor; the organizer's don't
+    const before = loadCorrections(TEST_EVENTS_FILE).length;
+    CORRECTION_STUB.set("מחיר 70", { price: "70" });
+    await applyCorrection(id, "מחיר 70", { byAdmin: true });
+    if (loadCorrections(TEST_EVENTS_FILE).length !== before + 1) throw new Error("admin correction recorded");
+    CORRECTION_STUB.set("מחיר 80", { price: "80" });
+    await applyCorrection(id, "מחיר 80");
+    if (loadCorrections(TEST_EVENTS_FILE).length !== before + 1) throw new Error("organizer correction not recorded");
   }
 
   fs.unlinkSync(CORRECTIONS_FILE);

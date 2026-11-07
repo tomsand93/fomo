@@ -9,6 +9,7 @@ const { isFreeEntry, entranceLabel, formatShort, formatLong } = require("./forma
 const { AD_WINDOWS, availableWindows, adDateLine } = require("./ad-windows");
 const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent, lastDay, runsOn, isSameEvent } = require("./events-store");
 const extractEventModule = require("./extract-event");
+const { FIELD_KEYS } = extractEventModule;
 const intentModule = require("./classify-intent");
 const { addCorrection, buildCorrectionGuidance } = require("./corrections-store");
 const answerInquiryModule = require("./answer-inquiry");
@@ -1781,7 +1782,11 @@ async function sendReviewButtons(id, eventName) {
 }
 
 async function forwardEventToAdmin(id, event, sender, unresolved = [], flyer = "") {
-  if (process.env.NODE_ENV === "test") return;
+  if (process.env.NODE_ENV === "test") {
+    const stored = storeFindEvent(EVENTS_FILE, id) || { ...event, flyer };
+    outbox.push({ to: ADMIN_SENDER, text: formatEventForReview(id, stored, sender, unresolved), mediaUrl: "" });
+    return;
+  }
   try {
     // Preview the stored row, not the extractor's object: the slug and flyer are
     // written by appendEvent and persistFlyer, so only the row has them. Previewing
@@ -1922,13 +1927,53 @@ async function sendPublishedPost(id, event) {
   }
 }
 
-async function notifySubmitter(sender, text) {
-  if (process.env.NODE_ENV === "test") return;
+// Everything the bot says in tests is collected here instead of sent.
+const outbox = [];
+
+async function sendToSubmitter(sender, text, mediaUrl = "") {
+  if (process.env.NODE_ENV === "test") {
+    outbox.push({ to: sender, text, mediaUrl });
+    return;
+  }
   try {
-    await sendWhatsApp(sender, text);
+    await sendWhatsApp(sender, text, mediaUrl);
   } catch (err) {
     console.error("failed to notify submitter:", err);
   }
+}
+
+async function notifySubmitter(sender, text) {
+  await sendToSubmitter(sender, text);
+}
+
+// One path for a free-text correction, whoever sends it. Only the fields the text really
+// changes are written; Stav's corrections are also recorded so the extractor learns.
+async function applyCorrection(id, text, { byAdmin = false } = {}) {
+  const event = storeFindEvent(EVENTS_FILE, id);
+  if (!event) return { changed: [], event: null };
+  const proposed = await extractEventModule.extractCorrection(event, text, todayIso());
+  const updates = {};
+  for (const key of FIELD_KEYS) {
+    const value = proposed && proposed[key];
+    if (typeof value !== "string" || !value.trim()) continue;
+    const next = value.trim();
+    if (next === (event[key] || "") || !fieldIsValid(key, next)) continue;
+    updates[key] = next;
+  }
+  const changed = Object.keys(updates);
+  if (!changed.length) return { changed, event };
+  storeUpdateEvent(EVENTS_FILE, id, updates);
+  if (byAdmin) {
+    for (const field of changed) {
+      addCorrection(EVENTS_FILE, {
+        field,
+        wrongValue: event[field] || "",
+        rightValue: updates[field],
+        sourceText: event.description || event.event_name || "",
+      });
+    }
+  }
+  return { changed, event: storeFindEvent(EVENTS_FILE, id) };
 }
 
 // Approval tells the submitter three things in order: it is live, it is already on
@@ -3494,6 +3539,9 @@ if (require.main === module) {
 
 module.exports = {
   routeMessage,
+  applyCorrection,
+  sendToSubmitter,
+  outbox,
   buildSlotPosts,
   adPost,
   adsDue,
