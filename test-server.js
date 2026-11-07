@@ -2929,6 +2929,34 @@ async function demo() {
     await routeMessage(sender, "ביטול");
   }
 
+  // --- Declining, or running out of windows, never promises a board that already went out ---
+  {
+    const eventsStore = require("./events-store");
+    const { declineAd, askForWindow } = require("./server");
+    const sender = "whatsapp:+972500017409";
+    const make = (fields) => {
+      const id = eventsStore.appendEvent(TEST_EVENTS_FILE, { event_name: "לוח", date: "2099-07-01", start_time: "20:00", location: "מקום", ...fields }, "test", sender, []);
+      eventsStore.updateEvent(TEST_EVENTS_FILE, id, { status: "published" });
+      return eventsStore.findEvent(TEST_EVENTS_FILE, id);
+    };
+    // 2099-07-01 is a Wednesday; at 23:00 that day every board slot has gone to Stav
+    const late = { date: "2099-07-01", hour: 23, minute: 0, day: 3 };
+    const early = { date: "2099-06-20", hour: 9, minute: 0, day: 6 };
+
+    const tonight = make({ start_time: "23:30" });
+    const declined = declineAd(sender, tonight, late);
+    if (eventsStore.findEvent(TEST_EVENTS_FILE, tonight.id).ad_window !== "decline") throw new Error("declined");
+    if (declined.includes("לוח")) throw new Error(`no board left: the decline names none, got: ${declined}`);
+    const ahead = make({ date: "2099-07-02" });
+    if (!declineAd(sender, ahead, early).includes("בלוח היומי של")) throw new Error("a board ahead is still named");
+
+    const noneLeft = askForWindow(sender, make({ start_time: "23:30" }), late, "");
+    if (!noneLeft.includes("לא נשאר עוד חלון") || noneLeft.includes("לוח")) throw new Error(`no window and no board: no board promised, got: ${noneLeft}`);
+    const boardAhead = askForWindow(sender, make({ date: "2099-07-02", start_time: "" }), early, "");
+    if (!boardAhead.includes("לא נשאר עוד חלון") || !boardAhead.includes("בלוח היומי")) throw new Error("no window, a board ahead: it is named");
+    awaitingAdChoice.delete(sender);
+  }
+
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });

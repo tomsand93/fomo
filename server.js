@@ -2283,7 +2283,11 @@ const NO_AD_TEXT = (date) => `אין בעיה. האירוע יופיע בלוח 
 const ASK_FLYER_TEXT = "כדי לפרסם מודעה גרפית צריך פלייר. שלחו אותו כאן כתמונה.";
 const WINDOW_PASSED_TEXT = "החלון הזה כבר עבר. אלה האפשרויות שנשארו:";
 const AMENDMENT_AFTER_APPROVAL_TEXT = "העברנו את הבקשה לסתיו, היא תעדכן את האירוע.";
-const NO_WINDOW_LEFT_TEXT = "החלון הזה כבר עבר, ולא נשאר עוד חלון למודעה לפני שהאירוע מתחיל 🙏 האירוע יופיע בלוח היומי.";
+// Said only when no daily board the event could be on is still ahead (boardSlotFor is
+// null): promising one would be untrue once today's has gone out.
+const NO_AD_NO_BOARD_TEXT = "אין בעיה, לא נפרסם מודעה.";
+const NO_WINDOW_LEFT_BASE_TEXT = "החלון הזה כבר עבר, ולא נשאר עוד חלון למודעה לפני שהאירוע מתחיל 🙏";
+const NO_WINDOW_LEFT_TEXT = `${NO_WINDOW_LEFT_BASE_TEXT} האירוע יופיע בלוח היומי.`;
 const BOARD_ALREADY_OUT_TEXT = "📋 הלוח היומי של היום כבר יצא, אז הוא יישלח לקבוצה בנפרד.";
 const HELD_OFFER_LEAD = (name) => `📌 לגבי האירוע "${name}" שאושר:`;
 const PICK_WINDOW_PROMPT = "מתי לפרסם את המודעה?";
@@ -2626,7 +2630,7 @@ function declineAd(sender, event, local) {
   awaitingAdChoice.delete(sender);
   saveState();
   const board = boardSlotFor(event, local);
-  return NO_AD_TEXT(dayName(board ? board.date : event.date));
+  return board ? NO_AD_TEXT(dayName(board.date)) : NO_AD_NO_BOARD_TEXT;
 }
 
 // The window list, freshly worked out. With nothing left, the question closes.
@@ -2635,7 +2639,7 @@ function askForWindow(sender, event, local, intro) {
   if (!windows.length) {
     awaitingAdChoice.delete(sender);
     saveState();
-    return NO_WINDOW_LEFT_TEXT;
+    return boardSlotFor(event, local) ? NO_WINDOW_LEFT_TEXT : NO_WINDOW_LEFT_BASE_TEXT;
   }
   const options = windowOptions(windows, local.date);
   setAdStep(sender, event.id, "pick", { options, prompt: PICK_WINDOW_PROMPT });
@@ -4177,6 +4181,8 @@ module.exports = {
   get awaitingAdChoice() { return awaitingAdChoice; },
   get pendingAdOffers() { return pendingAdOffers; },
   get pendingBoards() { return pendingBoards; },
+  declineAd,
+  askForWindow,
   confirmBoardDelivery,
   flushPendingBoards,
   _setAdOfferSender(fn) { adOfferSender = fn; },
