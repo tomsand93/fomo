@@ -1011,71 +1011,19 @@ async function demo() {
     }
   }
 
-  // A submitter who picks a day for the daily message must get it on that day, even
-  // when the event itself is later (14/10/2026: approved at 17:00, missing at 17:50).
+  // daily_days no longer promotes a later event into the daily digest (the daily board
+  // shows today's events only); the promoted-message tests were removed with that.
   const { digestFlyerEvents } = require("./make-digest");
   const { longDate } = require("./clock");
   const promotedEvents = [
     { status: "published", event_name: "היום", date: "2026-10-14", start_time: "21:00", location: "חיפה" },
     { status: "published", event_name: "בעוד שבוע", date: "2026-10-21", start_time: "20:00", location: "חיפה", daily_days: "2026-10-14", flyer: "f.jpg" },
-    { status: "published", event_name: "לא נבחר", date: "2026-10-22", start_time: "20:00", location: "חיפה", daily_days: "2026-10-21" },
-    { status: "published", event_name: "סירב", date: "2026-10-23", start_time: "20:00", location: "חיפה", daily_days: "decline" },
   ];
   const promotedDigest = makeDigest(promotedEvents, "2026-10-14");
-  if (!promotedDigest.includes("בעוד שבוע")) {
-    throw new Error("an event whose daily_days includes today must be in today's digest");
-  }
-  if (promotedDigest.includes("לא נבחר") || promotedDigest.includes("סירב")) {
-    throw new Error("a later event must not reach the digest unless today is one of its chosen days");
-  }
-  if (!promotedDigest.includes("— יום")) {
-    throw new Error("a promoted event must sit under its own day header so it isn't read as today");
-  }
-  if (promotedDigest.indexOf("היום") > promotedDigest.indexOf("בעוד שבוע")) {
-    throw new Error("today's events must come before promoted later ones");
-  }
-  if (/📅 \d/.test(promotedDigest)) {
-    throw new Error("a promoted event's date must lead with a day name, not a bare number");
-  }
-  if (!digestFlyerEvents(promotedEvents, "2026-10-14").some((e) => e.event_name === "בעוד שבוע")) {
-    throw new Error("a promoted event's flyer must follow the digest like today's do");
-  }
-  const onlyPromoted = makeDigest(promotedEvents.slice(1, 2), "2026-10-14");
-  if (onlyPromoted.includes("אין אירועים") || onlyPromoted.includes(`📅 ${longDate("2026-10-14")}`)) {
-    throw new Error("a digest with only a promoted event must show it, without announcing today's date");
-  }
-  if (onlyPromoted.includes("היום בחיפה") || !onlyPromoted.includes("בקרוב")) {
-    throw new Error("a digest with nothing on today must not be titled 'today'");
-  }
-  if (!promotedDigest.includes("היום בחיפה")) {
-    throw new Error("a digest with events today keeps the 'today' title");
-  }
-
-  // The slot sends today's events and the promoted ones as separate messages.
-  const { makeDailyParts } = require("./make-digest");
-  const parts = makeDailyParts(promotedEvents, "2026-10-14");
-  if (!parts.today.includes("היום בחיפה") || parts.today.includes("בעוד שבוע")) {
-    throw new Error("the today message holds only today's events");
-  }
-  if (!parts.promoted.includes("בקרוב") || !parts.promoted.includes("בעוד שבוע") || parts.promoted.includes("21:00")) {
-    throw new Error("the promoted message holds only later events, under the 'soon' title");
-  }
-  const onlyLater = makeDailyParts(promotedEvents.slice(1, 2), "2026-10-14");
-  if (onlyLater.today !== "" || !onlyLater.promoted) throw new Error("an empty today message is skipped");
-
-  // The slot opens with a note naming each message that follows, for Stav only.
+  if (promotedDigest.includes("בעוד שבוע")) throw new Error("daily_days must not pull a later event into today's digest");
+  if (digestFlyerEvents(promotedEvents, "2026-10-14").length) throw new Error("a later event's flyer must not follow today's digest");
   const { buildSlotPosts } = require("./server");
-  const slotPosts = buildSlotPosts(promotedEvents.slice(1, 2), "2026-10-14", "18:00");
-  if (slotPosts.length !== 3) throw new Error("no events today: the note, the promoted message and the board");
-  const note = slotPosts[0].text;
-  // Each message is named by its own first line, the thing Stav actually sees in the chat.
-  // This event has a flyer, so it is its own post, named by the event.
-  if (!note.includes("1. תמונה ופרטים: בעוד שבוע") || !note.includes(`2. "${slotPosts[2].text.split("\n")[0]}"`)) {
-    throw new Error(`the note should name each message by its title, got: ${note}`);
-  }
-  if (!note.includes("2 הודעות") || !note.includes("אין אירועים שמתקיימים היום")) {
-    throw new Error(`the note should count the messages and say there is nothing today, got: ${note}`);
-  }
+
 
   // An event with an unsent flyer goes as its own image post, not also inside the text.
   {
@@ -1120,7 +1068,7 @@ async function demo() {
     ];
     const todayOf = (posts) => (posts.find((p) => p.text.startsWith("מה עושים היום")) || { text: "" }).text;
     const noon = buildSlotPosts(day, friday, "12:00");
-    if (!todayOf(noon).includes("בוקר") || !todayOf(noon).includes("ערב") || !noon.some((p) => p.text.startsWith("מה עושים בקרוב"))) {
+    if (!todayOf(noon).includes("בוקר") || !todayOf(noon).includes("ערב")) {
       throw new Error("the noon slot carries everything for the day");
     }
     const evening = buildSlotPosts(day, friday, "18:00");
@@ -1231,10 +1179,10 @@ async function demo() {
     throw new Error("an event with no stated price must show neither entrance emoji");
   }
 
-  // SHORT is for scanning: at most two lines however much the event carries.
+  // SHORT is for scanning: at most three lines however much the event carries.
   for (const [label, ev] of [["free", freeEvent], ["paid", paidEvent], ["unpriced", noPriceEvent]]) {
     const lineCount = fmt.formatShort(ev).split("\n").length;
-    if (lineCount > 2) throw new Error(`SHORT (${label}) must be 1-2 lines, got ${lineCount}`);
+    if (lineCount > 3) throw new Error(`SHORT (${label}) must be 1-3 lines, got ${lineCount}`);
   }
 
   // LONG is the full pitch, and the flyer rides as media rather than a text line.

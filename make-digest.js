@@ -1,6 +1,6 @@
 const { loadEvents, runsOn, withoutDuplicates } = require("./events-store");
 const { longDate, todayIso } = require("./clock");
-const { formatLong } = require("./format-event");
+const { formatLong, formatShort } = require("./format-event");
 
 const TODAY_TITLE = "מה עושים היום בחיפה? 🎈";
 const SOON_TITLE = "מה עושים בקרוב בחיפה? 🎈";
@@ -88,10 +88,7 @@ function digestFlyerEvents(events, targetDate) {
   return digestEvents(events, targetDate).filter((event) => event.flyer && !event.flyer_sent_at);
 }
 
-// Today's events, plus later ones whose submitter picked today for the daily message
-// (daily_days). That choice used to be recorded and then ignored: the submitter was told
-// "we'll send it in the daily message on X" and it never went out (14/10/2026).
-// A multi-day event counts as today's on every day it runs.
+// Today's events. A multi-day event counts as today's on every day it runs.
 //
 // No location is not a reason to leave an approved event out: Last Summer Sunset (#80)
 // was approved without one and silently missed its own day's message (23/10/2026),
@@ -101,10 +98,22 @@ function digestEvents(events, targetDate) {
     .filter((event) =>
       event.status === "published" &&
       event.start_time &&
-      (runsOn(event, targetDate) ||
-        (event.date > targetDate && (event.daily_days || "").split(",").includes(targetDate)))
+      runsOn(event, targetDate)
     ))
     .sort((a, b) => a.date.localeCompare(b.date) || a.start_time.localeCompare(b.start_time));
+}
+
+// The daily board: today's events only, in the short form. A later event whose
+// submitter picked today (daily_days) is not on it. Returns "" for a day with nothing,
+// so the caller can skip the post.
+function makeBoard(events, targetDate, { linkFor, todayUrl } = {}) {
+  const today = digestEvents(events, targetDate);
+  if (!today.length) return "";
+  const lines = ["*מה עושים היום בחיפה?* 🎈", `*${longDate(targetDate)}*`];
+  if (todayUrl) lines.push(todayUrl);
+  lines.push("");
+  for (const event of today) lines.push(formatShort(event, { linkFor }), "");
+  return lines.join("\n").trim();
 }
 
 function demo() {
@@ -132,4 +141,4 @@ if (require.main === module) {
   console.log(makeDigest(loadEvents(process.env.EVENTS_FILE || "events.csv"), dateArg));
 }
 
-module.exports = { loadEvents, makeDigest, makeDailyParts, digestEvents, digestFlyerEvents };
+module.exports = { loadEvents, makeDigest, makeBoard, makeDailyParts, digestEvents, digestFlyerEvents };

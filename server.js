@@ -299,6 +299,12 @@ function coveredByEarlierSlot(event, localDate, slot) {
   return !runsOn(event, localDate) || (event.start_time || "") < slot;
 }
 
+// The date line for a post forwarded on its own: day name, and the last day of a festival.
+function dateLineFor(event) {
+  const multiDay = event.end_date && event.end_date > event.date;
+  return `${longDate(event.date)}${multiDay ? `–${longDate(event.end_date)}` : ""}`;
+}
+
 function buildSlotPosts(events, localDate, slot = "", links = { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) }) {
   const daily = digestEvents(events, localDate);
   const fresh = daily.filter((event) => !coveredByEarlierSlot(event, localDate, slot));
@@ -316,7 +322,7 @@ function buildSlotPosts(events, localDate, slot = "", links = { linkFor: shortLi
 
   const titled = (text, label) => ({ text, label: `"${text.split("\n")[0]}" — ${label}` });
   const flyerPost = (event, isToday) => ({
-    ...formatLong(event, { ...longLinks, withDate: true }),
+    ...formatLong(event, { ...longLinks, dateLine: dateLineFor(event) }),
     eventId: event.id,
     label: `תמונה ופרטים: ${event.event_name}${isToday ? "" : ` (${longDate(event.date)})`}`,
   });
@@ -1679,7 +1685,7 @@ async function forwardAmendmentToAdmin(id, text, sender) {
 // A ready-to-forward post for the group. Same LONG rendering the daily message uses,
 // so the group sees one consistent format however an event reaches it.
 function formatPublishedPost(event) {
-  return formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), withDate: true, mapFor: mapLink }).text;
+  return formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), dateLine: dateLineFor(event), mapFor: mapLink }).text;
 }
 
 // Each event's flyer post reaches Stav once ever. It used to repeat at approval, at both
@@ -1691,7 +1697,7 @@ function markFlyerSent(id) {
 
 async function sendPublishedPost(id, event) {
   if (process.env.NODE_ENV === "test") return;
-  const rendered = formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), withDate: true, mapFor: mapLink });
+  const rendered = formatLong(event, { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer), dateLine: dateLineFor(event), mapFor: mapLink });
   const { text } = rendered;
   const mediaUrl = event.flyer_sent_at ? "" : rendered.mediaUrl;
   if (event.flyer && !rendered.mediaUrl) {

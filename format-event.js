@@ -77,22 +77,20 @@ function defaultLinkFor(event) {
   return event.contact_link || "";
 }
 
-// SHORT: name and time on line one, everything else on an indented second line.
-// Both lines are assembled from whatever exists — an event missing location, price
-// and link is still a valid one-line entry.
+// SHORT: three lines at most - bold time and name, then place and entrance, then the
+// link. Empty parts drop out, so an event missing location, price and link is still a
+// valid one-line entry. The category is left off: the icon already carries it.
 function formatShort(event, { linkFor = defaultLinkFor } = {}) {
-  const head = [`${iconFor(event)} ${event.start_time} ${event.event_name}`];
-  if (event.category) head.push(`· ${event.category}`);
+  const lines = [`${iconFor(event)} *${event.start_time} · ${event.event_name}*`];
 
   const details = [];
   if (event.location) details.push(`📍 ${event.location}`);
   const badge = entranceBadge(event);
   if (badge) details.push(badge);
-  const link = linkFor(event);
-  if (link) details.push(link);
+  if (details.length) lines.push(details.join(" · "));
 
-  const lines = [head.join(" ")];
-  if (details.length) lines.push(`   ${details.join(" · ")}`);
+  const link = linkFor(event);
+  if (link) lines.push(`🔗 ${link}`);
   return lines.join("\n");
 }
 
@@ -100,28 +98,25 @@ function formatShort(event, { linkFor = defaultLinkFor } = {}) {
 // Twilio carries it as MediaUrl on the same message, so the caller never has to
 // re-derive it.
 //
-// No date line: both the daily message and the weekly board carry the date in a
-// heading above the event, so repeating it per event was noise. `withDate` puts it
-// back for the one case that has no heading — a single event forwarded on its own,
-// where dropping it would lose the date entirely.
+// `dateLine` is the caller's own wording for the date ("*מחר!* יום שבת 7.11"), shown as
+// a 📅 line. Without it no date line is rendered: the daily message carries the date in
+// a heading above the event.
 //
 // Time and entrance share a line: they are the two things someone checks together
 // when deciding whether they can go.
 // `mapFor` is opt-in rather than always on: the board line is already dense, and only
 // the daily message has room for an extra line. Callers that do not pass it render
 // exactly what they rendered before.
-function formatLong(event, { linkFor = defaultLinkFor, flyerUrl = () => "", withDate = false, mapFor = () => "" } = {}) {
-  const head = [`${iconFor(event)} ${event.event_name}`];
+function formatLong(event, { linkFor = defaultLinkFor, flyerUrl = () => "", dateLine = "", mapFor = () => "" } = {}) {
+  const head = [`${iconFor(event)} *${event.event_name}*`];
   if (event.category) head.push(`· ${event.category}`);
 
   const when = [];
   // A festival names its last day even under a day heading, or readers take it for
   // a one-night thing.
   const multiDay = event.end_date && event.end_date > event.date;
-  // With the day name, as everywhere else a date is shown: Stav asked again on
-  // 22/10/2026, after a forwarded post read "📅 22.10" alone.
-  if (withDate && event.date) {
-    when.push(`📅 ${longDate(event.date)}${multiDay ? `–${longDate(event.end_date)}` : ""}`);
+  if (dateLine) {
+    when.push(`📅 ${dateLine}`);
   } else if (multiDay) {
     when.push(`📅 עד ${longDate(event.end_date)}`);
   }

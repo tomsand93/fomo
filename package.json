@@ -3,6 +3,6 @@
   "private": true,
   "scripts": {
     "start": "node server.js",
-    "test": "node test-server.js && node test-reminders.js"
+    "test": "node test-server.js && node test-reminders.js && node test-ads.js"
   }
 }
