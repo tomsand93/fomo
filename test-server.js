@@ -1132,6 +1132,30 @@ async function demo() {
     if (!todayOf(weekday).includes("בוקר")) throw new Error("with no noon slot, the evening slot keeps the day's earlier events");
   }
 
+  // A low Twilio balance warns Stav on the board's note, never on a post she forwards.
+  {
+    const { balanceWarning, lowBalanceWarning, withBalanceWarning, BALANCE_ALERT_USD } = require("./server");
+    if (balanceWarning(BALANCE_ALERT_USD + 0.01)) throw new Error("a balance above the threshold must not warn");
+    if (balanceWarning(NaN)) throw new Error("an unreadable balance must not warn");
+    const warning = balanceWarning(8.4);
+    if (!warning.includes("$8.40") || !warning.includes("console.twilio.com")) {
+      throw new Error(`the warning should show the balance and where to top up, got: ${warning}`);
+    }
+    if (!balanceWarning(-1.12).includes("$-1.12")) throw new Error("a negative balance still warns");
+
+    const posts = [{ text: "note" }, { text: "today" }, { text: "board" }];
+    const warned = withBalanceWarning(posts, warning);
+    if (!warned[0].text.startsWith(warning) || !warned[0].text.endsWith("note")) throw new Error("the warning heads the note");
+    if (warned.slice(1).some((p) => p.text.includes("Twilio"))) throw new Error("forwarded posts must never carry the warning");
+    if (withBalanceWarning(posts, "") !== posts) throw new Error("no warning leaves the posts untouched");
+
+    if (await lowBalanceWarning(async () => { throw new Error("down"); }) !== "") {
+      throw new Error("a failed balance lookup must not block the board");
+    }
+    if (!(await lowBalanceWarning(async () => ({ balance: 3 }))).includes("$3.00")) throw new Error("a low lookup should warn");
+    if (await lowBalanceWarning(async () => ({ balance: 48.88 })) !== "") throw new Error("a healthy lookup should not warn");
+  }
+
   // The same event submitted twice is listed once.
   {
     const { isSameEvent, withoutDuplicates } = require("./events-store");

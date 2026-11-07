@@ -1,24 +1,23 @@
-// Creates fomo_weekly_nudge and submits it to Meta for WhatsApp approval.
+// Creates one WhatsApp template per weekly-nudge wording and submits each to Meta.
 //
 //   node submit-nudge-template.js
 //
-// Reads TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN from .env. Safe to re-run: it refuses to
-// create a second copy if the template already exists, because a duplicate friendly name
-// is how approvedTemplateSid ends up picking the wrong one.
+// Reads TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN from .env. Safe to re-run: a wording whose
+// template already exists is not created again (a duplicate friendly name is how
+// approvedTemplateSid ends up picking the wrong one); its approval status is printed
+// instead, so a re-run doubles as "where do they stand with Meta".
 //
-// This is what sendDueWeeklyNudge (server.js) sends publishers every Wednesday at 18:00.
-// Most of them have not written in 24h by then, so until this is approved only the few
-// with an open window get the nudge, as plain text.
+// The wordings and buttons come from nudge-variants.js, the same module server.js sends
+// from, so what is submitted is exactly what the code sends. Adding a wording there and
+// re-running this submits just the new one.
 //
-// Two steps, because Twilio separates them:
+// Two steps per template, because Twilio separates them:
 //   1. POST /v1/Content                                   -> creates it, returns a SID
 //   2. POST /v1/Content/{sid}/ApprovalRequests/whatsapp    -> asks Meta to approve it
-//
-// The name, body and buttons are read from server.js rather than retyped, so what is
-// submitted is exactly what the code sends.
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
+const { NUDGE_OPTIONS, NUDGE_VARIANTS } = require("./nudge-variants");
 
 const dir = __dirname;
 
@@ -41,25 +40,6 @@ if (!ACCOUNT || !TOKEN) {
   process.exit(1);
 }
 const auth = Buffer.from(`${ACCOUNT}:${TOKEN}`).toString("base64");
-
-// Single source of truth: read straight from server.js so this cannot drift from what
-// sendDueWeeklyNudge actually sends.
-const code = fs.readFileSync(path.join(dir, "server.js"), "utf8");
-const NAME = (code.match(/const NUDGE_TEMPLATE = "([^"]+)"/) || [])[1];
-const OPT_OUT_KEY = (code.match(/const NUDGE_OPT_OUT_KEY = "([^"]+)"/) || [])[1];
-const BODY = (code.match(/const NUDGE_TEXT = `([^`]+)`;/) || [])[1];
-const optionsBlock = (code.match(/const NUDGE_OPTIONS = \[([\s\S]*?)\];/) || [])[1];
-if (!NAME || !OPT_OUT_KEY || !BODY || !optionsBlock) {
-  console.error("Could not read the template name, body or buttons from server.js");
-  process.exit(1);
-}
-// The opt-out button's key is the NUDGE_OPT_OUT_KEY constant, not a literal.
-const BUTTONS = [...optionsBlock.matchAll(/key:\s*(?:"([^"]+)"|NUDGE_OPT_OUT_KEY),\s*label:\s*"([^"]+)"/g)]
-  .map(([, key, label]) => ({ key: key || OPT_OUT_KEY, label }));
-if (BUTTONS.length !== 2) {
-  console.error("Could not parse the two nudge buttons from server.js");
-  process.exit(1);
-}
 
 function request(method, path_, payload) {
   const data = payload ? JSON.stringify(payload) : "";
@@ -85,55 +65,80 @@ function request(method, path_, payload) {
   });
 }
 
-(async () => {
-  console.log("name:", NAME);
-  console.log("body:", BODY);
-  console.log("buttons:", BUTTONS.map((b) => `${b.key} -> ${b.label}`).join(", "));
-
-  const listing = await request("GET", "/v1/Content?PageSize=50");
-  if (listing.status !== 200) {
-    console.error("could not list templates:", listing.status, listing.body.slice(0, 300));
-    process.exit(1);
+// Every page, not just the first: with more than one page of templates, a wording on
+// page two would otherwise look missing and be created a second time.
+async function listAll() {
+  const all = [];
+  let next = "/v1/Content?PageSize=50";
+  while (next) {
+    const page = await request("GET", next);
+    if (page.status !== 200) {
+      console.error("could not list templates:", page.status, page.body.slice(0, 300));
+      process.exit(1);
+    }
+    const body = JSON.parse(page.body);
+    all.push(...(body.contents || []));
+    const url = body.meta && body.meta.next_page_url;
+    next = url ? new URL(url).pathname + new URL(url).search : "";
   }
-  const existing = (JSON.parse(listing.body).contents || [])
-    .find((c) => c.friendly_name === NAME);
-  if (existing) {
-    console.log(`\n${NAME} already exists (${existing.sid}); not creating a second copy.`);
-    const status = await request("GET", `/v1/Content/${existing.sid}/ApprovalRequests`);
-    console.log("approval status:", status.body.slice(0, 400));
-    return;
-  }
+  return all;
+}
 
+async function approvalStatus(sid) {
+  const res = await request("GET", `/v1/Content/${sid}/ApprovalRequests`);
+  const w = (JSON.parse(res.body).whatsapp) || {};
+  return `${w.status || "not submitted"}${w.category ? ` ${w.category}` : ""}` +
+    (w.rejection_reason ? ` (rejected: ${w.rejection_reason})` : "");
+}
+
+async function createAndSubmit(variant) {
   // The button `id` becomes the ButtonPayload a tap sends back: "2" starts a submission
   // like the menu option, and the opt-out key is caught at the top of routeMessageInner.
   const create = await request("POST", "/v1/Content", {
-    friendly_name: NAME,
+    friendly_name: variant.template,
     language: "he",
     types: {
       "twilio/quick-reply": {
-        body: BODY,
-        actions: BUTTONS.map((b) => ({ id: b.key, title: b.label })),
+        body: variant.text,
+        actions: NUDGE_OPTIONS.map((o) => ({ id: o.key, title: o.label })),
       },
     },
   });
-  console.log("\ncreate HTTP", create.status);
   if (create.status < 200 || create.status >= 300) {
-    console.error(create.body.slice(0, 600));
-    process.exit(1);
+    return `create failed: HTTP ${create.status} ${create.body.slice(0, 300)}`;
   }
   const sid = JSON.parse(create.body).sid;
-  console.log("created:", sid);
 
   // Marketing, honestly: it invites people to publish, and Meta re-categorised the far
   // more transactional reminder as marketing anyway (see send-reminder.js).
   const approve = await request("POST", `/v1/Content/${sid}/ApprovalRequests/whatsapp`, {
-    name: NAME,
+    name: variant.template,
     category: "MARKETING",
   });
-  console.log("\nsubmit HTTP", approve.status);
-  console.log(approve.body.slice(0, 600));
+  if (approve.status < 200 || approve.status >= 300) {
+    return `created ${sid}, but submitting failed: HTTP ${approve.status} ${approve.body.slice(0, 300)}`;
+  }
+  return `created ${sid} and submitted to Meta`;
+}
+
+(async () => {
+  console.log("buttons:", NUDGE_OPTIONS.map((o) => `${o.key} -> ${o.label}`).join(", "));
+  const existing = await listAll();
+  console.log(`${existing.length} templates in the account\n`);
+
+  let failed = false;
+  for (const variant of NUDGE_VARIANTS) {
+    const found = existing.find((c) => c.friendly_name === variant.template);
+    const result = found
+      ? `exists (${found.sid}): ${await approvalStatus(found.sid)}`
+      : await createAndSubmit(variant);
+    if (/failed/.test(result)) failed = true;
+    console.log(`${variant.template.padEnd(28)} ${result}`);
+  }
+
   console.log(
-    "\nOnce it reads approved, sendDueWeeklyNudge will start using it automatically " +
-    "(server.js checks approvedTemplateSid before every send)."
+    "\nApproved wordings are picked up automatically: server.js re-checks approvals " +
+    "(at most hourly) before every Wednesday send. Re-run this to see where they stand."
   );
+  if (failed) process.exitCode = 1;
 })();

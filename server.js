@@ -19,6 +19,7 @@ const { logClick, logInteraction, clickStats, pruneOlderThan } = require("./clic
 const { sendChoice, renderNumbered, approvedTemplateSid, ensureTemplates } = require("./send-interactive");
 const remindersStore = require("./reminders-store");
 const { deliverReminder, REMINDER_TEMPLATE, windowIsOpen } = require("./send-reminder");
+const { fetchBalance } = require("./twilio-balance");
 
 const PORT = Number(process.env.PORT || 3000);
 const EVENTS_FILE = process.env.EVENTS_FILE || "events.csv";
@@ -89,6 +90,7 @@ function loadState() {
     sentReminders = new Set(raw.sentReminders || []);
     sentNudges = new Set(raw.sentNudges || []);
     nudgeOptOuts = new Set(raw.nudgeOptOuts || []);
+    lastNudgeVariant = raw.lastNudgeVariant || "";
     lastButtonEventId = raw.lastButtonEventId || "";
     // Older state held each board as one joined string; it goes out as a single post.
     pendingBoards = new Map(
@@ -131,6 +133,7 @@ function writeStateNow() {
     sentNudges: [...sentNudges].slice(-8),
     // Never bounded: dropping an opt-out would start messaging someone who said stop.
     nudgeOptOuts: [...nudgeOptOuts],
+    lastNudgeVariant,
     lastButtonEventId,
     pendingBoards: [...pendingBoards.entries()].slice(-10),
     undeliveredAdminNotices: [...undeliveredAdminNotices],
@@ -241,6 +244,7 @@ let pendingBoards = new Map(); // `${date}:${slot}` -> [{ text, mediaUrl, eventI
 let sentReminders = new Set(); // `${date}` already reminded, so a restart can't send twice
 let sentNudges = new Set(); // `${date}` the weekly publisher nudge already went out, same reason
 let nudgeOptOuts = new Set(); // senders who answered the weekly nudge with "הסר"
+let lastNudgeVariant = ""; // id of the wording sent last week, so this week's differs
 // The event whose review buttons were sent last and not yet acted on. Persisted, because
 // Fly suspends this machine between messages: in memory it was gone by the time Stav
 // tapped, and a bare "אשר" from a button then had nothing to resolve against — which is
@@ -345,6 +349,41 @@ function buildSlotPosts(events, localDate, slot = "", links = { linkFor: shortLi
   return [{ text: intro.join("\n") }, ...posts.map(({ text, mediaUrl = "", eventId = "" }) => ({ text, mediaUrl, eventId }))];
 }
 
+// The Twilio balance is prepaid; at zero the account is suspended and the bot goes
+// silent (05/11/2026). Spend runs about $4 a month, so $10 is roughly two months of
+// warning. The warning rides on the daily board's note to Stav rather than a message of
+// its own: the board is the one thing that reaches her every day, closed window or not
+// (sendSlotReadyPing), so it needs no template of its own. The note is hers only — she
+// forwards the posts under it, never the note itself.
+const BALANCE_ALERT_USD = Number(process.env.BALANCE_ALERT_USD) || 10;
+const TWILIO_BILLING_URL = "https://console.twilio.com/us1/billing/manage-billing/billing-overview";
+
+function balanceWarning(balance, threshold = BALANCE_ALERT_USD) {
+  if (!Number.isFinite(balance) || balance >= threshold) return "";
+  return [
+    `🚨 היתרה בחשבון Twilio נמוכה: $${balance.toFixed(2)}.`,
+    "כשהיא נגמרת הבוט מפסיק לשלוח הודעות. צריך להטעין כאן:",
+    TWILIO_BILLING_URL,
+  ].join("\n");
+}
+
+// A failed lookup must never cost the board: it is logged and the board goes without.
+async function lowBalanceWarning(lookup = fetchBalance) {
+  try {
+    const { balance } = await lookup();
+    return balanceWarning(balance);
+  } catch (err) {
+    console.error("failed to read the Twilio balance:", err.message);
+    return "";
+  }
+}
+
+function withBalanceWarning(posts, warning) {
+  if (!warning || !posts.length) return posts;
+  const [intro, ...rest] = posts;
+  return [{ ...intro, text: `${warning}\n\n${intro.text}` }, ...rest];
+}
+
 async function sendDueBoards(now = new Date()) {
   if (process.env.NODE_ENV === "test") return;
   const local = israelClock(now);
@@ -357,7 +396,7 @@ async function sendDueBoards(now = new Date()) {
     saveState();
 
     const events = loadEvents(EVENTS_FILE);
-    const posts = buildSlotPosts(events, localDate, slot);
+    const posts = withBalanceWarning(buildSlotPosts(events, localDate, slot), await lowBalanceWarning());
     let sent = 0;
     try {
       // Goes to Stav, not the group: WhatsApp's API can't post into a normal group
@@ -684,57 +723,76 @@ async function sendPendingReminder() {
 // the week that an event sent now still makes the Friday and Saturday slots.
 const WEEKLY_NUDGE_SLOT = { day: 3, sendHour: 18, sendMinute: 0 };
 
-// Submitted as MARKETING (submit-nudge-template.js): it is promotional, and Meta
-// re-categorised the friendlier reminder template as marketing anyway. Body:
-//   "Hi! FOMO Haifa here. The weekend is coming, got an event soon? Send me the
-//    details and I'll make sure all of Haifa hears about it."
-const NUDGE_TEMPLATE = "fomo_weekly_nudge";
-const NUDGE_OPT_OUT_KEY = "הסר";
-// "2" is the main menu's "publish an event", so a tap starts a submission exactly as
-// typing it would. The opt-out is a button too: a weekly unsolicited message has to be
-// one tap away from stopping.
-const NUDGE_OPTIONS = [
-  { key: "2", label: "יש לי אירוע לפרסם" },
-  { key: NUDGE_OPT_OUT_KEY, label: "להסיר אותי" },
-];
-const NUDGE_TEXT = `היי! 👋 כאן FOMO חיפה 🎈
-סוף השבוע כבר מתקרב, יש לכם אירוע בקרוב? שלחו לי את הפרטים ואדאג שכל חיפה תשמע עליו ✨`;
+// The wordings and buttons live in nudge-variants.js, one Meta template per wording, all
+// submitted as MARKETING (submit-nudge-template.js): it is promotional, and Meta
+// re-categorised the friendlier reminder template as marketing anyway.
+const { NUDGE_OPT_OUT_KEY, NUDGE_OPTIONS, NUDGE_VARIANTS } = require("./nudge-variants");
 // The free-text version cannot carry buttons, so it spells out what they would do.
-const NUDGE_FREE_TEXT = `${NUDGE_TEXT}
+function nudgeFreeText(variant) {
+  return `${variant.text}
 
 לפרסום כתבו 2 · כדי להפסיק לקבל את התזכורת הזו כתבו "${NUDGE_OPT_OUT_KEY}"`;
+}
 const NUDGE_OPT_OUT_TEXT = "הסרנו אתכם מהתזכורת השבועית. תמיד אפשר לשלוח לנו אירוע כאן 💙";
 
-// Everyone who has ever sent us an event, once each. Stav is excluded (she is the one
+// Published at least once. A published event Stav later cancelled or that its submitter
+// cancelled still counts (published_at survives the status change); one she rejected
+// does not, and neither does anything that only ever sat in review.
+function wasPublished(event) {
+  if (event.status === "published") return true;
+  return Boolean(event.published_at) && event.status !== "rejected";
+}
+
+// Everyone who has had an event published, once each. Stav is excluded (she is the one
 // publishing them), as is anyone who opted out or is mid-draft — a nudge to send an
 // event, landing in the middle of sending one, would only confuse the draft.
 function nudgeRecipients(events) {
   const recipients = new Set();
   for (const event of events) {
     const sender = event.submitter;
-    if (!sender || sender === ADMIN_SENDER) continue;
+    if (!sender || sender === ADMIN_SENDER || !wasPublished(event)) continue;
     if (nudgeOptOuts.has(sender) || activeSubmissions.has(sender)) continue;
     recipients.add(sender);
   }
   return [...recipients];
 }
 
+// One wording for the whole week, drawn at random and never last week's. Approved
+// wordings are preferred, since only they reach people whose window is closed (nearly
+// everyone). If none but last week's is approved, an unapproved one is still drawn
+// rather than repeating: it reaches only open windows that week, which is the price of
+// never sending the same words twice in a row. A pool of one has no choice but to repeat.
+function pickNudgeVariant(lastId, isApproved, random = Math.random) {
+  const fresh = NUDGE_VARIANTS.filter((variant) => variant.id !== lastId);
+  const approved = fresh.filter(isApproved);
+  const pool = approved.length ? approved : fresh.length ? fresh : NUDGE_VARIANTS;
+  return pool[Math.floor(random() * pool.length)];
+}
+
 // Same clock-based slot as sendDuePendingReminder, for the same reason: setInterval(7d)
 // would never survive Fly suspending the machine.
 //
-// `deliver` is injectable so the suite can check who is messaged without sending.
-async function sendDueWeeklyNudge(now = new Date(), deliver = deliverNudge) {
+// `deliver` and `isApproved` are injectable so the suite can check who is messaged, and
+// with which wording, without sending or asking Twilio.
+async function sendDueWeeklyNudge(now = new Date(), deliver = deliverNudge, isApproved = null) {
   const local = israelClock(now);
   if (local.day !== WEEKLY_NUDGE_SLOT.day || !isDue(local, WEEKLY_NUDGE_SLOT)) return;
   if (sentNudges.has(local.date)) return;
+  if (!isApproved) {
+    if (process.env.NODE_ENV !== "test") await ensureTemplates();
+    isApproved = (variant) => Boolean(approvedTemplateSid(variant.template));
+  }
+  const variant = pickNudgeVariant(lastNudgeVariant, isApproved);
   // Claimed before sending: a crash mid-run can at worst skip someone this week, never
   // message them twice.
   sentNudges.add(local.date);
+  lastNudgeVariant = variant.id;
   saveState();
+  console.log(`weekly nudge ${local.date}: "${variant.id}" (${isApproved(variant) ? "approved" : "not approved, open windows only"})`);
 
   for (const sender of nudgeRecipients(loadEvents(EVENTS_FILE))) {
     try {
-      await deliver(sender, lastActivity.get(sender) || 0);
+      await deliver(sender, lastActivity.get(sender) || 0, variant);
     } catch (err) {
       console.error(`failed to send the weekly nudge to ${sender}:`, err);
     }
@@ -744,18 +802,18 @@ async function sendDueWeeklyNudge(now = new Date(), deliver = deliverNudge) {
 // Buttons through the approved template whenever there is one. Without it, only people
 // whose 24h window is provably open get the free-text version: outside the window Twilio
 // accepts text and then drops it (63016), so sending it would only look like it worked.
-async function deliverNudge(sender, lastInboundMs) {
+async function deliverNudge(sender, lastInboundMs, variant) {
   if (process.env.NODE_ENV === "test") return;
   await ensureTemplates();
-  if (approvedTemplateSid(NUDGE_TEMPLATE)) {
-    await sendChoice(sender, { text: NUDGE_TEXT, options: NUDGE_OPTIONS, template: NUDGE_TEMPLATE });
+  if (approvedTemplateSid(variant.template)) {
+    await sendChoice(sender, { text: variant.text, options: NUDGE_OPTIONS, template: variant.template });
     return;
   }
   if (windowIsOpen(lastInboundMs)) {
-    await sendWhatsApp(sender, NUDGE_FREE_TEXT);
+    await sendWhatsApp(sender, nudgeFreeText(variant));
     return;
   }
-  console.error(`${NUDGE_TEMPLATE} is not approved and ${sender}'s window is closed; skipping their weekly nudge`);
+  console.error(`${variant.template} is not approved and ${sender}'s window is closed; skipping their weekly nudge`);
 }
 
 // ---------------------------------------------------------------------------
@@ -3218,6 +3276,10 @@ if (require.main === module) {
 module.exports = {
   routeMessage,
   buildSlotPosts,
+  balanceWarning,
+  lowBalanceWarning,
+  withBalanceWarning,
+  BALANCE_ALERT_USD,
   acknowledgeDuplicate,
   receiveInbound,
   looksLikeEventAnnouncement,
@@ -3229,9 +3291,9 @@ module.exports = {
   sendDueWeeklyNudge,
   nudgeRecipients,
   get nudgeOptOuts() { return nudgeOptOuts; },
-  NUDGE_TEMPLATE,
   NUDGE_OPTIONS,
-  NUDGE_TEXT,
+  pickNudgeVariant,
+  get lastNudgeVariant() { return lastNudgeVariant; },
   upcomingPublishedEvents,
   get activeSubmissions() { return activeSubmissions; },
   get awaitingIntentConfirm() { return awaitingIntentConfirm; },

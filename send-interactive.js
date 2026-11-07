@@ -12,6 +12,7 @@ const https = require("https");
 // Referenced through the module rather than destructured, so a test can replace
 // postForm without this module holding a stale binding to the original.
 const sendWhatsAppModule = require("./send-whatsapp");
+const { NUDGE_OPTIONS, NUDGE_VARIANTS } = require("./nudge-variants");
 
 const CONTENT_HOST = "content.twilio.com";
 // WhatsApp renders at most three quick-reply buttons; more than that has to be a list.
@@ -61,10 +62,19 @@ let lastRefresh = 0;
 let refreshing = null;
 
 async function refreshTemplates() {
-  const listing = await contentGet("/v1/Content?PageSize=50");
+  // Every page: the nudge alone is six templates, and one on page two would otherwise
+  // read as unapproved forever.
+  const contents = [];
+  let page = "/v1/Content?PageSize=50";
+  while (page) {
+    const listing = await contentGet(page);
+    contents.push(...(listing.contents || []));
+    const url = listing.meta && listing.meta.next_page_url;
+    page = url ? new URL(url).pathname + new URL(url).search : "";
+  }
   const next = new Map();
 
-  for (const content of listing.contents || []) {
+  for (const content of contents) {
     try {
       const approvals = await contentGet(`/v1/Content/${content.sid}/ApprovalRequests`);
       if (approvals.whatsapp && approvals.whatsapp.status === "approved") {
@@ -112,7 +122,8 @@ const TEMPLATE_BUTTON_KEYS = new Map([
   ["fomo_review_event_v2", ["אשר", "דחה", "ממתינים"]],
   ["fomo_review_event", ["אשר", "דחה", "ממתינים"]],
   ["fomo_slot_ready", ["שלח"]],
-  ["fomo_weekly_nudge", ["2", "הסר"]],
+  // One template per nudge wording, all sharing the same two buttons.
+  ...NUDGE_VARIANTS.map((variant) => [variant.template, NUDGE_OPTIONS.map((option) => option.key)]),
 ]);
 
 function templateButtonKeys(name) {
