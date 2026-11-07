@@ -19,7 +19,8 @@ const path = require("path");
 //   ad_date        - the day of the ad window the organiser booked, YYYY-MM-DD
 //   ad_window      - "morning", "evening", or "decline" (asked and said no, which is
 //                    not the same as empty = not asked yet)
-//   ad_sent_at     - when that ad was handed to Stav. Set once, never cleared
+//   ad_sent_at     - when that ad was handed to Stav. Cleared only when its queued,
+//                    undelivered post is dropped at the end of the day, so it can go late
 //   confirm_asked_at - when the organiser was asked to confirm the booking
 const CSV_HEADERS = [
   "id", "status", "event_name", "date", "start_time", "end_time", "location",

@@ -644,12 +644,11 @@ async function demo() {
   if (longParts.join("\n\n") !== longPost) throw new Error("splitting must not drop or reorder text");
   if (splitBody("קצר").length !== 1) throw new Error("a short post should go out as one message");
 
-  // The weekly board carries the location, because "where" is the first thing someone
-  // scanning the week asks. An event without one must simply omit the line rather than
-  // print an empty marker. Neither the board nor the digest carries the standing
-  // "put the group on mute" recommendation any more.
-  const { makeWeekly } = require("./make-weekly");
-  const { makeDigest } = require("./make-digest");
+  // The daily board carries the location, because "where" is the first thing someone
+  // scanning it asks. An event without one must simply omit the line rather than
+  // print an empty marker. The board does not carry the standing "put the group on
+  // mute" recommendation any more.
+  const { makeBoard } = require("./make-digest");
   const boardFile = path.join(__dirname, "test-board.csv");
   if (fs.existsSync(boardFile)) fs.unlinkSync(boardFile);
   fs.writeFileSync(boardFile, eventsStore.CSV_HEADERS.join(",") + "\n", "utf8");
@@ -668,18 +667,16 @@ async function demo() {
     eventsStore.updateEvent(boardFile, rid, { status: "published" });
   }
   const boardEvents = eventsStore.loadEvents(boardFile);
-  const board = makeWeekly(boardEvents, "2026-09-20");
+  const board = makeBoard(boardEvents, "2026-09-20");
   if (!board.includes("📍 סילביה, החלוץ 27")) {
-    throw new Error("the weekly board must show the location of an event that has one");
+    throw new Error("the board must show the location of an event that has one");
   }
-  if (board.includes("📍 \n") || board.includes("📍 המלצה")) {
+  const noPlaceBoard = makeBoard(boardEvents, "2026-09-21");
+  if (!noPlaceBoard.includes("בלי מיקום") || noPlaceBoard.includes("📍")) {
     throw new Error("an event without a location must omit the line, not print an empty marker");
   }
   if (board.includes("המלצה חמה")) {
-    throw new Error("the weekly board must not carry the standing recommendation any more");
-  }
-  if (makeDigest(boardEvents, "2026-09-20").includes("המלצה חמה")) {
-    throw new Error("the daily digest must not carry the standing recommendation any more");
+    throw new Error("the board must not carry the standing recommendation any more");
   }
 
   // --- Map links ---
@@ -993,81 +990,71 @@ async function demo() {
   if (/📅 \d/.test(board)) {
     throw new Error("the board's date header must lead with a day name, not a bare number");
   }
-  if (/📅 \d/.test(makeDigest(boardEvents, "2026-09-20"))) {
-    throw new Error("the digest's date header must lead with a day name, not a bare number");
-  }
 
   // The same message, second half: "if there's no event, no need to write the day."
-  // An empty board keeps its title and its sentence, so Stav can still tell the bot
-  // ran, but must not announce a date it has nothing for.
-  const emptyDigest = makeDigest([], "2026-09-20");
-  const emptyBoard = makeWeekly([], "2026-09-20");
-  for (const [name, text] of [["digest", emptyDigest], ["board", emptyBoard]]) {
-    if (text.includes("📅")) {
-      throw new Error(`an empty ${name} must not print a date header`);
-    }
-    if (!text.includes("אין אירועים")) {
-      throw new Error(`an empty ${name} must still say there is nothing, not go silent`);
-    }
-  }
+  // An empty day has no board at all; the slot's note says so instead.
+  if (makeBoard([], "2026-09-20") !== "") throw new Error("an empty day must have no board");
 
-  // daily_days no longer promotes a later event into the daily digest (the daily board
-  // shows today's events only); the promoted-message tests were removed with that.
-  const { digestFlyerEvents } = require("./make-digest");
+  // daily_days no longer promotes a later event onto the daily board, which shows
+  // today's events only.
   const promotedEvents = [
     { status: "published", event_name: "היום", date: "2026-10-14", start_time: "21:00", location: "חיפה" },
     { status: "published", event_name: "בעוד שבוע", date: "2026-10-21", start_time: "20:00", location: "חיפה", daily_days: "2026-10-14", flyer: "f.jpg" },
   ];
-  const promotedDigest = makeDigest(promotedEvents, "2026-10-14");
-  if (promotedDigest.includes("בעוד שבוע")) throw new Error("daily_days must not pull a later event into today's digest");
-  if (digestFlyerEvents(promotedEvents, "2026-10-14").length) throw new Error("a later event's flyer must not follow today's digest");
+  const promotedBoard = makeBoard(promotedEvents, "2026-10-14");
+  if (!promotedBoard.includes("היום בחיפה") || promotedBoard.includes("בעוד שבוע")) {
+    throw new Error("daily_days must not pull a later event onto today's board");
+  }
   const { buildSlotPosts } = require("./server");
 
-  // The slot sends today's events as their own message.
-  const { makeDailyParts } = require("./make-digest");
-  const parts = makeDailyParts(promotedEvents, "2026-10-14");
-  if (!parts.today.includes("היום בחיפה") || parts.today.includes("בעוד שבוע")) {
-    throw new Error("the today message holds only today's events");
-  }
-  const onlyLater = makeDailyParts(promotedEvents.slice(1, 2), "2026-10-14");
-  if (onlyLater.today !== "") throw new Error("an empty today message is skipped");
-
   // The slot opens with a note naming each message that follows, for Stav only.
-  const slotPosts = buildSlotPosts(promotedEvents.slice(1, 2), "2026-10-14", "18:00");
-  if (slotPosts.length !== 2) throw new Error("no events today: the note and the board");
-  const note = slotPosts[0].text;
-  // Each message is named by its own first line, the thing Stav actually sees in the chat.
-  if (!note.includes(`1. "${slotPosts[1].text.split("\n")[0]}"`)) {
-    throw new Error(`the note should name each message by its title, got: ${note}`);
+  const slotPosts = buildSlotPosts(promotedEvents, "2026-10-14", "18:00");
+  if (slotPosts.length !== 2) throw new Error("the note and the board");
+  // Each message is named by its title, the thing Stav actually sees in the chat.
+  if (!slotPosts[0].text.includes(`1. "מה עושים היום בחיפה?`)) {
+    throw new Error(`the note should name each message by its title, got: ${slotPosts[0].text}`);
   }
-  if (!note.includes("אין אירועים שמתקיימים היום")) {
-    throw new Error(`the note should say there is nothing today, got: ${note}`);
+  if (slotPosts.some((post) => post.mediaUrl)) throw new Error("the board carries no flyers");
+  const nothingToday = buildSlotPosts(promotedEvents.slice(1, 2), "2026-10-14", "18:00");
+  if (nothingToday.length !== 1) throw new Error("no events today: the note alone");
+  if (!nothingToday[0].text.includes("אין אירועים שמתקיימים היום")) {
+    throw new Error(`the note should say there is nothing today, got: ${nothingToday[0].text}`);
   }
 
-  // An event with an unsent flyer goes as its own image post, not also inside the text.
+  // A board over the message limit goes as several posts, cut between events.
+  {
+    const many = Array.from({ length: 30 }, (_, i) => ({
+      id: String(100 + i), status: "published", event_name: `אירוע ארוך מספר ${i} עם שם שתופס מקום`,
+      date: "2026-10-14", start_time: `${String(10 + (i % 12)).padStart(2, "0")}:00`,
+      location: `רחוב הנביאים ${i}, חיפה`, price: "50 ₪", slug: `slug${i}`,
+    }));
+    const posts = buildSlotPosts(many, "2026-10-14", "18:00");
+    if (posts.length < 3) throw new Error("a long board must be split into several posts");
+    if (posts.some((post) => post.text.length >= 1600)) throw new Error("every post must stay under 1600 characters");
+    for (const post of posts.slice(1)) {
+      if (!/^(\*מה עושים|\S+ \*\d{2}:\d{2} · )/u.test(post.text.split("\n")[0])) throw new Error("a board part must start at an event or the title, not mid-event");
+    }
+    if (!posts[0].text.includes(`מתוך ${posts.length - 1}`)) throw new Error("the note should count the board's parts");
+  }
+
+  // The board carries no flyers; a flyer reaches the group only through a booked ad, its
+  // own post after the board, with the flyer, the map and a date for the day it goes.
   {
     const flyerLinks = { linkFor: () => "", flyerUrl: (e) => (e.flyer ? `https://x/${e.flyer}` : "") };
     const day = [
-      { id: "1", status: "published", event_name: "עם פלייר", date: "2026-10-14", start_time: "20:00", location: "חיפה", flyer: "a.jpg" },
-      { id: "2", status: "published", event_name: "בלי פלייר", date: "2026-10-14", start_time: "21:00", location: "חיפה" },
+      { id: "1", status: "published", event_name: "עם פלייר", date: "2026-10-14", start_time: "20:00", location: "חיפה", flyer: "a.jpg", slug: "fl1" },
+      { id: "2", status: "published", event_name: "מודעה למחר", date: "2026-10-15", start_time: "21:00", location: "חיפה", flyer: "b.jpg", slug: "fl2",
+        ad_date: "2026-10-14", ad_window: "evening", ad_sent_at: "" },
     ];
     const posts = buildSlotPosts(day, "2026-10-14", "18:00", flyerLinks);
-    const today = posts.find((p) => p.text.startsWith("מה עושים היום"));
-    const flyerPost = posts.find((p) => p.mediaUrl);
-    if (!today || today.text.includes("עם פלייר") || !today.text.includes("בלי פלייר")) {
-      throw new Error("a flyered event must leave the today text, which keeps the rest");
-    }
-    if (!flyerPost || !flyerPost.text.includes("עם פלייר") || flyerPost.eventId !== "1") {
-      throw new Error("a flyered event must go as its own image post");
-    }
-    if (posts.indexOf(flyerPost) !== posts.indexOf(today) + 1) {
-      throw new Error("the flyer post must follow the section it belongs to");
-    }
-    if (!flyerPost.text.includes("יום רביעי 14.10")) throw new Error("a forwarded post's date must carry its day name");
-    const sentAlready = buildSlotPosts(day.map((e) => ({ ...e, flyer_sent_at: "2026-10-13T10:00:00Z" })), "2026-10-14", "18:00", flyerLinks);
-    if (sentAlready.some((p) => p.mediaUrl) || !sentAlready.find((p) => p.text.startsWith("מה עושים היום")).text.includes("עם פלייר")) {
-      throw new Error("once its flyer went out, the event is back in the text");
-    }
+    if (posts.length !== 3) throw new Error("note, board, ad");
+    if (posts[1].mediaUrl || !posts[1].text.includes("עם פלייר")) throw new Error("the board lists a flyered event as text");
+    const ad = posts[2];
+    if (ad.mediaUrl !== "https://x/b.jpg" || !ad.isAd || ad.eventId !== "2") throw new Error("the ad carries its flyer");
+    if (!ad.text.includes("/m/fl2")) throw new Error("the ad keeps the map line");
+    if (!ad.text.includes("*מחר!* יום חמישי 15.10")) throw new Error("the ad is dated for the day it goes");
+    if (!posts[0].text.includes("2. מודעה: מודעה למחר")) throw new Error(`the note should name the ad, got: ${posts[0].text}`);
+    if (buildSlotPosts(day, "2026-10-14", "12:00", flyerLinks).some((p) => p.isAd)) throw new Error("12:00 is no ad window");
   }
 
   // An approved event with no location still makes its day's message.
@@ -1085,7 +1072,7 @@ async function demo() {
       { id: "2", status: "published", event_name: "ערב", date: friday, start_time: "21:00", location: "חיפה" },
       { id: "3", status: "published", event_name: "מקודם", date: "2026-10-24", start_time: "20:00", location: "חיפה", daily_days: friday },
     ];
-    const todayOf = (posts) => (posts.find((p) => p.text.startsWith("מה עושים היום")) || { text: "" }).text;
+    const todayOf = (posts) => (posts.find((p) => p.text.startsWith("*מה עושים היום")) || { text: "" }).text;
     const noon = buildSlotPosts(day, friday, "12:00");
     if (!todayOf(noon).includes("בוקר") || !todayOf(noon).includes("ערב")) {
       throw new Error("the noon slot carries everything for the day");
@@ -1093,7 +1080,6 @@ async function demo() {
     const evening = buildSlotPosts(day, friday, "18:00");
     if (todayOf(evening).includes("בוקר")) throw new Error("a morning event must not go out again in the evening");
     if (!todayOf(evening).includes("ערב")) throw new Error("an evening event still goes in the evening slot");
-    if (evening.some((p) => p.text.startsWith("מה עושים בקרוב"))) throw new Error("promoted events go once, at noon");
     if (!evening[0].text.includes("12:00")) throw new Error("the note should say what the noon slot already covered");
     const weekday = buildSlotPosts(day.map((e) => ({ ...e, date: "2026-10-22", daily_days: "" })), "2026-10-22", "18:00");
     if (!todayOf(weekday).includes("בוקר")) throw new Error("with no noon slot, the evening slot keeps the day's earlier events");
@@ -1134,25 +1120,8 @@ async function demo() {
     const city = { ...a, location: "חיפה" };
     if (isSameEvent(city, { ...city, event_name: "משהו אחר" })) throw new Error("a bare city is not an address");
     if (withoutDuplicates([a, b]).length !== 1 || withoutDuplicates([a, b])[0].id !== "69") throw new Error("the first copy is kept");
-    const board = makeWeekly([a, b], "2026-10-22");
+    const board = makeBoard([a, b], "2026-10-23");
     if (board.split("SEE GARDEN").length !== 2) throw new Error("the board must list a duplicated event once");
-  }
-
-  // The range must end on the last day that actually has an event: with empty days
-  // skipped, a header running to Saturday over a board ending Friday promises a day
-  // that is not on it.
-  const rangeEvents = [
-    { status: "published", event_name: "א", date: "2026-09-20", start_time: "20:00", location: "חיפה", category: "מסיבה" },
-    { status: "published", event_name: "ב", date: "2026-09-22", start_time: "21:00", location: "חיפה", category: "מוזיקה" },
-  ];
-  const ranged = makeWeekly(rangeEvents, "2026-09-20");
-  if (ranged.includes("26.9") || ranged.includes("25.9")) {
-    throw new Error("the range must stop at the last day with an event, not run to the window's end");
-  }
-  // One day left in the window needs no per-day header: the range already names it.
-  const single = makeWeekly([rangeEvents[0]], "2026-09-20");
-  if (single.includes("—")) {
-    throw new Error("a board with one day must not repeat that day as a separate header");
   }
 
   fs.unlinkSync(boardFile);
@@ -1237,58 +1206,11 @@ async function demo() {
   }
   fs.unlinkSync(cpFile);
 
-  // --- Phase 2: rolling board and the daily slots ---
-  const weekly = require("./make-weekly");
+  // --- Phase 2: the daily slots ---
 
-  // The board starts today and runs to Saturday. The old fixed boards snapped backward
-  // to their first day, so a board sent on Wednesday still led with Sunday — days the
-  // reader could no longer act on.
-  const windowCases = [
-    ["2026-08-23", 7], // Sunday
-    ["2026-08-26", 4], // Wednesday
-    ["2026-08-28", 2], // Friday
-    ["2026-08-29", 1], // Saturday
-  ];
-  for (const [from, expected] of windowCases) {
-    const win = weekly.rollingWindow(from);
-    if (win.length !== expected) {
-      throw new Error(`rollingWindow(${from}) should span ${expected} days, got ${win.length}`);
-    }
-    if (win[0] !== from) throw new Error(`rollingWindow(${from}) must start on that day`);
-  }
-  // Never rolls into next week: the title promises this week.
-  const satWindow = weekly.rollingWindow("2026-08-29");
-  if (satWindow[satWindow.length - 1] !== "2026-08-29") {
-    throw new Error("the rolling window must stop at Saturday, not continue into next week");
-  }
-  // On a one-day window "what's on this week" would be a lie.
-  if (!weekly.boardTitle(satWindow).includes("היום")) {
-    throw new Error("a single-day board must say today, not this week");
-  }
-  if (!weekly.boardTitle(weekly.rollingWindow("2026-08-23")).includes("השבוע")) {
-    throw new Error("a multi-day board must say this week");
-  }
-
-  const rollFile = path.join(__dirname, "test-roll.csv");
-  if (fs.existsSync(rollFile)) fs.unlinkSync(rollFile);
-  fs.writeFileSync(rollFile, eventsStore.CSV_HEADERS.join(",") + "\n", "utf8");
-  for (const [name, date] of [["אתמול", "2026-08-22"], ["מחרתיים", "2026-08-26"]]) {
-    const rid = eventsStore.appendEvent(
-      rollFile,
-      { event_name: name, date, start_time: "20:00", end_time: "", location: "בר בזל, מסדה 12, חיפה",
-        category: "מוזיקה", price: "", organizer: "", contact_link: "", contact_person: "",
-        description: "" },
-      "Twilio WhatsApp", "whatsapp:+972500004321", []
-    );
-    eventsStore.updateEvent(rollFile, rid, { status: "published" });
-  }
-  const rolled = weekly.makeWeekly(eventsStore.loadEvents(rollFile), "2026-08-23");
-  if (rolled.includes("אתמול")) throw new Error("a past event must never appear on the board");
-  if (!rolled.includes("מחרתיים")) throw new Error("an upcoming event must appear on the board");
-  fs.unlinkSync(rollFile);
-
-  // Slots: weekdays 18:00, weekends also 12:00, sent 10 minutes prior. A window rather
-  // than an exact minute, because Fly suspends the machine and timers drift.
+  // Slots: the 10:00 ads slot every day, weekdays 18:00, weekends also 12:00, sent 10
+  // minutes prior. A window rather than an exact minute, because Fly suspends the
+  // machine and timers drift.
   const slotsAt = (day, hour, minute) =>
     slotsDueAt({ day, hour, minute }).map((s) => s.slot).join(",");
   if (slotsAt(1, 17, 50) !== "18:00") throw new Error("Monday 17:50 must be due for the 18:00 slot");
@@ -1299,6 +1221,7 @@ async function demo() {
   if (slotsAt(5, 11, 50) !== "12:00") throw new Error("Friday must have the midday slot");
   if (slotsAt(6, 11, 50) !== "12:00") throw new Error("Saturday must have the midday slot");
   if (slotsAt(6, 17, 50) !== "18:00") throw new Error("Saturday must also have the evening slot");
+  if (slotsAt(1, 9, 50) !== "10:00" || slotsAt(6, 9, 50) !== "10:00") throw new Error("every day has the 10:00 ads slot");
 
   // --- Phase 3: publish-day choice, approval flow, goodbye ---
 
@@ -1514,7 +1437,7 @@ async function demo() {
   // sequences, and a client that does not know the pair renders nothing at all — which
   // is how a price line reached Stav looking unlabelled, as if the payment had moved.
   // Single code points degrade to a recognisable glyph instead of vanishing.
-  for (const file of ["server.js", "format-event.js", "make-weekly.js", "make-digest.js", "send-reminder.js"]) {
+  for (const file of ["server.js", "format-event.js", "make-digest.js", "ad-windows.js", "send-reminder.js"]) {
     const source = fs.readFileSync(path.join(__dirname, file), "utf8");
     const fragile = [...source.matchAll(/[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}]\u{FE0F}/gu)];
     if (fragile.length) {
@@ -2175,16 +2098,6 @@ async function demo() {
 
   // --- Feedback of 16/10/2026 ---
 
-  // A flyer post goes out once ever.
-  {
-    const { digestFlyerEvents } = require("./make-digest");
-    const base = { status: "published", event_name: "פלייר", date: "2026-10-20", start_time: "20:00", location: "בר בזל, מסדה 12", flyer: "f.jpg" };
-    if (digestFlyerEvents([base], "2026-10-20").length !== 1) throw new Error("an unsent flyer should be attached");
-    if (digestFlyerEvents([{ ...base, flyer_sent_at: "2026-10-19T10:00:00Z" }], "2026-10-20").length) {
-      throw new Error("a flyer already sent must not be attached again");
-    }
-  }
-
   // A partial send says how far it got, so the board is not retried from the top.
   {
     const sw = require("./send-whatsapp");
@@ -2194,15 +2107,11 @@ async function demo() {
 
   // Multi-day events appear on every day they run, and expire after the last.
   {
-    const { makeDigest } = require("./make-digest");
-    const { makeWeekly } = require("./make-weekly");
     const fest = { status: "published", event_name: "פסטיבל שלושה ימים", date: "2026-10-20", end_date: "2026-10-22", start_time: "18:00", location: "גן הבהאים, חיפה", category: "מוזיקה" };
     for (const day of ["2026-10-20", "2026-10-21", "2026-10-22"]) {
-      if (!makeDigest([fest], day).includes("פסטיבל שלושה ימים")) throw new Error(`a festival should be in the digest on ${day}`);
+      if (!makeBoard([fest], day).includes("פסטיבל שלושה ימים")) throw new Error(`a festival should be on the board on ${day}`);
     }
-    if (makeDigest([fest], "2026-10-23").includes("פסטיבל שלושה ימים")) throw new Error("a festival should be gone after its last day");
-    const board = makeWeekly([fest], "2026-10-20");
-    if ((board.match(/פסטיבל שלושה ימים/g) || []).length !== 3) throw new Error("a festival should sit under each of its days on the board");
+    if (makeBoard([fest], "2026-10-23").includes("פסטיבל שלושה ימים")) throw new Error("a festival should be gone after its last day");
     if (upcomingPublishedEvents([fest], "2026-10-22").length !== 1) throw new Error("a festival is still upcoming on its last day");
     if (upcomingPublishedEvents([fest], "2026-10-23").length) throw new Error("a festival is over after its last day");
     if (eventsStore.cleanEndDate("2026-10-20", "2026-10-20") !== "") throw new Error("an end date equal to the start is dropped");
@@ -2281,6 +2190,47 @@ async function demo() {
     if (!(await routeMessage("whatsapp:+972500016302", "5")).includes("לא מצאנו אירועים")) {
       throw new Error("someone with no events should be told so");
     }
+  }
+
+  // --- The daily board and booked ads at the slots ---
+  const { lateAds, todayPage, eventLandingPage } = require("./server");
+  {
+    const base = { status: "published", location: "מקום", price: "20 ₪", slug: "s", contact_link: "", daily_days: "" };
+    const today = { ...base, id: "1", event_name: "היום בערב", date: "2026-11-05", start_time: "20:00" };
+    const early = { ...base, id: "2", event_name: "בוקר", date: "2026-11-05", start_time: "09:00" };
+    const booked = { ...base, id: "3", event_name: "מודעה", date: "2026-11-07", start_time: "20:00",
+      flyer: "f.jpg", ad_date: "2026-11-06", ad_window: "evening", ad_sent_at: "" };
+    const morningAd = { ...booked, id: "4", ad_window: "morning" };
+
+    // Thursday 18:00: board has today's events only, and the 10:00 ads slot is not an
+    // earlier board, so the 09:00 event stays in.
+    const thu = buildSlotPosts([today, early, booked], "2026-11-05", "18:00");
+    if (thu.length !== 2) throw new Error("note and board only");
+    if (!thu[1].text.includes("בוקר") || thu[1].text.includes("מודעה")) throw new Error("board is today only");
+    // Friday 18:00: board-less day, the ad still goes, after the note
+    const fri = buildSlotPosts([booked], "2026-11-06", "18:00");
+    if (fri.length !== 2 || !fri[1].text.includes("*מחר!*") || fri[1].eventId !== "3") throw new Error("evening ad");
+    // the ads-only slot is silent with nothing booked, and carries a morning booking
+    if (buildSlotPosts([today], "2026-11-05", "10:00").length !== 0) throw new Error("empty ads slot sends nothing");
+    if (buildSlotPosts([morningAd], "2026-11-06", "10:00").length !== 2) throw new Error("morning ad");
+    // sent once; a declined booking never goes
+    if (buildSlotPosts([{ ...booked, ad_sent_at: "x" }], "2026-11-06", "18:00").length !== 1) throw new Error("ad resent");
+    // quiet day: the note alone
+    const quiet = buildSlotPosts([], "2026-11-05", "18:00");
+    if (quiet.length !== 1 || !quiet[0].text.includes("אין")) throw new Error("quiet note");
+    // Saturday 18:00 still drops what 12:00 covered
+    const satEarly = { ...early, date: "2026-11-07", start_time: "11:00" };
+    if (buildSlotPosts([satEarly], "2026-11-07", "18:00").length !== 1) throw new Error("covered by 12:00");
+    // late ads: unsent after handoff and before the event; not before handoff, not after start
+    const local = (date, hour) => ({ date, hour, minute: 0, day: 5 });
+    if (lateAds([morningAd], local("2026-11-06", 11)).length !== 1) throw new Error("late ad found");
+    if (lateAds([morningAd], local("2026-11-06", 9)).length !== 0) throw new Error("before handoff");
+    if (lateAds([{ ...morningAd, date: "2026-11-06", start_time: "10:30" }], local("2026-11-06", 11)).length !== 0) throw new Error("event started");
+    if (lateAds([{ ...morningAd, ad_window: "decline" }], local("2026-11-06", 11)).length !== 0) throw new Error("declined");
+    // pages
+    const page = todayPage([today], "2026-11-05");
+    if (!page.includes('property="og:title"') || !page.includes("היום בערב")) throw new Error("today page");
+    if (!eventLandingPage(today).includes('property="og:title"')) throw new Error("event page tags");
   }
 
   fs.unlinkSync(CORRECTIONS_FILE);

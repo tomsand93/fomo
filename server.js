@@ -3,16 +3,16 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const { URLSearchParams } = require("url");
-const { loadEvents, makeDigest, makeDailyParts, digestEvents } = require("./make-digest");
+const { loadEvents, makeBoard, digestEvents } = require("./make-digest");
 const { israelClock, todayIso, addDays, dayOfWeek, longDate, isReminderDue, isReminderMissed } = require("./clock");
-const { isFreeEntry, formatShort, formatLong } = require("./format-event");
-const { makeWeekly } = require("./make-weekly");
+const { isFreeEntry, entranceLabel, formatShort, formatLong } = require("./format-event");
+const { AD_WINDOWS, adDateLine } = require("./ad-windows");
 const { appendEvent: storeAppendEvent, updateEvent: storeUpdateEvent, findEvent: storeFindEvent, lastDay, runsOn, isSameEvent } = require("./events-store");
 const extractEventModule = require("./extract-event");
 const intentModule = require("./classify-intent");
 const { addCorrection, buildCorrectionGuidance } = require("./corrections-store");
 const answerInquiryModule = require("./answer-inquiry");
-const { sendWhatsApp, getMessageStatus, postForm } = require("./send-whatsapp");
+const { sendWhatsApp, getMessageStatus, postForm, splitBody } = require("./send-whatsapp");
 const { fetchMediaAsDataUrl } = require("./fetch-media");
 const { saveFlyer, flyerPath, contentTypeFor, deleteFlyer } = require("./flyer-store");
 const { logClick, logInteraction, clickStats, pruneOlderThan } = require("./clicks-store");
@@ -220,7 +220,13 @@ function isRateLimited(sender) {
 // Stav forwards to the group at these Israel-local times, so the bot hands her the
 // material ten minutes earlier. Weekends get a midday slot as well, because that is
 // when the group actually plans a Friday or Saturday.
+//
+// 10:00 is the morning ad window (ad-windows.js) and carries booked ads only, never the
+// board: a day with nothing booked sends nothing at 10:00. adsOnly keeps it out of
+// earlierSlotToday, or every 18:00 board would take 10:00 for an earlier board and drop
+// the day's morning events.
 const DAILY_SLOTS = [
+  { slot: "10:00", sendHour: 9, sendMinute: 50, days: [0, 1, 2, 3, 4, 5, 6], adsOnly: true },
   { slot: "12:00", sendHour: 11, sendMinute: 50, days: [5, 6] },          // Fri, Sat
   { slot: "18:00", sendHour: 17, sendMinute: 50, days: [0, 1, 2, 3, 4, 5, 6] },
 ];
@@ -240,7 +246,7 @@ const LOG_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 // send window re-sent the board despite the comment promising otherwise — and Fly
 // suspends this machine when idle (auto_stop_machines), making restarts routine.
 let sentBoards = new Set(); // `${date}:${slot}` already sent, so a restart can't double-post
-let pendingBoards = new Map(); // `${date}:${slot}` -> [{ text, mediaUrl, eventId }] Twilio accepted but never delivered
+let pendingBoards = new Map(); // `${date}:${slot}` -> [{ text, mediaUrl, eventId, isAd }] Twilio accepted but never delivered
 let sentReminders = new Set(); // `${date}` already reminded, so a restart can't send twice
 let sentNudges = new Set(); // `${date}` the weekly publisher nudge already went out, same reason
 let nudgeOptOuts = new Set(); // senders who answered the weekly nudge with "הסר"
@@ -264,28 +270,31 @@ function slotsDueAt(local) {
 }
 
 // Each slot is a short note for Stav, then the messages she forwards as is, in order:
-// events happening today, later events whose submitter picked today, and the rolling
-// board. Empty ones are skipped; the board always goes, so a quiet day still shows the
-// bot ran.
+// the daily board (today's events, short form), then the ads booked for the window that
+// opens at that slot. 10:00 carries ads only, 12:00 the board only, 18:00 both. A slot
+// with no board and no ads still sends its note, saying so, so a quiet day shows the bot
+// ran. 10:00 with nothing booked sends nothing: it never carries a board to miss.
 //
-// An event with an unsent flyer is not in the text messages: its own post (image and
-// full text) goes right after the section it belongs to, instead. Sending both put the
-// same event in front of the group twice, and Stav could not tell which to forward.
-//
-// The note names each message by its own first line, which is what she sees in the
-// chat. It used to say "1. today's events, 2. ..." over messages that carry no numbers,
-// and she could not match them up (21/10/2026).
+// The note names each message by what she sees in the chat. It used to say "1. today's
+// events, 2. ..." over messages that carry no numbers, and she could not match them up
+// (21/10/2026).
 const SLOT_POST_LABELS = {
-  today: "האירועים שמתקיימים היום",
-  promoted: "אירועים בימים הבאים, שהמפרסמים ביקשו שיופיעו היום",
-  board: "הלוח: כל האירועים המאושרים עד סוף השבוע, בקצרה",
+  today: "הלוח היומי",
+  ad: "מודעה",
 };
-const MAX_SLOT_FLYERS = 3;
+const SLOT_LINKS = { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) };
+// sendWhatsApp's own margin under Twilio's 1600. A longer board becomes several posts,
+// cut at the blank line between two events, so the note can count them and each one
+// forwards as is.
+const MAX_BOARD_CHARS = 1500;
+
+const pad2 = (n) => String(n).padStart(2, "0");
 
 // The earlier slot that already ran today, if any — the weekend's 12:00 before its 18:00.
+// The 10:00 ads slot never carries the board, so it is not an earlier board.
 function earlierSlotToday(localDate, slot) {
   const day = dayOfWeek(localDate);
-  const earlier = DAILY_SLOTS.filter((entry) => entry.days.includes(day) && slot && entry.slot < slot);
+  const earlier = DAILY_SLOTS.filter((entry) => !entry.adsOnly && entry.days.includes(day) && slot && entry.slot < slot);
   return earlier.length ? earlier[earlier.length - 1].slot : "";
 }
 
@@ -305,54 +314,99 @@ function dateLineFor(event) {
   return `${longDate(event.date)}${multiDay ? `–${longDate(event.end_date)}` : ""}`;
 }
 
-function buildSlotPosts(events, localDate, slot = "", links = { linkFor: shortLink, flyerUrl: (e) => flyerUrl(e.flyer) }) {
-  const daily = digestEvents(events, localDate);
+// The ad window that opens at a slot: 10:00 is the morning one, 18:00 the evening one.
+function adWindowAt(slot) {
+  const window = AD_WINDOWS.find((entry) => entry.start === slot);
+  return window ? window.key : "";
+}
+
+// Ads booked for a window on this day that have not gone to Stav yet. A declined offer
+// has ad_window "decline", which no window matches.
+function adsDue(events, localDate, windowKey) {
+  return events
+    .filter((event) =>
+      event.status === "published" &&
+      event.ad_date === localDate &&
+      event.ad_window === windowKey &&
+      !event.ad_sent_at
+    )
+    .sort((a, b) => `${a.date} ${a.start_time}`.localeCompare(`${b.date} ${b.start_time}`));
+}
+
+// The graphic ad: the long form with the flyer as media, dated for the day it is posted.
+// It keeps the map line. A message with a flyer shows no link preview, so the map tile
+// can't push anything else out of it.
+function adPost(event, postDate, windowKey, links = SLOT_LINKS) {
+  const { text, mediaUrl } = formatLong(event, { ...links, mapFor: mapLink, dateLine: adDateLine(event, postDate, windowKey) });
+  return { text, mediaUrl, eventId: event.id, isAd: true };
+}
+
+function adLabel(event) {
+  return `${SLOT_POST_LABELS.ad}: ${event.event_name} (${longDate(event.date)})`;
+}
+
+const postCount = (n) => (n === 1 ? "הודעה אחת" : `${n} הודעות`);
+
+// What leaves buildSlotPosts and sendLateAds: the labels are for the note only.
+const forwardable = ({ text, mediaUrl = "", eventId = "", isAd = false }) => ({ text, mediaUrl, eventId, isAd });
+
+// Returns [] for a 10:00 slot with nothing booked, otherwise the note and then the posts.
+function buildSlotPosts(events, localDate, slot = "", links = SLOT_LINKS) {
+  const entry = DAILY_SLOTS.find((candidate) => candidate.slot === slot) || {};
+  const windowKey = adWindowAt(slot);
+  const ads = windowKey ? adsDue(events, localDate, windowKey) : [];
+  if (entry.adsOnly && !ads.length) return [];
+
+  const daily = entry.adsOnly ? [] : digestEvents(events, localDate);
   const fresh = daily.filter((event) => !coveredByEarlierSlot(event, localDate, slot));
-  const flyered = fresh
-    .filter((event) => event.flyer && !event.flyer_sent_at && links.flyerUrl(event))
-    .slice(0, MAX_SLOT_FLYERS);
-  const flyeredIds = new Set(flyered.map((event) => event.id));
+  const board = entry.adsOnly ? "" : makeBoard(fresh, localDate, { linkFor: links.linkFor, todayUrl: absoluteUrl("/today") });
+  const boardParts = board ? splitBody(board, MAX_BOARD_CHARS) : [];
+  const title = board.split("\n")[0].replace(/\*/g, "").trim();
 
-  // The map goes on the daily messages only. The board's one-line entries already carry
-  // a location, a price and a link; a second URL there is noise. formatShort ignores
-  // mapFor anyway, but passing it only where it is wanted keeps that deliberate.
-  const longLinks = { ...links, mapFor: mapLink };
-  const { today, promoted } = makeDailyParts(fresh.filter((event) => !flyeredIds.has(event.id)), localDate, longLinks);
-  const board = makeWeekly(events, localDate, links);
-
-  const titled = (text, label) => ({ text, label: `"${text.split("\n")[0]}" — ${label}` });
-  const flyerPost = (event, isToday) => ({
-    ...formatLong(event, { ...longLinks, dateLine: dateLineFor(event) }),
-    eventId: event.id,
-    label: `תמונה ופרטים: ${event.event_name}${isToday ? "" : ` (${longDate(event.date)})`}`,
-  });
-  const isToday = (event) => runsOn(event, localDate);
   const posts = [
-    today && titled(today, SLOT_POST_LABELS.today),
-    ...flyered.filter(isToday).map((event) => flyerPost(event, true)),
-    promoted && titled(promoted, SLOT_POST_LABELS.promoted),
-    ...flyered.filter((event) => !isToday(event)).map((event) => flyerPost(event, false)),
-    titled(board, SLOT_POST_LABELS.board),
-  ].filter(Boolean);
-
-  const intro = [
-    `📬 להעביר לקבוצה${slot ? ` ב-${slot}` : ""} — ${posts.length === 1 ? "הודעה אחת" : `${posts.length} הודעות`}, לפי הסדר:`,
-    "",
-    ...posts.map((post, i) => `${i + 1}. ${post.label}`),
+    ...boardParts.map((text, i) => ({
+      text,
+      label: `"${title}" (${SLOT_POST_LABELS.today}${boardParts.length > 1 ? `, חלק ${i + 1} מתוך ${boardParts.length}` : ""})`,
+    })),
+    ...ads.map((event) => ({ ...adPost(event, localDate, windowKey, links), label: adLabel(event) })),
   ];
-  const earlier = earlierSlotToday(localDate, slot);
-  const coveredToday = daily.some((event) => isToday(event) && coveredByEarlierSlot(event, localDate, slot));
-  const hasToday = Boolean(today) || flyered.some(isToday);
-  if (!hasToday && coveredToday) {
-    intro.push("", `אירועי היום כבר נשלחו בהודעה של ${earlier}, לכן אין הודעת "מה עושים היום".`);
-  } else if (!hasToday) {
-    intro.push("", "אין אירועים שמתקיימים היום, לכן אין הודעת \"מה עושים היום\".");
-  } else if (coveredToday) {
-    intro.push("", `אירועים שכבר נשלחו בהודעה של ${earlier} לא מופיעים שוב.`);
-  }
-  intro.push("", "כל ההודעות שמתחת לזו — להעביר כמו שהן.");
 
-  return [{ text: intro.join("\n") }, ...posts.map(({ text, mediaUrl = "", eventId = "" }) => ({ text, mediaUrl, eventId }))];
+  const where = slot ? ` ב-${slot}` : "";
+  const intro = posts.length
+    ? [`📬 להעביר לקבוצה${where} — ${postCount(posts.length)}, לפי הסדר:`, "", ...posts.map((post, i) => `${i + 1}. ${post.label}`)]
+    : [`📬 אין הודעות להעביר לקבוצה${where}.`];
+  if (!entry.adsOnly) {
+    const earlier = earlierSlotToday(localDate, slot);
+    const covered = fresh.length < daily.length;
+    if (!board && covered) {
+      intro.push("", `אירועי היום כבר נשלחו בהודעה של ${earlier}, לכן אין לוח יומי.`);
+    } else if (!board) {
+      intro.push("", "אין אירועים שמתקיימים היום, לכן אין לוח יומי.");
+    } else if (covered) {
+      intro.push("", `אירועים שכבר נשלחו בהודעה של ${earlier} לא מופיעים שוב.`);
+    }
+  }
+  if (posts.length) intro.push("", "כל ההודעות שמתחת לזו — להעביר כמו שהן.");
+
+  return [{ text: intro.join("\n") }, ...posts.map(forwardable)];
+}
+
+// Booked ads whose handoff has passed with the ad still not handed to Stav, while the
+// event is ahead: the machine slept through the slot, the slot failed, a past-day board
+// holding the ad was dropped, or the booking came in after its window's handoff. "Ahead"
+// is measured as availableWindows measures it: a multi-day event against its start time
+// on its last day.
+function lateAds(events, local) {
+  const now = `${local.date} ${pad2(local.hour)}:${pad2(local.minute)}`;
+  return events
+    .filter((event) => {
+      if (event.status !== "published" || event.ad_sent_at || !event.ad_date || !event.start_time) return false;
+      const window = AD_WINDOWS.find((entry) => entry.key === event.ad_window);
+      if (!window) return false;
+      const handoff = `${event.ad_date} ${pad2(window.sendHour)}:${pad2(window.sendMinute)}`;
+      return handoff <= now && now < `${lastDay(event)} ${event.start_time}`;
+    })
+    .sort((a, b) => `${a.date} ${a.start_time}`.localeCompare(`${b.date} ${b.start_time}`));
 }
 
 // The Twilio balance is prepaid; at zero the account is suspended and the bot goes
@@ -402,55 +456,119 @@ async function sendDueBoards(now = new Date()) {
     saveState();
 
     const events = loadEvents(EVENTS_FILE);
-    const posts = withBalanceWarning(buildSlotPosts(events, localDate, slot), await lowBalanceWarning());
-    let sent = 0;
-    try {
-      // Goes to Stav, not the group: WhatsApp's API can't post into a normal group
-      // (channels.md), so she forwards it — and gets to eyeball it first.
-      let firstSid = "";
-      for (const post of posts) {
-        const result = await sendSlotPost(post);
-        if (!firstSid) firstSid = result.sid;
-        sent += 1;
-      }
-      // A resolved send is not delivery: the slots fire when Stav is usually not
-      // mid-conversation, so her 24h WhatsApp window is typically closed and Twilio
-      // drops the message with 63016. Every board between 16 Aug and 23 Aug 2026 was
-      // lost this way, silently. Hold it until confirmed. The posts stay separate (with
-      // their flyers): she forwards each one as is, and a single joined message had her
-      // cutting it apart by hand (29/10/2026).
-      pendingBoards.set(key, posts);
-      saveState();
-      confirmBoardDelivery(key, firstSid);
-    } catch (err) {
-      console.error(`failed to send the ${slot} message:`, err);
-      if (sent > 0 || err.sentParts > 0) {
-        // Some of it already reached Stav. Retrying from the top re-sent it every five
-        // minutes, so only the rest is queued, for her next message.
-        const rest = [err.sentParts > 0 ? { text: err.unsent } : posts[sent], ...posts.slice(sent + 1)];
-        pendingBoards.set(key, rest);
-        saveState();
-        continue;
-      }
+    const slotPosts = buildSlotPosts(events, localDate, slot);
+    if (!slotPosts.length) continue; // the 10:00 ads slot with nothing booked
+    const posts = withBalanceWarning(slotPosts, await lowBalanceWarning());
+    if (!(await sendPostsToStav(key, posts))) {
       sentBoards.delete(key); // nothing went out: let the next check retry within the window
       saveState();
     }
   }
+
+  // After the slots, so an ad a slot just sent is already marked and not sent twice.
+  await sendLateAds(now);
 }
 
-// Twilio attaches one image per message, so each flyered event is its own post. That
-// event is left out of the text messages, so a failed image must not lose it: the post
-// goes again as text only.
-async function sendSlotPost(post) {
-  if (!post.mediaUrl) return sendWhatsApp(ADMIN_SENDER, post.text);
+// Sends one batch to Stav in order and holds it until delivery is confirmed. Resolves to
+// false when nothing went out, so the caller can let the next check retry.
+async function sendPostsToStav(key, posts) {
+  let sent = 0;
   try {
-    const result = await sendWhatsApp(ADMIN_SENDER, post.text, post.mediaUrl);
-    markFlyerSent(post.eventId);
-    return result;
+    // Goes to Stav, not the group: WhatsApp's API can't post into a normal group
+    // (channels.md), so she forwards it — and gets to eyeball it first.
+    let firstSid = "";
+    for (const post of posts) {
+      const result = await sendSlotPost(post);
+      if (!firstSid) firstSid = result.sid;
+      sent += 1;
+    }
+    // A resolved send is not delivery: the slots fire when Stav is usually not
+    // mid-conversation, so her 24h WhatsApp window is typically closed and Twilio
+    // drops the message with 63016. Every board between 16 Aug and 23 Aug 2026 was
+    // lost this way, silently. Hold it until confirmed. The posts stay separate (with
+    // their flyers): she forwards each one as is, and a single joined message had her
+    // cutting it apart by hand (29/10/2026).
+    //
+    // A late-ad key is the minute it went, so it can meet a batch still queued under the
+    // same key; the two are kept together rather than one overwriting the other.
+    pendingBoards.set(key, [...(pendingBoards.get(key) || []), ...posts]);
+    saveState();
+    confirmBoardDelivery(key, firstSid);
+    return true;
   } catch (err) {
-    console.error(`failed to send the flyer for event #${post.eventId}, sending its text alone:`, err);
-    return sendWhatsApp(ADMIN_SENDER, post.text);
+    console.error(`failed to send the ${key} messages:`, err);
+    if (sent > 0 || err.sentParts > 0) {
+      // Some of it already reached Stav. Retrying from the top re-sent it every five
+      // minutes, so only the rest is queued, for her next message.
+      const rest = [err.sentParts > 0 ? { ...posts[sent], text: err.unsent, mediaUrl: "" } : posts[sent], ...posts.slice(sent + 1)];
+      pendingBoards.set(key, [...(pendingBoards.get(key) || []), ...rest]);
+      saveState();
+      return true;
+    }
+    return false;
   }
+}
+
+// Hands Stav every late ad (lateAds) in one batch, under a note saying they are late.
+// Keyed `${date}:${HH:MM}` like a slot, because sendSlotReadyPing reads the time back
+// with key.slice(11). Runs one at a time: the interval and a fresh booking can both call
+// it, and two runs reading the file before either marks ad_sent_at would send twice.
+let lateAdsRun = Promise.resolve();
+
+function sendLateAds(now = new Date()) {
+  if (process.env.NODE_ENV === "test") return Promise.resolve();
+  const run = lateAdsRun.then(() => sendLateAdsNow(now));
+  lateAdsRun = run.catch((err) => console.error("failed to send late ads:", err));
+  return lateAdsRun;
+}
+
+async function sendLateAdsNow(now) {
+  const local = israelClock(now);
+  // An ad already queued for Stav is not late, it is waiting for her window to reopen.
+  const queued = new Set(
+    [...pendingBoards.values()].flat().filter((post) => post.isAd).map((post) => String(post.eventId))
+  );
+  const late = lateAds(loadEvents(EVENTS_FILE), local).filter((event) => !queued.has(String(event.id)));
+  if (!late.length) return;
+
+  // The date line is worked out for when the ad actually goes: from the evening handoff
+  // on it reads as tonight's.
+  const evening = AD_WINDOWS.find((entry) => entry.key === "evening");
+  const minutes = local.hour * 60 + local.minute;
+  const windowKey = minutes >= evening.sendHour * 60 + evening.sendMinute ? "evening" : "morning";
+  const posts = late.map((event) => ({ ...adPost(event, local.date, windowKey), label: adLabel(event) }));
+  const note = [
+    `⏰ ${late.length === 1 ? "מודעה באיחור" : `${late.length} מודעות באיחור`} — להעביר לקבוצה כבר עכשיו, ${postCount(posts.length)}, לפי הסדר:`,
+    "",
+    ...posts.map((post, i) => `${i + 1}. ${post.label}`),
+    "",
+    "כל ההודעות שמתחת לזו — להעביר כמו שהן.",
+  ].join("\n");
+  const key = `${local.date}:${pad2(local.hour)}:${pad2(local.minute)}`;
+  await sendPostsToStav(key, [{ text: note }, ...posts.map(forwardable)]);
+}
+
+// Twilio attaches one image per message, so an ad goes as its own post. A failed image
+// must not lose the ad: the post goes again as text only. Either way the ad is marked
+// as handed over, so neither the slot nor lateAds sends it again.
+async function sendSlotPost(post) {
+  let result;
+  if (!post.mediaUrl) {
+    result = await sendWhatsApp(ADMIN_SENDER, post.text);
+  } else {
+    try {
+      result = await sendWhatsApp(ADMIN_SENDER, post.text, post.mediaUrl);
+    } catch (err) {
+      console.error(`failed to send the flyer for event #${post.eventId}, sending its text alone:`, err);
+      result = await sendWhatsApp(ADMIN_SENDER, post.text);
+    }
+  }
+  if (post.isAd && post.eventId) markAdSent(post.eventId);
+  return result;
+}
+
+function markAdSent(id) {
+  storeUpdateEvent(EVENTS_FILE, id, { ad_sent_at: new Date().toISOString() });
 }
 
 // Mirrors confirmAdminNotification: poll detached, and on a non-delivery leave the board
@@ -542,6 +660,11 @@ async function flushPendingBoards() {
       // forwarding it would mislead the group, so it is dropped, not sent late.
       if (key.slice(0, 10) < today) {
         console.error(`dropping the ${key} board: its day has passed`);
+        // An ad in it never reached her. Unmarked, lateAds hands it over again, with a
+        // date line for the day it actually goes, if the event is still ahead.
+        for (const post of posts) {
+          if (post.isAd && post.eventId) storeUpdateEvent(EVENTS_FILE, post.eventId, { ad_sent_at: "" });
+        }
         pendingBoards.delete(key);
         continue;
       }
@@ -1448,33 +1571,29 @@ function escapeHtml(value) {
     .replace(/'/g, "&#39;");
 }
 
-// Where a short link lands when the submitter gave a contact rather than a URL, which
-// is the common case. Self-contained: one file, no external assets, so it renders on a
-// phone with a bad connection and nothing to fetch.
-function eventLandingPage(event) {
-  const rows = [
-    ["📅", event.date ? `${longDate(event.date)}${lastDay(event) !== event.date ? `–${longDate(lastDay(event))}` : ""}` : ""],
-    ["🕗", event.start_time ? `${event.start_time}${event.end_time ? `-${event.end_time}` : ""}` : ""],
-    ["📍", event.location],
-    [isFreeEntry(event) ? "🆓" : "🎫", isFreeEntry(event) ? "כניסה חופשית" : event.price],
-    ["👤", event.contact_person],
-    ["📞", destinationFor(event) ? "" : event.contact_link],
-  ]
-    .filter(([, value]) => value)
-    .map(([icon, value]) => `<div class="row"><span>${icon}</span><span>${escapeHtml(value)}</span></div>`)
-    .join("\n      ");
+// The branded card WhatsApp shows when /today is linked (1200x630). Optional: without the
+// file the page carries no og:image and the preview falls back to its title and text.
+const OG_CARD_FILE = path.join(__dirname, "assets", "og-card.png");
 
-  const flyer = event.flyer && flyerUrl(event.flyer)
-    ? `<img src="${escapeHtml(flyerUrl(event.flyer))}" alt="">`
-    : "";
+function absoluteUrl(pathname) {
+  return PUBLIC_BASE_URL ? `${PUBLIC_BASE_URL.replace(/\/$/, "")}${pathname}` : "";
+}
 
-  return `<!doctype html>
-<html lang="he" dir="rtl">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${escapeHtml(event.event_name)} · FOMO חיפה</title>
-<style>
+function ogCardUrl() {
+  return fs.existsSync(OG_CARD_FILE) ? absoluteUrl("/og-card.png") : "";
+}
+
+// WhatsApp builds a link preview from these. og:image has to be an absolute URL, so it
+// is left out when there is none to give.
+function ogTags({ title, description, image }) {
+  return [
+    `<meta property="og:title" content="${escapeHtml(title)}">`,
+    `<meta property="og:description" content="${escapeHtml(description)}">`,
+    image ? `<meta property="og:image" content="${escapeHtml(image)}">` : "",
+  ].filter(Boolean).join("\n");
+}
+
+const PAGE_STYLE = `<style>
   :root { color-scheme: light dark; }
   * { box-sizing: border-box; }
   body { margin: 0; padding: 24px 16px; font-family: system-ui, -apple-system, "Segoe UI", Arial, sans-serif;
@@ -1488,15 +1607,56 @@ function eventLandingPage(event) {
   .row span:first-child { flex: 0 0 1.4rem; }
   .desc { margin-top: 16px; padding-top: 16px; border-top: 1px solid #eee7dd;
           white-space: pre-wrap; line-height: 1.55; color: #3b3733; }
+  .event { padding: 12px 0; border-top: 1px solid #eee7dd; }
+  .event:first-of-type { border-top: 0; }
+  .when { font-weight: 700; font-size: 1.05rem; }
+  .when a { color: inherit; }
+  .details { color: #6b6560; font-size: .95rem; margin-top: 3px; }
   img { width: 100%; border-radius: 12px; margin-top: 18px; display: block; }
   .foot { margin-top: 20px; font-size: .82rem; color: #8a837c; text-align: center; }
   @media (prefers-color-scheme: dark) {
     body { background: #17150f; color: #f2ede4; }
     .card { background: #221f18; box-shadow: none; }
     .desc { color: #ccc5b8; border-top-color: #332f26; }
-    .cat, .foot { color: #9a938a; }
+    .event { border-top-color: #332f26; }
+    .cat, .foot, .details { color: #9a938a; }
   }
-</style>
+</style>`;
+
+// Where a short link lands when the submitter gave a contact rather than a URL, which
+// is the common case. Self-contained: one file, no external assets, so it renders on a
+// phone with a bad connection and nothing to fetch.
+function eventLandingPage(event) {
+  const dates = event.date ? `${longDate(event.date)}${lastDay(event) !== event.date ? `–${longDate(lastDay(event))}` : ""}` : "";
+  const rows = [
+    ["📅", dates],
+    ["🕗", event.start_time ? `${event.start_time}${event.end_time ? `-${event.end_time}` : ""}` : ""],
+    ["📍", event.location],
+    [isFreeEntry(event) ? "🆓" : "🎫", isFreeEntry(event) ? "כניסה חופשית" : event.price],
+    ["👤", event.contact_person],
+    ["📞", destinationFor(event) ? "" : event.contact_link],
+  ]
+    .filter(([, value]) => value)
+    .map(([icon, value]) => `<div class="row"><span>${icon}</span><span>${escapeHtml(value)}</span></div>`)
+    .join("\n      ");
+
+  const flyer = event.flyer && flyerUrl(event.flyer)
+    ? `<img src="${escapeHtml(flyerUrl(event.flyer))}" alt="">`
+    : "";
+  const og = ogTags({
+    title: event.event_name,
+    description: [dates, event.start_time, event.location].filter(Boolean).join(" · "),
+    image: (event.flyer && flyerUrl(event.flyer)) || ogCardUrl(),
+  });
+
+  return `<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(event.event_name)} · FOMO חיפה</title>
+${og}
+${PAGE_STYLE}
 </head>
 <body>
   <div class="card">
@@ -1507,6 +1667,49 @@ function eventLandingPage(event) {
     ${event.description ? `<div class="desc">${escapeHtml(event.description)}</div>` : ""}
     ${flyer}
     <div class="foot">מה עושים היום בחיפה?</div>
+  </div>
+</body>
+</html>`;
+}
+
+// /today, the link at the top of the daily board: the board's events, each opening its
+// own /e/ page. Its og: tags are the branded preview WhatsApp shows above the board.
+function todayPage(events, date) {
+  const today = digestEvents(events, date);
+  const title = "מה עושים היום בחיפה?";
+  const items = today.map((event) => {
+    const name = escapeHtml(`${event.start_time} · ${event.event_name}`);
+    const link = shortLink(event);
+    const details = [event.location ? `📍 ${event.location}` : "", entranceLabel(event)].filter(Boolean).join(" · ");
+    return [
+      `<div class="event">`,
+      `      <div class="when">${/^https?:\/\//.test(link) ? `<a href="${escapeHtml(link)}">${name}</a>` : name}</div>`,
+      details ? `      <div class="details">${escapeHtml(details)}</div>` : "",
+      `    </div>`,
+    ].filter(Boolean).join("\n");
+  });
+  const count = today.length === 1 ? "אירוע אחד" : `${today.length} אירועים`;
+  const og = ogTags({
+    title,
+    description: today.length ? `${longDate(date)} · ${count}` : longDate(date),
+    image: ogCardUrl(),
+  });
+
+  return `<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)} · FOMO חיפה</title>
+${og}
+${PAGE_STYLE}
+</head>
+<body>
+  <div class="card">
+    <div class="brand">FOMO חיפה</div>
+    <h1>${escapeHtml(title)}</h1>
+    <div class="cat">${escapeHtml(longDate(date))}</div>
+    ${items.length ? items.join("\n    ") : `<div class="row">אין אירועים היום עדיין.</div>`}
   </div>
 </body>
 </html>`;
@@ -3142,21 +3345,23 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (req.method === "GET" && url.pathname === "/digest") {
-    const targetDate = url.searchParams.get("date") || todayIso();
-    const digest = makeDigest(loadEvents(EVENTS_FILE), targetDate);
-    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-    res.end(digest);
+  // The link at the top of the daily board. Not counted: clicks are counted per event,
+  // on /e/ and /m/, and this page links on to those.
+  if (req.method === "GET" && url.pathname === "/today") {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=300" });
+    res.end(todayPage(loadEvents(EVENTS_FILE), todayIso()));
     return;
   }
 
-  if (req.method === "GET" && url.pathname === "/weekly") {
-    // ?board= is gone with the two fixed boards, but old links still carry it; ignoring
-    // an unknown parameter beats a 400 for something that no longer means anything.
-    const fromDate = url.searchParams.get("date") || todayIso();
-    const post = makeWeekly(loadEvents(EVENTS_FILE), fromDate, { linkFor: shortLink });
-    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-    res.end(post);
+  // The preview card named by /today's og:image.
+  if (req.method === "GET" && url.pathname === "/og-card.png") {
+    if (!fs.existsSync(OG_CARD_FILE)) {
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("not found");
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "image/png", "Cache-Control": "public, max-age=86400" });
+    fs.createReadStream(OG_CARD_FILE).pipe(res);
     return;
   }
 
@@ -3282,6 +3487,13 @@ if (require.main === module) {
 module.exports = {
   routeMessage,
   buildSlotPosts,
+  adPost,
+  adsDue,
+  lateAds,
+  sendLateAds,
+  markAdSent,
+  todayPage,
+  eventLandingPage,
   balanceWarning,
   lowBalanceWarning,
   withBalanceWarning,
