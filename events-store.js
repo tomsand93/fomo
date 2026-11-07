@@ -16,11 +16,16 @@ const path = require("path");
 //   flyer_sent_at  - when this event's flyer post went to Stav. Set once, never
 //                    cleared: the same image post kept reaching her at approval, at
 //                    every slot and on each chosen day (16/10/2026)
+//   ad_date        - the day of the ad window the organiser booked, YYYY-MM-DD
+//   ad_window      - "morning", "evening", or "decline" (asked and said no, which is
+//                    not the same as empty = not asked yet)
+//   ad_sent_at     - when that ad was handed to Stav. Set once, never cleared
+//   confirm_asked_at - when the organiser was asked to confirm the booking
 const CSV_HEADERS = [
   "id", "status", "event_name", "date", "start_time", "end_time", "location",
   "category", "price", "organizer", "contact_link", "contact_person", "description",
   "source", "published_at", "notes", "submitter", "flyer", "slug", "daily_days",
-  "end_date", "flyer_sent_at",
+  "end_date", "flyer_sent_at", "ad_date", "ad_window", "ad_sent_at", "confirm_asked_at",
 ];
 
 function csv(value) {
@@ -225,6 +230,10 @@ function appendEvent(filePath, event, source, sender, missing) {
     daily_days: "",
     end_date: cleanEndDate(event.date, event.end_date),
     flyer_sent_at: "",
+    ad_date: "",
+    ad_window: "",
+    ad_sent_at: "",
+    confirm_asked_at: "",
   };
 
   events.push(row);
