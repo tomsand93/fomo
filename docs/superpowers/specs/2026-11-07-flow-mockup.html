@@ -1,0 +1,721 @@
+<title>FOMO לוח יומי ומודעות</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Secular+One&family=Assistant:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: a working spec sheet. A sticky band of controls, then sections; the flow is a row of chat screens that wraps. */
+:root {
+  --paper: #F2F4F0;
+  --card: #FFFFFF;
+  --ink: #18211C;
+  --muted: #5B6960;
+  --line: #D3DCD5;
+  --chat: #E3EAE2;
+  --bot: #FFFFFF;
+  --me: #D3EFD9;
+  --admin: #FFF1CC;
+  --accent: #D4512A;
+  --accent-ink: #FFFFFF;
+  --link: #1C6E8C;
+  --good: #2D7A4B;
+  --bad: #B23A2A;
+  --shadow: 0 1px 0 rgba(24,33,28,.06);
+  --f-display: "Secular One", "Assistant", system-ui, sans-serif;
+  --f-body: "Assistant", system-ui, -apple-system, "Segoe UI", Arial, sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #121815; --card: #19211D; --ink: #E7EEE9; --muted: #98A89E; --line: #2C3832;
+    --chat: #0F1512; --bot: #1F2A25; --me: #1E4630; --admin: #3D3418; --accent: #F07650; --accent-ink: #1A0E08;
+    --link: #6CC3E0; --good: #6FCB92; --bad: #F08A78; --shadow: none; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #121815; --card: #19211D; --ink: #E7EEE9; --muted: #98A89E; --line: #2C3832;
+  --chat: #0F1512; --bot: #1F2A25; --me: #1E4630; --admin: #3D3418; --accent: #F07650; --accent-ink: #1A0E08;
+  --link: #6CC3E0; --good: #6FCB92; --bad: #F08A78; --shadow: none; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { background: var(--paper); color: var(--ink); font-family: var(--f-body); font-size: 16px; line-height: 1.5; }
+.wrap { max-width: 1240px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 0 64px; }
+body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); z-index: 10; background: var(--paper); }
+h1, h2, h3 { font-family: var(--f-display); font-weight: 400; text-wrap: balance; margin: 0; line-height: 1.2; }
+h1 { font-size: clamp(1.8rem, 4vw, 2.6rem); }
+h2 { font-size: 1.5rem; }
+h3 { font-size: 1.1rem; }
+.en { font-family: var(--f-body); direction: ltr; text-align: left; color: var(--muted); font-size: .9rem; unicode-bidi: isolate; }
+html:not(.show-en) .en { display: none; }
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* top */
+.top { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 5; background: var(--paper); border-bottom: 1px solid var(--line); }
+.top .wrap { padding-block: 10px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.brand { font-family: var(--f-display); font-size: 1.15rem; }
+.brand span { color: var(--accent); }
+.spacer { flex: 1; }
+.toggle { display: inline-flex; gap: 8px; align-items: center; border: 1px solid var(--line); background: var(--card); border-radius: 999px; padding: 4px 12px; font-size: .9rem; }
+.status { font-size: .85rem; color: var(--muted); }
+.status.ok::before { content: "● "; color: var(--good); }
+.status.off::before { content: "● "; color: var(--bad); }
+
+header.hero { padding-block: 36px 12px; display: grid; gap: 10px; }
+header.hero p { margin: 0; max-width: 68ch; }
+.kicker { font-family: var(--f-mono); font-size: .8rem; letter-spacing: .06em; color: var(--accent); }
+
+section { padding-block: 32px 8px; display: grid; gap: 16px; }
+.sec-head { display: grid; gap: 4px; max-width: 72ch; }
+.sec-head p { margin: 0; }
+
+/* change summary */
+.changes { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.change { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: grid; gap: 6px; align-content: start; box-shadow: var(--shadow); min-width: 0; }
+.change b { font-weight: 700; }
+.tag { justify-self: start; font-family: var(--f-mono); font-size: .72rem; padding: 1px 8px; border-radius: 4px; background: var(--chat); color: var(--muted); }
+.tag.new { background: var(--accent); color: var(--accent-ink); }
+.tag.gone { background: transparent; border: 1px solid var(--bad); color: var(--bad); }
+
+/* flow screens */
+.screens { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 16px; align-items: start; }
+.screen { background: var(--card); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; min-width: 0; display: grid; }
+.screen-head { padding: 12px 14px 10px; display: grid; gap: 2px; border-bottom: 1px solid var(--line); }
+.screen-head .who { font-family: var(--f-mono); font-size: .75rem; color: var(--muted); }
+.chat { background: var(--chat); padding: 14px 10px; display: flex; flex-direction: column; gap: 8px; min-height: 120px; }
+.ctx { align-self: center; font-size: .78rem; color: var(--muted); background: var(--card); border-radius: 6px; padding: 2px 10px; text-align: center; }
+.msg { max-width: 92%; display: grid; gap: 3px; }
+.msg.bot { align-self: flex-start; }
+.msg.me { align-self: flex-end; }
+.bubble { background: var(--bot); border-radius: 10px; padding: 8px 10px; font-size: .95rem; line-height: 1.45; box-shadow: var(--shadow); overflow-wrap: anywhere; position: relative; }
+.msg.me .bubble { background: var(--me); }
+.msg.admin .bubble { background: var(--admin); }
+.bubble .lk { color: var(--link); direction: ltr; unicode-bidi: isolate; }
+.bubble.edited { outline: 2px dashed var(--accent); outline-offset: -2px; }
+.flyer { display: block; width: 100%; border-radius: 6px; margin-bottom: 6px; }
+.pv { border-radius: 6px; overflow: hidden; margin-bottom: 6px; background: var(--chat); display: grid; }
+.pv .pv-img { height: 92px; }
+.pv .pv-txt { padding: 6px 8px; font-size: .8rem; display: grid; gap: 1px; }
+.pv .pv-txt b { font-size: .85rem; }
+.pv.maps .pv-img { background:
+  linear-gradient(90deg, transparent 47%, #f6d27a 47% 53%, transparent 53%),
+  linear-gradient(0deg, transparent 30%, #fff 30% 36%, transparent 36%),
+  linear-gradient(20deg, transparent 60%, #fff 60% 65%, transparent 65%),
+  #cfe3c8; }
+.pv.fomo .pv-img { background: var(--accent); display: grid; place-items: center; color: var(--accent-ink); font-family: var(--f-display); font-size: 1.4rem; }
+.msg-tools { display: flex; gap: 8px; align-items: center; font-size: .78rem; color: var(--muted); flex-wrap: wrap; }
+.msg.me .msg-tools { justify-content: flex-end; }
+.linkbtn { background: none; border: 0; padding: 0; color: var(--link); font-size: .78rem; text-decoration: underline; text-underline-offset: 2px; }
+.editor { display: grid; gap: 6px; }
+.editor textarea { width: 100%; min-height: 140px; border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: var(--card); resize: vertical; line-height: 1.45; }
+.editor .row { display: flex; gap: 8px; flex-wrap: wrap; }
+.btn { border: 1px solid var(--line); background: var(--card); border-radius: 8px; padding: 4px 12px; font-size: .88rem; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+.gloss { font-size: .8rem; line-height: 1.35; }
+.note { padding: 10px 14px; font-size: .9rem; border-top: 1px solid var(--line); display: grid; gap: 4px; }
+.note b { color: var(--accent); }
+.fixed { color: var(--good); font-weight: 700; }
+
+/* simulator */
+.sim { display: grid; grid-template-columns: minmax(0, 340px) minmax(0, 1fr); gap: 16px; align-items: start; }
+@media (max-width: 760px) { .sim { grid-template-columns: minmax(0, 1fr); } }
+.panel { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; display: grid; gap: 12px; min-width: 0; }
+.field { display: grid; gap: 4px; }
+.field label { font-weight: 600; font-size: .92rem; }
+.field input, .field select { border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; background: var(--paper); width: 100%; font-family: var(--f-mono); font-size: .9rem; }
+.presets { display: flex; flex-wrap: wrap; gap: 6px; }
+.presets .btn { font-size: .82rem; }
+.timeline { display: grid; gap: 6px; }
+.slot { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--paper); font-size: .9rem; }
+.slot .t { font-family: var(--f-mono); font-size: .82rem; font-variant-numeric: tabular-nums; }
+.slot.pick { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.slot.no { opacity: .55; text-decoration: line-through; }
+.pill { font-family: var(--f-mono); font-size: .72rem; padding: 1px 8px; border-radius: 999px; white-space: nowrap; }
+.pill.ok { background: var(--good); color: var(--card); }
+.pill.x { background: transparent; border: 1px solid var(--bad); color: var(--bad); }
+.pill.a { background: var(--accent); color: var(--accent-ink); }
+.outchat { background: var(--chat); border-radius: 10px; padding: 12px 10px; display: flex; flex-direction: column; gap: 8px; }
+
+/* before / after */
+.ba { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; align-items: start; }
+.ba .label { font-family: var(--f-mono); font-size: .78rem; }
+.ba ol, .ba ul { margin: 0; padding-inline-start: 20px; display: grid; gap: 6px; }
+
+/* questions */
+.qs { display: grid; gap: 12px; }
+.q { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; display: grid; gap: 8px; }
+.q .prop { font-size: .92rem; color: var(--muted); }
+.q textarea { width: 100%; min-height: 64px; border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: var(--paper); resize: vertical; }
+.q .meta { font-size: .8rem; color: var(--muted); }
+.q .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+
+.gone-list { margin: 0; padding-inline-start: 20px; display: grid; gap: 4px; }
+code { font-family: var(--f-mono); font-size: .85em; background: var(--chat); padding: 0 4px; border-radius: 4px; direction: ltr; unicode-bidi: isolate; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div dir="rtl" lang="he">
+<div class="top">
+  <div class="wrap">
+    <div class="brand">FOMO <span>חיפה</span></div>
+    <div class="spacer"></div>
+    <span id="status" class="status">טוען…</span>
+    <label class="toggle" for="toggle-en"><input type="checkbox" id="toggle-en" checked> English notes</label>
+  </div>
+</div>
+
+<div class="wrap">
+<header class="hero">
+  <div class="kicker">טיוטה לבדיקה · 5.11.2026</div>
+  <h1>שני פורמטים בלבד: לוח יומי ומודעה גרפית</h1>
+  <p>ככה הבוט ידבר עם מפרסמים ועם סתיו אחרי השינוי. כל הודעה כאן ניתנת לעריכה: לחצו <b>✎ ערוך</b>, שנו את הנוסח ושמרו, והשינוי נשמר לכל מי שפותח את הדף. בתחתית יש שאלות פתוחות, ואפשר לענות עליהן ישירות כאן.</p>
+  <p class="en">How the bot will talk to submitters and to Stav after the change. Every message is editable (✎), and edits are saved for everyone who opens the page. Open questions at the bottom can be answered in place.</p>
+</header>
+
+<section id="changes">
+  <div class="sec-head"><h2>מה משתנה</h2><p class="en">What changes</p></div>
+  <div class="changes">
+    <div class="change"><span class="tag gone">מבוטל</span><b>הלוח השבועי</b><span>לא נשלח יותר לסתיו ולא מוזכר בשום הודעה. גם הקטע "אירועים בימים הבאים" יורד, ובמקומו באות מודעות.</span><span class="en">The weekly board is gone: not sent to Stav, never mentioned in copy. The "upcoming events" section goes too; ads replace it.</span></div>
+    <div class="change"><span class="tag">תמיד</span><b>לוח יומי, מודעה מקוצרת</b><span>כל אירוע מאושר נכנס אוטומטית ללוח של יום האירוע, בשורה מקוצרת. הלוח מפרט רק את האירועים של אותו יום.</span><span class="en">Daily board, short listing: every approved event goes in automatically, on its own day only.</span></div>
+    <div class="change"><span class="tag new">חדש</span><b>מודעה גרפית מורחבת, כולל פלייר</b><span>אופציונלית. המפרסם בוחר יום וחלון: בוקר (10:00–13:00) או ערב (18:00–21:00). הבוט מעביר אותה לסתיו בחלון שנבחר.</span><span class="en">Graphic ad with flyer, optional. Submitter picks a day and a window (morning 10–13 or evening 18–21); the bot hands it to Stav in that window.</span></div>
+    <div class="change"><span class="tag new">חדש</span><b>עריכה לפני אישור</b><span>המפרסם רואה את שתי הגרסאות מיד, ויכול לתקן עד שסתיו מאשרת. גם סתיו יכולה לערוך את המודעה לפני האישור.</span><span class="en">Submitter sees both versions right away and can fix things until Stav approves; Stav can edit too.</span></div>
+    <div class="change"><span class="tag new">חדש</span><b>שאלת המודעה רק אחרי אישור</b><span>בהודעה נפרדת, עם הזמן המדויק שבו המודעה תצא, כדי שהמפרסם ידע מתי היא תפורסם.</span><span class="en">The ad question only comes after approval, as a separate message, and names the exact time the ad will go out.</span></div>
+    <div class="change"><span class="tag">תיקון באג</span><b>תיקון באמצע שאלה לא נבלע</b><span>היום, מפרסם שכותב "תתקנו…" בזמן שהבוט מחכה לתשובה מקבל שוב את אותה רשימה. בגרסה החדשה התיקון נקלט.</span><span class="en">Bug fix: a correction typed while the bot awaits an answer is applied, not answered with the same list again.</span></div>
+  </div>
+</section>
+
+<section id="flow">
+  <div class="sec-head"><h2>הזרימה, הודעה אחרי הודעה</h2><p>הדוגמה: ערב יין בשבת 7.11 ב-20:00, נשלח ביום חמישי. ההודעות בצבע צהוב הן הצ'אט של סתיו עם הבוט.</p><p class="en">The flow, message by message. Example: a wine evening on Sat 7.11 at 20:00, submitted on Thursday. Yellow bubbles are Stav's own chat with the bot.</p></div>
+  <div class="screens" id="screens"></div>
+</section>
+
+<section id="simulator">
+  <div class="sec-head"><h2>מתי המודעה תצא? סימולטור</h2><p>הזינו מתי סתיו אישרה ומתי האירוע מתחיל, ותראו מה המפרסם יקבל. אפשר לנסות גם את מקרה הקצה של 21:01.</p><p class="en">When does the ad go out? Set when Stav approved and when the event starts, and see what the submitter is told, including the 21:01 edge case.</p></div>
+  <div class="sim">
+    <div class="panel">
+      <div class="presets" id="presets"></div>
+      <div class="field"><label for="sim-approved">סתיו אישרה ב־</label><input type="datetime-local" id="sim-approved" value="2026-11-05T14:30"></div>
+      <div class="field"><label for="sim-date">תאריך האירוע</label><input type="date" id="sim-date" value="2026-11-07"></div>
+      <div class="field"><label for="sim-start">שעת התחלה</label><input type="time" id="sim-start" value="20:00"></div>
+      <div class="field"><label for="sim-margin">מינימום זמן בין תחילת החלון לתחילת האירוע (דקות)</label><input type="number" id="sim-margin" value="60" min="0" step="15"><span class="en">Proposal: an ad window counts only if it opens at least this long before the event starts.</span></div>
+      <div class="field"><label for="sim-choice">המפרסם בחר</label><select id="sim-choice"></select></div>
+    </div>
+    <div class="panel">
+      <h3>חלונות</h3>
+      <div class="timeline" id="sim-windows"></div>
+      <h3>מה המפרסם מקבל</h3>
+      <div class="outchat" id="sim-chat"></div>
+    </div>
+  </div>
+</section>
+
+<section id="layout">
+  <div class="sec-head"><h2>הלוח היומי: עיצוב חדש</h2><p>היום וואטסאפ מציג תצוגה מקדימה של הקישור הראשון בהודעה. הקישור הראשון הוא של המפה, ולכן מופיעה תמונה של גוגל מפות מעל הלוח.</p><p class="en">WhatsApp previews the first link in a message. Today that is the map link, so a Google Maps tile sits on top of the board.</p></div>
+  <div class="ba">
+    <div class="screen"><div class="screen-head"><span class="label">לפני</span><span class="en">Before: long form, map link first → map preview</span></div><div class="chat" id="ba-before"></div></div>
+    <div class="screen"><div class="screen-head"><span class="label">אחרי</span><span class="en">After: short form, bold, FOMO card as preview</span></div><div class="chat" id="ba-after"></div></div>
+    <div class="panel">
+      <h3>מה משתנה בלוח</h3>
+      <ol>
+        <li><b>קישור FOMO בראש ההודעה</b>, לעמוד "מה עושים היום" עם כרטיס ממותג. וואטסאפ יציג את הכרטיס הזה במקום את המפה.<div class="en">A FOMO "today" link first, with a branded preview card; WhatsApp shows that instead of the map.</div></li>
+        <li><b>בלי קישור מפה בלוח.</b> המפה נמצאת בעמוד של האירוע, מאחורי הקישור 🔗.<div class="en">No map link on the board; the event page behind 🔗 has it.</div></li>
+        <li><b>הדגשה:</b> הכותרת, התאריך, והשעה והשם של כל אירוע מודגשים, כך שקל לסרוק את הרשימה.<div class="en">Bold title, date, and each event's time and name, so the list scans quickly.</div></li>
+        <li><b>שורה וחצי לאירוע</b> במקום 5–7 שורות. הפירוט המלא נשאר למודעה הגרפית.<div class="en">About 1.5 lines per event instead of 5–7; the full pitch belongs to the ad.</div></li>
+      </ol>
+    </div>
+  </div>
+</section>
+
+<section id="questions">
+  <div class="sec-head"><h2>שאלות פתוחות לסתיו</h2><p>אלה החלטות שעדיין פתוחות. ליד כל שאלה מופיעה ההצעה שלנו. אפשר לכתוב תשובה, והיא נשמרת.</p><p class="en">Decisions still open, each with our proposal. Answers typed here are saved for Tom and Claude to read.</p></div>
+  <div class="qs" id="qs"></div>
+</section>
+
+<section id="removed">
+  <div class="sec-head"><h2>מה יוצא מהקוד</h2><p class="en">What comes out of the code (for Tom)</p></div>
+  <div class="panel">
+    <ul class="gone-list" dir="ltr" style="text-align:left">
+      <li>Slot handoff: the board post (<code>makeWeekly</code>, label "הלוח") and the "promoted" section are removed from <code>buildSlotPosts</code>; ads scheduled for a window take their place.</li>
+      <li><code>make-weekly.js</code>, <code>send-weekly.js</code> and the <code>/weekly</code> route go; the formatters drop "weekly board" comments.</li>
+      <li>Copy: <code>publishChoicePrompt</code>, <code>NO_DAILY_TEXT</code>, the "לא, רק בלוח השבועי" option and the review notice's "בלוח השבועי" label are rewritten.</li>
+      <li><code>daily_days</code> (pick-a-day for the daily message) is replaced by an ad booking: date + window (<code>morning</code>/<code>evening</code>).</li>
+      <li>The publish-day question moves out of the submission receipt; it is asked only in <code>notifyApproved</code>, as a separate message.</li>
+      <li>Template <code>fomo_publish_day_v2</code> names the old options; it needs new wording and Meta approval before the buttons version can go out.</li>
+      <li>The weekly <em>publisher nudge</em> (Wednesday 18:00) is a reminder to submitters, not the board, and stays.</li>
+    </ul>
+  </div>
+</section>
+</div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---------- helpers ----------
+  const DAYS = ["ראשון", "שני", "שלישי", "רביעי", "חמישי", "שישי", "שבת"];
+  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  // WhatsApp markup: *bold*, _italic_, links.
+  function wa(text) {
+    let h = esc(text);
+    h = h.replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1<b>$2</b>");
+    h = h.replace(/(^|[\s(])_([^_\n]+)_/g, "$1<i>$2</i>");
+    h = h.replace(/((?:https?:\/\/)?[a-z0-9-]+\.fly\.dev\/[^\s<]*)/gi, '<span class="lk">$1</span>');
+    return h.replace(/\n/g, "<br>");
+  }
+  const URL = "fomo-qe2gha.fly.dev";
+
+  // ---------- flyer art (inline, no network) ----------
+  function flyerSvg() {
+    return `<svg class="flyer" viewBox="0 0 320 180" role="img" aria-label="פלייר לדוגמה">
+      <rect width="320" height="180" fill="#3B1424"/>
+      <circle cx="250" cy="40" r="70" fill="#6B2140"/>
+      <path d="M228 60 h44 c0 30 -10 44 -22 46 v34 h14 v6 h-34 v-6 h14 v-34 c-12 -2 -16 -16 -16 -46z" fill="#F4D9A8"/>
+      <path d="M231 70 h38 c-2 18 -8 28 -19 30 c-11 -2 -17 -12 -19 -30z" fill="#9E1F45"/>
+      <text x="110" y="78" text-anchor="middle" font-family="Secular One, Assistant, sans-serif" font-size="34" fill="#F4D9A8">ערב יין</text>
+      <text x="110" y="106" text-anchor="middle" font-family="Assistant, sans-serif" font-size="16" fill="#F4D9A8">בחצר של לוי</text>
+      <text x="110" y="138" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="13" fill="#E9A8B8">7.11 · 20:00</text>
+    </svg>`;
+  }
+
+  // ---------- message copy ----------
+  const SHORT = `🍷 *20:00 · ערב יין בחצר של לוי*\n📍 לוי'ס בקיארד, שמריהו לוין 10 · 🎫 60 ₪\n🔗 ${URL}/e/levi-wine`;
+  const SHORT50 = SHORT.replace("60 ₪", "50 ₪");
+  const LONG = (when, price = "60 ₪", desc = "טעימות של 5 יינות מיקבי הכרמל, גבינות מקומיות ומוזיקה חיה בחצר.") =>
+    `🍷 *ערב יין בחצר של לוי* · אוכל ויין\n📅 ${when} · 🕗 20:00 · 🎫 ${price}\n📍 לוי'ס בקיארד, שמריהו לוין 10, חיפה\n${desc}\n🔗 ${URL}/e/levi-wine`;
+
+  const M = {
+    c_in: { who: "me", img: true, text: "ערב יין בחצר של לוי, שבת 7.11 ב-20:00, לוי'ס בקיארד שמריהו לוין 10 חיפה. 60 ש״ח, טעימות של 5 יינות מהכרמל + גבינות ומוזיקה חיה", en: "Submitter sends the flyer and details in free text." },
+    r1: { who: "bot", text: "קיבלנו את האירוע! 🎉 הוא עובר עכשיו לבדיקה של סתיו.\n\nככה הוא ייראה בקבוצה, בשתי גרסאות 👇", en: "Got your event! It's going to Stav for review. Here's how it'll look in the group, in two versions 👇" },
+    r2: { who: "bot", text: `*לוח יומי · מודעה מקוצרת*\n_נכנס אוטומטית ללוח של יום האירוע_\n\n${SHORT}`, en: "Daily board, short listing. Goes into the board on the event's day automatically." },
+    r3: { who: "bot", img: true, text: `*מודעה גרפית מורחבת · כולל פלייר*\n_אופציונלי. אחרי האישור נשאל אם ומתי לפרסם_\n\n${LONG("*שבת 7.11*")}`, en: "Expanded graphic ad, with flyer. Optional: after approval we'll ask whether and when to post it." },
+    r4: { who: "bot", text: "משהו לא נכון? כתבו לנו כאן מה לשנות. אפשר לתקן עד שסתיו מאשרת ✏️", en: "Something wrong? Write here what to change; you can fix it until Stav approves." },
+
+    f_u: { who: "me", text: "רגע, המחיר הוא 50 ולא 60", en: "Wait, the price is 50, not 60." },
+    f_b: { who: "bot", text: `עדכנו ✏️\n🎫 מחיר: 50 ₪\n\n${SHORT50}\n\nסתיו תקבל את הגרסה המעודכנת.`, en: "Updated. Price ₪50 [refreshed short preview]. Stav gets the updated version. (Today the bot only forwards the text to Stav and edits nothing.)" },
+
+    s1: { who: "bot admin", img: true, text: `אירוע חדש לבדיקה #42\nנשלח מ: 054-•••-••12\n\n— לוח יומי (מקוצר) —\n${SHORT50}\n\n— מודעה גרפית (מורחבת, עם הפלייר) —\n${LONG("*שבת 7.11*", "50 ₪")}\n\nלאישור: אשר 42\nלדחייה: דחה 42 [סיבה]\nלעריכה: תקן 42 שדה: ערך`, en: "Stav's review notice: both versions, labelled with the new names, plus approve / reject / edit commands." },
+    s2: { who: "me admin", text: "תקן 42 תיאור: 5 יינות מיקבי הכרמל, גבינות של המחלבה ומוזיקה חיה 🎶", en: "Stav edits the description (existing \"תקן\" command, extended to show the result)." },
+    s3: { who: "bot admin", text: `עודכן ✏️ #42. ככה המודעה נראית עכשיו:\n\n${LONG("*שבת 7.11*", "50 ₪", "5 יינות מיקבי הכרמל, גבינות של המחלבה ומוזיקה חיה 🎶")}\n\nלאישור: אשר 42`, en: "Updated; here's the ad now. Reply אשר 42 to approve." },
+    s4: { who: "me admin", text: "אשר 42", en: "Approve 42." },
+    s5: { who: "bot admin", text: "אושר ✅ #42 ייכנס ללוח היומי של שבת 7.11. שלחנו למפרסם את השאלה על מודעה.", en: "Approved. #42 goes into Saturday's daily board; the submitter has been asked about an ad." },
+
+    a1: { who: "bot", text: "האירוע שלכם \"ערב יין בחצר של לוי\" אושר 🎉\n📋 הוא ייכנס ללוח היומי של *שבת 7.11*, שיוצא לקבוצה ב-12:00.", en: "Your event was approved. It'll be on the daily board of Sat 7.11, posted to the group at 12:00." },
+    a2: { who: "bot", text: "רוצים שנפרסם גם *מודעה גרפית מורחבת* עם הפלייר?\n\n1. כן, בהקדם האפשרי: *היום בערב* (18:00–21:00)\n2. כן, אבחר יום וחלון\n3. לא, רק בלוח היומי", en: "Separate follow-up message: want a graphic ad too? 1. Yes, ASAP (names the actual time: tonight 18–21) 2. Yes, I'll pick a day and window 3. No, daily board only." },
+    a3u: { who: "me", text: "2", en: "" },
+    a3: { who: "bot", text: "מתי לפרסם את המודעה?\n\n1. היום (חמישי 5.11) · ערב 18:00–21:00\n2. מחר (שישי 6.11) · בוקר 10:00–13:00\n3. מחר (שישי 6.11) · ערב 18:00–21:00\n4. שבת 7.11 · בוקר 10:00–13:00\n5. שבת 7.11 · ערב 18:00–21:00", en: "When should the ad go out? Only windows before the event are listed, so no date typing is needed." },
+    a4u: { who: "me", text: "3", en: "" },
+    a4: { who: "bot", text: "סגור ✅\nהמודעה תתפרסם בקבוצה *מחר בערב*: שישי 6.11, בין 18:00 ל-21:00.", en: "Done. The ad will be posted tomorrow evening, Fri 6.11, between 18:00 and 21:00." },
+
+    b_u: { who: "me", text: "אפשר לשנות את השעה ל-20:30?", en: "Can you change the time to 20:30? (typed while the bot is waiting for 1/2/3)" },
+    b_b: { who: "bot", text: "עדכנו ✏️ 🕗 שעה: 20:30. האירוע כבר אושר, אז סתיו תאשר את השינוי.\n\nובינתיים: רוצים גם מודעה גרפית? ענו 1, 2 או 3.", en: "Updated time to 20:30. It was already approved, so Stav confirms the change. Meanwhile, still want an ad? Answer 1, 2 or 3." },
+
+    e1: { who: "bot", text: "האירוע שלכם \"מסיבת גג\" אושר 🎉", en: "Your event \"Rooftop party\" was approved." },
+    e2: { who: "bot", text: "האירוע מתחיל *הערב ב-22:00*, והחלון הבא למודעות הוא רק מחר ב-10:00, אז הפעם לא נוכל לפרסם עליו מודעה 🙏\nהלוח היומי של היום כבר יצא ב-18:00, אבל מי ששואל את הבוט מה יש הערב ימצא אותו.\n\nבפעם הבאה שלחו לפחות יום מראש, ונוכל לפרסם גם מודעה.", en: "Edge case (approved 21:01, event 22:00 today): no ASAP option is offered at all. The next window is tomorrow morning, after the event. Today's board already went out, but the inquiry bot will still surface it. Send a day ahead next time." },
+
+    h1: { who: "bot admin", text: "📬 להעביר לקבוצה ב-18:00, 2 הודעות לפי הסדר:\n\n1. \"מה עושים היום בחיפה?\" (הלוח היומי)\n2. מודעה: ערב יין בחצר של לוי (שבת 7.11)\n\nכל ההודעות שמתחת לזו להעביר כמו שהן.", en: "Stav's 17:50 handoff on Fri 6.11: the daily board, then the ad booked for this evening window." },
+    h2: { who: "bot admin", preview: "fomo", text: `*מה עושים היום בחיפה?* 🎈\n*יום שישי 6.11*\n${URL}/today\n\n🎸 *19:00 · ג'אם פתוח בבר בזל*\n📍 בר בזל, מסדה 12 · 🆓\n🔗 ${URL}/e/jam-basel\n\n🎬 *20:30 · קולנוע על הגג*\n📍 גג המוזיאון, שד' הציונות 2 · 🎫 35 ₪\n🔗 ${URL}/e/roof-cinema`, en: "The new daily board: today's events only, short form, bold, FOMO preview card on top." },
+    h3: { who: "bot admin", img: true, text: LONG("*מחר!* שבת 7.11", "50 ₪", "5 יינות מיקבי הכרמל, גבינות של המחלבה ומוזיקה חיה 🎶"), en: "The ad as posted on Friday: the date reads TOMORROW! in bold, not just the weekday." },
+
+    old: { who: "bot admin", preview: "maps", text: `מה עושים היום בחיפה? 🎈\n\n📅 יום שישי 6.11\n\n🎸 ג'אם פתוח בבר בזל · מוזיקה חיה\n🕗 19:00 · 🆓 כניסה חופשית\n📍 בר בזל, מסדה 12\n🗺 ${URL}/m/jam-basel\nג'אם פתוח לכל מי שמנגן, מגברים ותופים במקום.\n🔗 ${URL}/e/jam-basel\n\n🎬 קולנוע על הגג · קולנוע\n🕗 20:30 · 🎫 35 ₪\n📍 גג המוזיאון, שד' הציונות 2\n🗺 ${URL}/m/roof-cinema\n…`, en: "Today: long form for every event, and the first link is the map, so WhatsApp shows a map tile." },
+  };
+
+  const SCREENS = [
+    { title: "1. המפרסם שולח, והבוט מראה את שתי הגרסאות", who: "הצ'אט של המפרסם", en: "Submitter sends; the bot shows both versions. No ad question here any more.",
+      items: ["c_in", "r1", "r2", "r3", "r4"],
+      note: ["<b>שינוי:</b> השאלה \"באיזה יום לפרסם\" יורדת מכאן ועוברת לאחרי האישור.", "The publish-day question moves out of the receipt, to after approval."] },
+    { title: "2. המפרסם מתקן לפני האישור", who: "הצ'אט של המפרסם", en: "Submitter corrects before approval; the bot applies it and refreshes the preview.",
+      items: ["f_u", "f_b"],
+      note: ["<b>שינוי:</b> התיקון מעדכן את האירוע עצמו, ולא רק מועבר לסתיו כטקסט.", "The fix updates the event itself instead of being forwarded as loose text."] },
+    { title: "3. סתיו בודקת, עורכת ומאשרת", who: "הצ'אט של סתיו", en: "Stav reviews both versions, edits, approves.",
+      items: ["s1", "s2", "s3", "s4", "s5"],
+      note: ["<b>שינוי:</b> אחרי כל עריכה סתיו רואה את המודעה המעודכנת לפני שהיא מאשרת.", "After each edit Stav sees the updated ad before approving."] },
+    { title: "4. אחרי האישור: שאלת המודעה, בהודעה נפרדת", who: "הצ'אט של המפרסם", en: "After approval: the ad question as its own message, with the real time.",
+      items: [{ ctx: "חמישי 5.11 · 14:30" }, "a1", "a2", "a3u", "a3", "a4u", "a4"],
+      note: ["<b>חשוב:</b> כל אפשרות כוללת את הזמן המדויק, כך שהמפרסם יודע מתי המודעה תצא.", "Every option names the actual time, so the submitter knows when it'll be posted."] },
+    { title: "5. תיקון באמצע השאלה", who: "הצ'אט של המפרסם", en: "A correction typed while the bot waits for 1/2/3.",
+      items: [{ ctx: "הבוט מחכה לתשובה 1/2/3" }, "b_u", "b_b"],
+      note: ["<span class=\"fixed\">תיקון באג:</span> היום הבוט מתעלם ושולח שוב את הרשימה. בגרסה החדשה הוא קולט את התיקון ואחר כך חוזר לשאלה.", "Bug: today the bot ignores this and re-sends the list. New: apply the fix, then repeat the question."] },
+    { title: "6. מקרה קצה: אושר ב-21:01, האירוע הערב", who: "הצ'אט של המפרסם", en: "Edge case: approved at 21:01, event tonight at 22:00.",
+      items: [{ ctx: "חמישי 5.11 · 21:01" }, "e1", "e2"],
+      note: ["<b>כלל:</b> אם אין חלון לפני תחילת האירוע, הבוט לא מציע מודעה בכלל ומסביר למה.", "Rule: if no window opens before the event starts, no ad is offered, and the bot says why."] },
+    { title: "7. מה סתיו מקבלת ב-17:50", who: "הצ'אט של סתיו", en: "What Stav gets at 17:50 on Friday.",
+      items: [{ ctx: "שישי 6.11 · 17:50" }, "h1", "h2", "h3"],
+      note: ["<b>שינוי:</b> אין לוח שבועי. נשארים הלוח היומי והמודעות שהוזמנו לחלון הזה. בבוקר המסירה היא ב-09:50.", "No weekly board: just the daily board plus ads booked for this window. Morning handoff at 09:50."] },
+  ];
+
+  // ---------- shared state ----------
+  const overrides = new Map(); // msgId -> {text, by, at}
+  const answers = new Map();   // qid -> {text, by, at}
+  let names = {};
+  let db = null, user = null, myId = null, canWrite = null;
+  let editing = null; // msgId being edited
+
+  function textOf(id) { const o = overrides.get(id); return o ? o.text : M[id].text; }
+
+  function whoName(id) { return (names[id] && names[id].name) || "מישהו"; }
+  function fmtAt(ms) { try { return new Date(ms).toLocaleString("he-IL", { day: "numeric", month: "numeric", hour: "2-digit", minute: "2-digit" }); } catch (e) { return ""; } }
+
+  function bubbleNode(id, { editable = true } = {}) {
+    const m = M[id];
+    const wrap = document.createElement("div");
+    wrap.className = "msg " + m.who;
+    const o = overrides.get(id);
+    if (editing === id) {
+      const ed = document.createElement("div");
+      ed.className = "editor";
+      const ta = document.createElement("textarea");
+      ta.id = "edit-" + id; ta.dir = "rtl"; ta.value = textOf(id);
+      const row = document.createElement("div"); row.className = "row";
+      const save = document.createElement("button"); save.className = "btn primary"; save.textContent = "שמור";
+      const cancel = document.createElement("button"); cancel.className = "btn"; cancel.textContent = "ביטול";
+      save.onclick = () => saveOverride(id, ta.value);
+      cancel.onclick = () => { editing = null; renderAll(); };
+      row.append(save, cancel);
+      if (o) { const reset = document.createElement("button"); reset.className = "btn"; reset.textContent = "חזרה לנוסח המקורי"; reset.onclick = () => resetOverride(id); row.append(reset); }
+      const hint = document.createElement("div"); hint.className = "msg-tools"; hint.textContent = "*כוכביות* = מודגש · _קו תחתון_ = נטוי";
+      ed.append(ta, row, hint);
+      wrap.append(ed);
+      setTimeout(() => ta.focus(), 0);
+      return wrap;
+    }
+    const b = document.createElement("div");
+    b.className = "bubble" + (o ? " edited" : "");
+    let html = "";
+    if (m.preview === "maps") html += `<div class="pv maps"><div class="pv-img"></div><div class="pv-txt"><b>Google Maps</b><span>בר בזל, מסדה 12, חיפה</span></div></div>`;
+    if (m.preview === "fomo") html += `<div class="pv fomo"><div class="pv-img">FOMO חיפה</div><div class="pv-txt"><b>מה עושים היום בחיפה? · שישי 6.11</b><span>2 אירועים היום</span></div></div>`;
+    if (m.img) html += flyerSvg();
+    html += wa(textOf(id));
+    b.innerHTML = html;
+    wrap.append(b);
+    const tools = document.createElement("div"); tools.className = "msg-tools";
+    if (editable) {
+      const eb = document.createElement("button"); eb.className = "linkbtn"; eb.textContent = "✎ ערוך";
+      eb.setAttribute("aria-label", "ערוך את ההודעה");
+      eb.onclick = () => { editing = id; renderAll(); };
+      tools.append(eb);
+    }
+    if (o) { const s = document.createElement("span"); s.textContent = `נערך ע״י ${whoName(o.by)}${o.at ? " · " + fmtAt(o.at) : ""}`; tools.append(s); }
+    wrap.append(tools);
+    if (m.en) {
+      const g = document.createElement("div"); g.className = "en gloss";
+      g.textContent = m.en + (o ? " (note describes the original wording)" : "");
+      wrap.append(g);
+    }
+    return wrap;
+  }
+
+  function renderScreens() {
+    const host = document.getElementById("screens");
+    host.innerHTML = "";
+    for (const s of SCREENS) {
+      const card = document.createElement("article"); card.className = "screen";
+      card.innerHTML = `<div class="screen-head"><h3>${esc(s.title)}</h3><span class="who">${esc(s.who)}</span><span class="en">${esc(s.en)}</span></div>`;
+      const chat = document.createElement("div"); chat.className = "chat";
+      for (const it of s.items) {
+        if (typeof it === "object") { const c = document.createElement("div"); c.className = "ctx"; c.textContent = it.ctx; chat.append(c); }
+        else chat.append(bubbleNode(it));
+      }
+      card.append(chat);
+      const note = document.createElement("div"); note.className = "note";
+      note.innerHTML = `<div>${s.note[0]}</div><div class="en">${esc(s.note[1])}</div>`;
+      card.append(note);
+      host.append(card);
+    }
+  }
+
+  function renderBA() {
+    const before = document.getElementById("ba-before"); before.innerHTML = ""; before.append(bubbleNode("old"));
+    const after = document.getElementById("ba-after"); after.innerHTML = ""; after.append(bubbleNode("h2"));
+  }
+
+  // ---------- questions ----------
+  const QS = [
+    { id: "q-margin", q: "האם מודעה לערב יכולה לצאת לאירוע שמתחיל ב-19:00, כשהחלון נפתח ב-18:00?", p: "הצעה: חלון נחשב רק אם הוא נפתח לפחות שעה לפני תחילת האירוע. בסימולטור אפשר לשנות את המספר.", en: "Can an evening ad go out for a 19:00 event? Proposal: a window counts only if it opens ≥1h before the start." },
+    { id: "q-relative", q: "\"היום!\", \"מחר!\", \"הערב!\" במודגש: רק כשבוחרים \"בהקדם האפשרי\", או בכל מודעה שיוצאת יום לפני האירוע או ביום האירוע?", p: "הצעה: בכל מודעה כזו. מודעה שיוצאת ביום שישי לאירוע בשבת תציג \"מחר!\" בלי קשר לאיך נבחר הזמן.", en: "Relative bold date: only for ASAP, or for any ad posted the day before or on the day? Proposal: any." },
+    { id: "q-after-approval", q: "מפרסם שמתקן אחרי שהאירוע כבר אושר: לעדכן ולשלוח לך לאישור מחדש, או לעדכן ישר?", p: "הצעה: לעדכן את האירוע ולשלוח לך את הגרסה החדשה עם \"אשר\". עד שתאשרי, יוצאת הגרסה הקודמת.", en: "Corrections after approval: re-approve or apply directly? Proposal: Stav re-approves; the old version is used until then." },
+    { id: "q-edit", q: "איך הכי נוח לך לערוך מודעה: הפקודה \"תקן 42 שדה: ערך\", או להשיב להודעת הבדיקה עם כל הטקסט המתוקן?", p: "הצעה: שתי האפשרויות. תשובה עם טקסט מלא מחליפה את נוסח המודעה כמו שהוא, ו\"תקן\" משנה שדה אחד.", en: "How should Stav edit: the field command, or reply to the notice with the full corrected text? Proposal: both." },
+    { id: "q-price", q: "האם המודעה הגרפית בתשלום והלוח היומי בחינם? אם כן, מתי מבקשים תשלום?", p: "המחירון עדיין לא נקבע. ההצעה כאן לא משנה תשלומים, רק את הנוסח.", en: "Is the ad paid and the board free? If so, when do we ask for payment? (Price list still TBD.)" },
+    { id: "q-other", q: "עוד משהו שצריך לשנות?", p: "", en: "Anything else?" },
+  ];
+
+  function renderQs() {
+    const host = document.getElementById("qs");
+    host.innerHTML = "";
+    for (const q of QS) {
+      const a = answers.get(q.id);
+      const box = document.createElement("div"); box.className = "q";
+      box.innerHTML = `<b>${esc(q.q)}</b>${q.p ? `<div class="prop">${esc(q.p)}</div>` : ""}<div class="en">${esc(q.en)}</div>`;
+      const ta = document.createElement("textarea"); ta.id = "ans-" + q.id; ta.dir = "rtl"; ta.placeholder = "התשובה שלך…";
+      ta.value = a ? a.text : "";
+      const row = document.createElement("div"); row.className = "row";
+      const btn = document.createElement("button"); btn.className = "btn primary"; btn.textContent = "שמור תשובה";
+      const meta = document.createElement("span"); meta.className = "meta";
+      if (a && a.by) meta.textContent = `נשמר ע״י ${whoName(a.by)}${a.at ? " · " + fmtAt(a.at) : ""}`;
+      btn.onclick = () => saveAnswer(q.id, ta.value, meta);
+      if (!db) { btn.disabled = true; meta.textContent = "השמירה זמינה רק כשהדף פתוח ב-claude.ai"; }
+      row.append(btn, meta);
+      box.append(ta, row);
+      host.append(box);
+    }
+  }
+
+  function renderAll() { renderScreens(); renderBA(); }
+
+  // ---------- simulator ----------
+  const WINS = [
+    { k: "morning", he: "בוקר", s: 600, e: 780, hand: 590 },
+    { k: "evening", he: "ערב", s: 1080, e: 1260, hand: 1070 },
+  ];
+  const ymd = (d) => d.toISOString().slice(0, 10);
+  const dayMin = (iso) => { const [y, m, d] = iso.split("-").map(Number); return Date.UTC(y, m - 1, d) / 60000; };
+  const hm = (t) => { const [h, m] = t.split(":").map(Number); return h * 60 + m; };
+  const fromDayMin = (min) => ymd(new Date(min * 60000));
+  const pad = (n) => String(n).padStart(2, "0");
+  const clock = (min) => `${pad(Math.floor(min / 60) % 24)}:${pad(min % 60)}`;
+  const dow = (iso) => new Date(dayMin(iso) * 60000).getUTCDay();
+  const dm = (iso) => { const [, m, d] = iso.split("-").map(Number); return `${d}.${m}`; };
+  const longDate = (iso) => `יום ${DAYS[dow(iso)]} ${dm(iso)}`;
+
+  function windowsFor(approvedIso, eventIso, start, margin) {
+    const [aDate, aTime] = approvedIso.split("T");
+    const approved = dayMin(aDate) + hm(aTime);
+    const eventStart = dayMin(eventIso) + hm(start);
+    const out = [];
+    // One day past the event too, so "the next window is tomorrow morning" can be shown and named.
+    for (let d = dayMin(aDate); d <= dayMin(eventIso) + 1440 && out.length < 40; d += 1440) {
+      for (const w of WINS) {
+        const ws = d + w.s, we = d + w.e;
+        const date = fromDayMin(d);
+        let reason = "";
+        if (we <= approved) reason = "החלון כבר נגמר";
+        else if (Math.max(ws, approved) > eventStart - margin) reason = "נפתח מאוחר מדי ביחס לתחילת האירוע";
+        out.push({ date, w, ws, we, ok: !reason, reason, now: approved >= ws - 10 && approved < we });
+      }
+    }
+    return { approved, aDate, eventStart, list: out };
+  }
+
+  function dayWord(postIso, aDate) {
+    const diff = (dayMin(postIso) - dayMin(aDate)) / 1440;
+    if (diff === 0) return "היום";
+    if (diff === 1) return "מחר";
+    return `ביום ${DAYS[dow(postIso)]} ${dm(postIso)}`;
+  }
+  function whenPhrase(win, aDate) {
+    const d = dayWord(win.date, aDate);
+    return `${d} ${win.w.k === "evening" ? "בערב" : "בבוקר"}`;
+  }
+  function relLabel(win, eventIso, start) {
+    const diff = (dayMin(eventIso) - dayMin(win.date)) / 1440;
+    if (diff === 0) return (win.w.k === "evening" || start >= "17:00") ? "*הערב!*" : "*היום!*";
+    if (diff === 1) return `*מחר!* ${DAYS[dow(eventIso)]} ${dm(eventIso)}`;
+    return `*${longDate(eventIso)}*`;
+  }
+  function boardSlot(eventIso, approved) {
+    const base = dayMin(eventIso);
+    const slots = [];
+    if ([5, 6].includes(dow(eventIso))) slots.push({ t: "12:00", hand: 710 });
+    slots.push({ t: "18:00", hand: 1070 });
+    return slots.find((s) => base + s.hand >= approved) || null;
+  }
+
+  function simBubble(text, who = "bot", img = false) {
+    const wrap = document.createElement("div"); wrap.className = "msg " + who;
+    const b = document.createElement("div"); b.className = "bubble";
+    b.innerHTML = (img ? flyerSvg() : "") + wa(text);
+    wrap.append(b);
+    return wrap;
+  }
+
+  let lastChoiceKey = "asap";
+  function runSim(resetChoice = false) {
+    const approvedIso = document.getElementById("sim-approved").value;
+    const eventIso = document.getElementById("sim-date").value;
+    const start = document.getElementById("sim-start").value;
+    const margin = Math.max(0, Number(document.getElementById("sim-margin").value) || 0);
+    const winHost = document.getElementById("sim-windows");
+    const chat = document.getElementById("sim-chat");
+    const sel = document.getElementById("sim-choice");
+    winHost.innerHTML = ""; chat.innerHTML = "";
+    if (!approvedIso || !eventIso || !start || !approvedIso.includes("T")) { chat.textContent = "מלאו את כל השדות."; return; }
+    const { approved, aDate, eventStart, list } = windowsFor(approvedIso, eventIso, start, margin);
+    if (eventStart <= approved) { chat.append(simBubble("האירוע כבר התחיל, אז אין מה לפרסם.")); return; }
+    const valid = list.filter((x) => x.ok);
+    const shown = valid.slice(0, 6);
+
+    // choice select
+    if (resetChoice) lastChoiceKey = "asap";
+    sel.innerHTML = "";
+    const opt = (v, t) => { const o = document.createElement("option"); o.value = v; o.textContent = t; sel.append(o); };
+    if (valid.length) {
+      opt("asap", "1. בהקדם האפשרי");
+      shown.forEach((x, i) => opt("w" + i, `2. ${DAYS[dow(x.date)]} ${dm(x.date)} · ${x.w.he}`));
+      opt("none", "3. לא, רק בלוח היומי");
+    } else opt("none", "(אין אפשרות למודעה)");
+    if ([...sel.options].some((o) => o.value === lastChoiceKey)) sel.value = lastChoiceKey; else sel.value = sel.options[0].value;
+    lastChoiceKey = sel.value;
+    const chosen = sel.value === "asap" ? valid[0] : sel.value.startsWith("w") ? shown[Number(sel.value.slice(1))] : null;
+
+    // windows list
+    const visible = list.slice(0, 12);
+    for (const x of visible) {
+      const row = document.createElement("div");
+      row.className = "slot" + (x.ok ? "" : " no") + (chosen && x === chosen ? " pick" : "");
+      const pill = x === chosen ? `<span class="pill a">נבחר</span>` : x.ok ? `<span class="pill ok">${x.now ? "פתוח עכשיו" : "אפשרי"}</span>` : `<span class="pill x">${esc(x.reason)}</span>`;
+      row.innerHTML = `<span class="t">${dm(x.date)} ${clock(x.w.s)}–${clock(x.w.e)}</span><span>${esc(DAYS[dow(x.date)])} · ${x.w.he}</span>${pill}`;
+      winHost.append(row);
+    }
+
+    // conversation
+    const slot = boardSlot(eventIso, approved);
+    const boardLine = slot
+      ? `📋 הוא ייכנס ללוח היומי של *${longDate(eventIso)}*, שיוצא לקבוצה ב-${slot.t}.`
+      : "הלוח היומי של יום האירוע כבר יצא, אבל מי ששואל את הבוט על אירועים ימצא אותו.";
+    chat.append(simBubble(`האירוע שלכם "ערב יין בחצר של לוי" אושר 🎉\n${boardLine}`));
+
+    if (!valid.length) {
+      const nextWin = list.find((x) => x.we > approved);
+      const nextText = nextWin ? `${dayWord(nextWin.date, aDate)} ב-${clock(Math.max(nextWin.ws, approved))}` : "אחרי האירוע";
+      chat.append(simBubble(`האירוע מתחיל ${dayWord(eventIso, aDate)} ב-${start}, והחלון הבא למודעות הוא ${nextText}, אז הפעם לא נוכל לפרסם עליו מודעה 🙏\n\nבפעם הבאה שלחו לפחות יום מראש, ונוכל לפרסם גם מודעה.`));
+      return;
+    }
+    const asap = valid[0];
+    const asapText = asap.now ? `*עכשיו* (עד ${clock(asap.w.e)})` : `*${whenPhrase(asap, aDate)}* (${clock(asap.w.s)}–${clock(asap.w.e)})`;
+    chat.append(simBubble(`רוצים שנפרסם גם *מודעה גרפית מורחבת* עם הפלייר?\n\n1. כן, בהקדם האפשרי: ${asapText}\n2. כן, אבחר יום וחלון\n3. לא, רק בלוח היומי`));
+
+    if (sel.value === "none") {
+      chat.append(simBubble("3", "me"));
+      chat.append(simBubble(`אין בעיה. האירוע יופיע בלוח היומי${slot ? ` של ${longDate(eventIso)}` : ""}.`));
+      return;
+    }
+    if (sel.value === "asap") chat.append(simBubble("1", "me"));
+    else {
+      chat.append(simBubble("2", "me"));
+      const lines = shown.map((x, i) => `${i + 1}. ${dayWord(x.date, aDate) === "היום" || dayWord(x.date, aDate) === "מחר" ? `${dayWord(x.date, aDate)} (${DAYS[dow(x.date)]} ${dm(x.date)})` : `${DAYS[dow(x.date)]} ${dm(x.date)}`} · ${x.w.he} ${clock(x.w.s)}–${clock(x.w.e)}`);
+      if (valid.length > shown.length) lines.push(`${shown.length + 1}. תאריך אחר`);
+      chat.append(simBubble(`מתי לפרסם את המודעה?\n\n${lines.join("\n")}`));
+      chat.append(simBubble(String(Number(sel.value.slice(1)) + 1), "me"));
+    }
+    const confirm = chosen.now
+      ? `סגור ✅\nהמודעה עוברת לסתיו עכשיו, ותתפרסם בקבוצה עד ${clock(chosen.w.e)}.`
+      : `סגור ✅\nהמודעה תתפרסם בקבוצה *${whenPhrase(chosen, aDate)}*: ${DAYS[dow(chosen.date)]} ${dm(chosen.date)}, בין ${clock(chosen.w.s)} ל-${clock(chosen.w.e)}.`;
+    chat.append(simBubble(confirm));
+    const ctx = document.createElement("div"); ctx.className = "ctx";
+    ctx.textContent = `ככה המודעה תיראה כשהיא יוצאת (${DAYS[dow(chosen.date)]} ${dm(chosen.date)}, ${chosen.w.he}):`;
+    chat.append(ctx);
+    chat.append(simBubble(LONG(relLabel(chosen, eventIso, start)).replace("20:00", start), "bot admin", true));
+  }
+
+  const PRESETS = [
+    { he: "חמישי אחה״צ, אירוע בשבת", a: "2026-11-05T14:30", d: "2026-11-07", s: "20:00" },
+    { he: "מקרה הקצה: 21:01", a: "2026-11-05T21:01", d: "2026-11-05", s: "22:00" },
+    { he: "אישור בבוקר, אירוע הערב", a: "2026-11-05T09:15", d: "2026-11-05", s: "19:00" },
+    { he: "אישור בתוך חלון", a: "2026-11-05T18:40", d: "2026-11-06", s: "21:00" },
+    { he: "שבוע מראש", a: "2026-11-05T11:00", d: "2026-11-12", s: "21:00" },
+  ];
+  function setupSim() {
+    const host = document.getElementById("presets");
+    PRESETS.forEach((p, i) => {
+      const b = document.createElement("button"); b.className = "btn"; b.id = "preset-" + i; b.textContent = p.he;
+      b.onclick = () => {
+        document.getElementById("sim-approved").value = p.a;
+        document.getElementById("sim-date").value = p.d;
+        document.getElementById("sim-start").value = p.s;
+        runSim(true);
+      };
+      host.append(b);
+    });
+    for (const id of ["sim-approved", "sim-date", "sim-start", "sim-margin"]) document.getElementById(id).addEventListener("input", () => runSim(false));
+    document.getElementById("sim-choice").addEventListener("change", (e) => { lastChoiceKey = e.target.value; runSim(false); });
+    runSim(true);
+  }
+
+  // ---------- persistence ----------
+  const status = document.getElementById("status");
+  function setStatus(text, cls) { status.textContent = text; status.className = "status " + (cls || ""); }
+
+  async function resolveNames() {
+    if (!user) return;
+    const ids = new Set();
+    for (const v of overrides.values()) if (v.by) ids.add(v.by);
+    for (const v of answers.values()) if (v.by) ids.add(v.by);
+    if (!ids.size) return;
+    try { names = await user.profiles([...ids]); } catch (e) { /* names stay unknown */ }
+  }
+
+  async function saveOverride(id, text) {
+    const clean = text.replace(/\r/g, "");
+    if (clean === M[id].text) { await resetOverride(id); return; }
+    const body = { text: clean, by: myId || "", at: Date.now() };
+    overrides.set(id, body);
+    editing = null; renderAll();
+    if (!db) { setStatus("נשמר רק אצלך (לא מחובר)", "off"); return; }
+    try { await db.collection("copy").doc(id).set(body); setStatus("נשמר", "ok"); }
+    catch (e) { setStatus("השמירה נכשלה, אין הרשאת עריכה", "off"); }
+  }
+  async function resetOverride(id) {
+    overrides.delete(id);
+    editing = null; renderAll();
+    if (!db) return;
+    try { await db.collection("copy").doc(id).delete(); setStatus("חזר לנוסח המקורי", "ok"); }
+    catch (e) { setStatus("השמירה נכשלה, אין הרשאת עריכה", "off"); }
+  }
+  async function saveAnswer(qid, text, meta) {
+    if (!db) return;
+    const body = { text: text.trim(), by: myId || "", at: Date.now() };
+    try {
+      await db.collection("answers").doc(qid).set(body);
+      answers.set(qid, body);
+      await resolveNames();
+      meta.textContent = `נשמר ע״י ${whoName(body.by)} · ${fmtAt(body.at)}`;
+      setStatus("נשמר", "ok");
+    } catch (e) { meta.textContent = "השמירה נכשלה, אין הרשאת עריכה"; }
+  }
+
+  async function connect() {
+    if (!window.claude || typeof window.claude.use !== "function") { setStatus("תצוגה בלבד: העריכות לא נשמרות", "off"); return; }
+    const timer = setTimeout(() => { if (!db) setStatus("תצוגה בלבד: העריכות לא נשמרות", "off"); }, 10000);
+    try {
+      [db, user] = await Promise.all([window.claude.use("db"), window.claude.use("user")]);
+    } catch (e) { db = null; }
+    clearTimeout(timer);
+    if (!db) { setStatus("תצוגה בלבד: העריכות לא נשמרות", "off"); renderQs(); return; }
+    if (user) {
+      try { myId = await user.id(); } catch (e) { myId = null; }
+      try { canWrite = await user.can("data.write"); } catch (e) { canWrite = null; }
+    }
+    setStatus(canWrite === false ? "צפייה בלבד" : "מחובר: עריכות נשמרות לכולם", canWrite === false ? "off" : "ok");
+    renderQs();
+    db.collection("copy").onSnapshot(async (snap) => {
+      overrides.clear();
+      for (const d of snap.docs) if (M[d.id]) overrides.set(d.id, d.data());
+      await resolveNames();
+      if (!editing) renderAll();
+    }, () => setStatus("החיבור נותק", "off"));
+    db.collection("answers").onSnapshot(async (snap) => {
+      const focused = document.activeElement && document.activeElement.id && document.activeElement.id.startsWith("ans-");
+      answers.clear();
+      for (const d of snap.docs) answers.set(d.id, d.data());
+      await resolveNames();
+      if (!focused) renderQs();
+    }, () => {});
+  }
+
+  // ---------- english toggle ----------
+  const tog = document.getElementById("toggle-en");
+  let enPref = true;
+  try { const v = localStorage.getItem("fomo-en"); if (v !== null) enPref = v === "1"; } catch (e) {}
+  tog.checked = enPref;
+  document.documentElement.classList.toggle("show-en", enPref);
+  tog.addEventListener("change", () => {
+    document.documentElement.classList.toggle("show-en", tog.checked);
+    try { localStorage.setItem("fomo-en", tog.checked ? "1" : "0"); } catch (e) {}
+  });
+
+  renderAll();
+  renderQs();
+  setupSim();
+  connect();
+})();
+</script>
