@@ -2660,14 +2660,32 @@ async function demo() {
     }
     awaitingAdChoice.delete(sender);
 
-    // in another conversation: held, so the offer's "1" cannot land in it
+    // in another conversation: the approval goes at once, since it asks nothing; only
+    // the offer waits, so its "1" cannot land in the other question
     lastActivity.set(sender, Date.now());
     await routeMessage(sender, "1"); // an inquiry
     id = await seed();
-    if (outbox.some((m) => m.to === sender) || !pendingAdOffers.has(id) || awaitingAdChoice.has(sender)) throw new Error("held while busy");
-    await routeMessage(sender, "ביטול");
+    const toSender = outbox.filter((m) => m.to === sender);
+    if (toSender.length !== 1 || !toSender[0].text.includes("אושר") || toSender[0].text.includes("מודעה גרפית")) {
+      throw new Error("the approval reaches a busy organizer at once, without the offer");
+    }
+    if (!pendingAdOffers.has(id) || awaitingAdChoice.has(sender)) throw new Error("the offer is held while busy");
+    const freed = await routeMessage(sender, "ביטול");
     if (pendingAdOffers.has(id) || !awaitingAdChoice.has(sender)) throw new Error("delivered once free");
+    if (!freed.includes("מודעה גרפית") || !freed.includes('"יין"') || freed.includes("אושר 🎉")) {
+      throw new Error("the offer comes with the event's name, not the approval again");
+    }
     awaitingAdChoice.delete(sender);
+
+    // in another conversation, and no window left: the approval still goes at once
+    lastActivity.set(sender, Date.now());
+    await routeMessage(sender, "1"); // an inquiry
+    id = await seed({ date: "2020-01-01" });
+    const noOffer = outbox.filter((m) => m.to === sender);
+    if (noOffer.length !== 1 || !noOffer[0].text.includes("אושר") || pendingAdOffers.has(id)) {
+      throw new Error("with no offer, a busy organizer gets the approval at once and nothing is held");
+    }
+    await routeMessage(sender, "ביטול");
   }
 
   fs.unlinkSync(CORRECTIONS_FILE);

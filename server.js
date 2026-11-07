@@ -52,6 +52,10 @@ let awaitingAdChoice = new Map();
 // closed with no approved template, or they were in another conversation. Attached to
 // their next reply (deliverPendingAdOffer).
 let pendingAdOffers = new Set();
+// The held offers whose approval already went out (the organizer was busy, not out of
+// reach): only the offer is still owed, so it comes with a reminder line, not the
+// approval again.
+let approvalAlreadySent = new Set();
 // sender -> { eventId, unresolved }. The organizer has seen both versions and has not yet
 // confirmed them or said what to change. Deliberately left alone by clearSession and kept
 // out of hasSessionState: the answer can come hours later, and the idle sweep must not
@@ -105,6 +109,7 @@ function loadState() {
     // publish-day question; they are ignored.
     awaitingAdChoice = new Map(raw.awaitingAdChoice || []);
     pendingAdOffers = new Set(raw.pendingAdOffers || []);
+    approvalAlreadySent = new Set(raw.approvalAlreadySent || []);
     awaitingConfirmation = new Map(raw.awaitingConfirmation || []);
     sentBoards = new Set(raw.sentBoards || []);
     sentReminders = new Set(raw.sentReminders || []);
@@ -148,6 +153,7 @@ function writeStateNow() {
     lastSubmittedEventId: [...lastSubmittedEventId.entries()].slice(-50),
     awaitingAdChoice: [...awaitingAdChoice.entries()].slice(-50),
     pendingAdOffers: [...pendingAdOffers].slice(-100),
+    approvalAlreadySent: [...approvalAlreadySent].slice(-100),
     awaitingConfirmation: [...awaitingConfirmation.entries()].slice(-50),
     // Only the last few send-windows matter; older keys can never fire again.
     sentBoards: [...sentBoards].slice(-20),
@@ -2204,6 +2210,7 @@ const WINDOW_PASSED_TEXT = "החלון הזה כבר עבר. אלה האפשרו
 const AMENDMENT_AFTER_APPROVAL_TEXT = "העברנו את הבקשה לסתיו, היא תעדכן את האירוע.";
 const NO_WINDOW_LEFT_TEXT = "החלון הזה כבר עבר, ולא נשאר עוד חלון למודעה לפני שהאירוע מתחיל 🙏 האירוע יופיע בלוח היומי.";
 const BOARD_ALREADY_OUT_TEXT = "📋 הלוח היומי של היום כבר יצא, אז הוא יישלח לקבוצה בנפרד.";
+const HELD_OFFER_LEAD = (name) => `📌 לגבי האירוע "${name}" שאושר:`;
 const PICK_WINDOW_PROMPT = "מתי לפרסם את המודעה?";
 const PAST_DATE_TEXT = "התאריך הזה כבר עבר. כתבו תאריך מהיום והלאה.";
 const MAX_LISTED_WINDOWS = 6;
@@ -2323,20 +2330,26 @@ function adQuestionText(open) {
 
 // Approval reaches the organizer as two messages: the approval with the board's date and
 // slot, then the ad offer. An open window gets both as text. A closed one can only take
-// the fomo_ad_offer template, which carries both; without it, or while the organizer is
-// in another conversation (the offer's "1" would land there), both wait in
-// pendingAdOffers for their next message.
+// the fomo_ad_offer template, which carries both; without it, both wait in
+// pendingAdOffers for the organizer's next message. An organizer in another conversation
+// gets the approval at once, since it asks nothing, and only the offer waits: its "1"
+// would land in that other question.
 async function notifyApproved(sender, id, event) {
   const offer = offerFor(event, israelClock(new Date()));
   const open = windowIsOpen(lastActivity.get(sender) || 0);
   const busy = inOpenConversation(sender);
 
-  if (open && (!busy || !offer.offerText)) {
+  if (open) {
     await sendToSubmitter(sender, offer.approvalText);
-    if (offer.offerText) {
-      setAdStep(sender, id, "offer", { options: offer.options, prompt: offer.prompt });
-      await sendToSubmitter(sender, offer.offerText);
+    if (!offer.offerText) return;
+    if (busy) {
+      pendingAdOffers.add(String(id));
+      approvalAlreadySent.add(String(id));
+      saveState();
+      return;
     }
+    setAdStep(sender, id, "offer", { options: offer.options, prompt: offer.prompt });
+    await sendToSubmitter(sender, offer.offerText);
     return;
   }
 
@@ -2365,6 +2378,12 @@ async function notifyApproved(sender, id, event) {
   saveState();
 }
 
+function dropHeldOffer(id) {
+  pendingAdOffers.delete(id);
+  approvalAlreadySent.delete(String(id));
+  saveState();
+}
+
 async function adOfferTemplateApproved() {
   if (process.env.NODE_ENV !== "test") await ensureTemplates();
   return Boolean(approvedTemplateSid(AD_OFFER_TEMPLATE));
@@ -2372,6 +2391,7 @@ async function adOfferTemplateApproved() {
 
 // A held approval and offer, attached under the reply to the organizer's next message
 // once they are in no other conversation. One per message: one question can be open.
+// When the approval already went out, the offer comes under a line naming the event.
 function deliverPendingAdOffer(sender, reply) {
   if (!pendingAdOffers.size || inOpenConversation(sender)) return reply;
   const local = israelClock(new Date());
@@ -2379,16 +2399,23 @@ function deliverPendingAdOffer(sender, reply) {
   for (const id of [...pendingAdOffers]) {
     const event = events.find((candidate) => candidate.id === String(id));
     if (!event || event.status !== "published" || !event.date || lastDay(event) < local.date) {
-      pendingAdOffers.delete(id);
-      saveState();
+      dropHeldOffer(id);
       continue;
     }
     if (event.submitter !== sender) continue;
     const offer = offerFor(event, local);
-    const extra = offer.offerText ? `${offer.approvalText}\n\n${offer.offerText}` : offer.approvalText;
+    const approved = approvalAlreadySent.has(String(id));
+    // Approved already, and no window left: there is nothing more to tell them.
+    if (approved && !offer.offerText) {
+      dropHeldOffer(id);
+      continue;
+    }
+    const lead = approved ? HELD_OFFER_LEAD(event.event_name) : offer.approvalText;
+    const extra = offer.offerText ? `${lead}\n\n${offer.offerText}` : lead;
     const full = reply ? `${reply}\n\n${extra}` : extra;
     if (full.length >= WHATSAPP_MAX_CHARS) return reply; // waits for a shorter reply
     pendingAdOffers.delete(id);
+    approvalAlreadySent.delete(String(id));
     if (offer.offerText) setAdStep(sender, id, "offer", { options: offer.options, prompt: offer.prompt });
     saveState();
     return full;
