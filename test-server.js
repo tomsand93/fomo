@@ -2957,6 +2957,26 @@ async function demo() {
     awaitingAdChoice.delete(sender);
   }
 
+  // --- Stav's edit result offers the approve line only while the event can be approved ---
+  {
+    const eventsStore = require("./events-store");
+    const sender = "whatsapp:+972500017410";
+    const id = eventsStore.appendEvent(TEST_EVENTS_FILE, { event_name: "עריכה שנייה", date: "2099-08-01", start_time: "20:00", location: "מקום, חיפה" }, "test", sender, []);
+    const editTo = async (status, description) => {
+      eventsStore.updateEvent(TEST_EVENTS_FILE, id, { status });
+      await routeMessage(ADMIN, `ערוך ${id}`);
+      CORRECTION_STUB.set(description, { description });
+      const reply = await routeMessage(ADMIN, description);
+      if (!reply.includes("עודכן")) throw new Error(`the ${status} edit is applied`);
+      return reply;
+    };
+    if (!(await editTo("submitted", "תיאור א")).includes(`לאישור: אשר ${id}`)) throw new Error("submitted: the approve line is shown");
+    if (!(await editTo("needs_info", "תיאור ב")).includes(`לאישור: אשר ${id}`)) throw new Error("needs_info: the approve line is shown");
+    for (const [status, description] of [["published", "תיאור ג"], ["rejected", "תיאור ד"], ["awaiting_confirm", "תיאור ה"]]) {
+      if ((await editTo(status, description)).includes(`אשר ${id}`)) throw new Error(`${status}: no approve line`);
+    }
+  }
+
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });

@@ -2850,7 +2850,10 @@ async function handleAdminEdit(id, text) {
   if (!event) return `לא נמצא אירוע #${id}.`;
   if (!changed.length) return askAgain(`${CORRECTION_UNCLEAR_TEXT}\n\n${editAskText(id)}`);
   const [short, ad] = previewMessages(event);
-  return [`עודכן ✏ #${id}. ככה זה נראה עכשיו:`, short.text, ad.text, `לאישור: אשר ${id}`].join("\n\n");
+  // Only an event still under review can be approved; on any other the line would invite
+  // a command that does nothing useful (or re-publishes one already out).
+  const approvable = event.status === "submitted" || event.status === "needs_info";
+  return [`עודכן ✏ #${id}. ככה זה נראה עכשיו:`, short.text, ad.text, ...(approvable ? [`לאישור: אשר ${id}`] : [])].join("\n\n");
 }
 
 async function handleAdminMessage(text, repliedSid = "") {
