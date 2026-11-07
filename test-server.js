@@ -2717,6 +2717,37 @@ async function demo() {
     if (lastInbound.has(sender)) throw new Error("lastInbound is pruned after 24h");
   }
 
+  // --- A failed fomo_ad_offer send keeps the approval, and opens no phantom question ---
+  {
+    const eventsStore = require("./events-store");
+    const interactive = require("./send-interactive");
+    const { _setAdOfferSender } = require("./server");
+    const sender = "whatsapp:+972500017402";
+    const id = eventsStore.appendEvent(TEST_EVENTS_FILE, { event_name: "תבנית", date: "2099-05-10", start_time: "20:00", location: "מקום" }, "test", sender, []);
+    eventsStore.updateEvent(TEST_EVENTS_FILE, id, { status: "submitted", flyer: "f.jpg" });
+    interactive._setApprovedTemplates(new Map([["fomo_ad_offer", "HXad"]]));
+    _setAdOfferSender(async () => { throw new Error("simulated send failure"); });
+    try {
+      lastInbound.set(sender, Date.now() - 25 * 3600e3);
+      outbox.length = 0;
+      await routeMessage(ADMIN, `אשר ${id}`);
+    } finally {
+      _setAdOfferSender(null);
+      interactive._setApprovedTemplates(new Map());
+    }
+    if (awaitingAdChoice.has(sender)) throw new Error("a failed send opens no question");
+    if (!pendingAdOffers.has(id)) throw new Error("a failed send holds the approval and the offer");
+    const persisted = JSON.parse(fs.readFileSync(TEST_STATE_FILE, "utf8"));
+    if (!persisted.pendingAdOffers.includes(id) || persisted.awaitingAdChoice.some(([who]) => who === sender)) {
+      throw new Error("the hold is saved");
+    }
+    const next = await routeMessage(sender, "תפריט");
+    if (!next.includes("אושר") || !next.includes("מודעה גרפית") || !awaitingAdChoice.has(sender)) {
+      throw new Error("both arrive with their next message");
+    }
+    awaitingAdChoice.delete(sender);
+  }
+
   fs.unlinkSync(CORRECTIONS_FILE);
   fs.unlinkSync(TEST_EVENTS_FILE);
   fs.rmSync(TEST_FLYER_DIR, { recursive: true, force: true });

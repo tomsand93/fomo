@@ -2374,20 +2374,33 @@ async function notifyApproved(sender, id, event) {
       template: AD_OFFER_TEMPLATE,
       variables: { 1: event.event_name, 2: offer.phrase },
     };
-    if (process.env.NODE_ENV === "test") {
-      outbox.push({ to: sender, text: renderNumbered(choice.text, choice.options), mediaUrl: "", template: AD_OFFER_TEMPLATE });
-      return;
-    }
     try {
-      await sendChoice(sender, choice);
+      await sendAdOffer(sender, choice);
     } catch (err) {
-      console.error(`failed to send the ad offer for event #${id}:`, err);
+      // Nothing reached them: the open step would capture their next message as an
+      // answer to a question they never saw, and the approval would be lost. Both wait
+      // for their next message instead, like a closed window with no template.
+      console.error(`failed to send the ad offer for event #${id}, holding it:`, err);
+      awaitingAdChoice.delete(sender);
+      pendingAdOffers.add(String(id));
+      saveState();
     }
     return;
   }
 
   pendingAdOffers.add(String(id));
   saveState();
+}
+
+// The fomo_ad_offer send. Injectable so the suite can make it fail without Twilio.
+let adOfferSender = null;
+function sendAdOffer(sender, choice) {
+  if (adOfferSender) return adOfferSender(sender, choice);
+  if (process.env.NODE_ENV === "test") {
+    outbox.push({ to: sender, text: renderNumbered(choice.text, choice.options), mediaUrl: "", template: AD_OFFER_TEMPLATE });
+    return Promise.resolve();
+  }
+  return sendChoice(sender, choice);
 }
 
 function dropHeldOffer(id) {
@@ -4062,6 +4075,7 @@ module.exports = {
   sendGoodbyes,
   get awaitingAdChoice() { return awaitingAdChoice; },
   get pendingAdOffers() { return pendingAdOffers; },
+  _setAdOfferSender(fn) { adOfferSender = fn; },
   offerFor,
   boardSlotFor,
   DAILY_SLOTS,
