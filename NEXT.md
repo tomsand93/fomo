@@ -16,13 +16,13 @@ only becomes visible after publication.
 
 Both renderings already exist and are used everywhere else:
 
-- `formatShort(event, { linkFor })` — what goes on the weekly board
+- `formatShort(event, { linkFor })` — what goes on the daily board
 - `formatLong(event, { linkFor, flyerUrl })` — what goes in the daily group message,
   returns `{ text, mediaUrl }` with the flyer as media
 
 **What to change:** rebuild the review notice as
 1. a short header naming the event and its id,
-2. the SHORT rendering under a "this is how it appears on the weekly board" label,
+2. the SHORT rendering under a "this is how it appears on the daily board" label,
 3. the LONG rendering under a "this is how it appears in the daily message" label,
 4. the existing `⚠️ לא הובהר` uncertainty note (keep — it is why she reviews at all),
 5. the approve/reject instructions.
@@ -47,14 +47,14 @@ contain the SHORT line, the LONG block, and still end with the approve/reject li
 
 The daily "events awaiting review" nudge (`server.js:365`) goes out as plain text, so it
 is silently dropped by error 63016 whenever Stav's 24h window is shut — the same failure
-that lost three weekly boards. The board send is now protected; this one is not.
+that lost three boards. The board send is now protected; this one is not.
 
 Reword tighter before submitting ("יש N אירועים שממתינים לאישור") — Meta rejects
 templates that read as content pushes, and the current version lists names and ids.
 
 ## 3. TwiML → API replies
 
-Unlocks buttons on the main menu and the submission-time publish-day question with no
+Unlocks buttons on the main menu with no
 Meta approval needed (verified: an unapproved template delivers fine inside an open 24h
 window). All 58 return statements funnel through one line (`server.js:1125`), so the
 change is small — but a failed send becomes silence instead of an error, so apply the

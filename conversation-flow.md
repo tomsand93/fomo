@@ -3,7 +3,8 @@
 ## Channels
 
 1. Submission bot: organizers send events to the WhatsApp number.
-2. Billboard: approved event messages are sent to Stav/Tom and forwarded to the audience.
+2. Group posts: the daily board and graphic ads are handed to Stav, who forwards them to the
+   group. WhatsApp's API cannot post to a group (`channels.md`).
 
 ## User Menu
 
@@ -60,18 +61,10 @@ After receiving it:
 - parse fields with the interpretation model
 - validate required fields
 - return all missing fields at once
-- save complete events to `events.csv`
-- mark complete events as `payment_pending`
-- mark incomplete events as `needs_info`
+- save incomplete events as `needs_info`
+- save complete events as `awaiting_confirm` and show the organizer both versions (below)
 
-Reply if complete:
-
-```text
-קיבלנו את האירוע.
-הוא נכנס לבדיקה לפני פרסום.
-```
-
-Reply if incomplete: the gaps are asked as questions a person can answer, one directly if
+Incomplete reply: the gaps are asked as questions a person can answer, one directly if
 only one field is missing and a short list otherwise. The exact wording lives in
 `missingFieldsPrompt` and `FIELD_QUESTIONS` in `server.js` — restating it here is how this
 file drifted out of date before.
@@ -79,6 +72,71 @@ file drifted out of date before.
 A draft that is still incomplete after three tries is handed to Stav with the gap named,
 unless almost nothing was extracted at all, in which case it is dropped rather than filed
 (see "Leaving a submission" above).
+
+### Confirming both versions
+
+A complete event is not sent to Stav yet. The organizer gets three separate messages
+(outbound sends, since a TwiML reply carries no media and only one message):
+
+1. the short listing, as it will appear on the daily board
+2. the graphic ad, with the flyer
+3. a prompt to confirm or say what to change
+
+Then:
+- A confirmation (`1`, or a Hebrew yes such as `אישור` / `מאשר`) sets the status to
+  `submitted` and forwards the event to Stav.
+- Any other text is a correction. It goes through `applyCorrection` (a model call that
+  returns only the fields the text changes, validated before it is stored), the bot shows
+  the updated versions and asks again. If nothing changed, the bot says it did not
+  understand; it never repeats the old question as if nothing was said.
+- An image replaces the flyer. A caption on it is a correction too.
+- An organizer who has not answered after 3 hours is reminded once. The event never
+  reaches Stav by itself; it stays on her pending list, under its own heading, until it
+  expires.
+
+### Stav reviews
+
+The review notice shows both versions with the labels for the daily board and the ad. She
+can approve (`אשר`), reject (`דחה`), or edit:
+
+- `ערוך` (with an id, or as a reply to the notice) makes the bot ask what to change. Her
+  next message goes through `applyCorrection`, the bot shows both updated versions and
+  the approve line.
+- `תקן 42 field: value` still works.
+- If the organizer sends a correction while the event is with her, it is applied and she
+  gets the updated notice.
+
+### After approval
+
+Two separate messages go to the organizer: the approval, naming the daily board's day and
+slot (18:00 daily; 12:00 as well on Friday and Saturday), then the ad offer:
+
+```text
+1. כן, בהקדם האפשרי: <the first window that passes the rule> (<hours>)
+2. כן, אבחר יום וחלון
+3. לא, רק בלוח היומי
+```
+
+- **1** books the first window that passes the rule.
+- **2** lists up to six windows, with `תאריך אחר` when there are more. Windows are morning
+  (10:00-13:00, handed to Stav at 09:50) and evening (18:00-21:00, handed to her at 17:50
+  after the board).
+- **3** declines; the event stays on the daily board only.
+
+The one rule: a window is offered only if the later of its start and now is before the
+event starts, and the window has not ended. For a multi-day event, the start time on its
+last day counts. If no window passes, no ad is offered and the approval says why. Windows
+are recomputed when the answer arrives; if the chosen one has passed, the bot says so and
+offers what is left. Choosing an ad for an event with no flyer makes the bot ask for one
+first. One ad per event; ads are free until a price is set.
+
+When the organizer's 24-hour window is shut, the approval and the offer go as the
+`fomo_ad_offer` template (`submit-ad-offer-template.js`). Until Meta approves it, both
+wait and are attached to the reply to the organizer's next message. An organizer in
+another open conversation gets the approval at once; only the offer waits.
+
+A correction sent after approval changes nothing by itself. It goes to Stav, the organizer
+is told, and any open ad question is asked again.
 
 ## Option 3 - Price List
 
@@ -125,20 +183,19 @@ Reject or hold:
 ## Approval
 
 MVP:
-- complete events are saved as `payment_pending`
-- user pays by the chosen MVP method
-- every paid event is manually reviewed
+- the organizer confirms both versions; the event is then `submitted`
+- payment is not collected yet (the price is undecided)
+- every event is manually reviewed
 - Stav approves or rejects
-- rejected paid events are refunded
+- rejected events are not published
 
 Production:
-- digest should use only `approved`
+- the daily board uses only approved events, each on its own day
 
 ## What Tom Needs To Decide
 
 1. Publication price.
 2. Free/community event policy.
 3. MVP payment method.
-4. Daily send time.
-5. Weekly send day/time.
-6. Exact visitor-facing event info bot behavior.
+4. Ad price, and when ads stop being free.
+5. Exact visitor-facing event info bot behavior.

@@ -38,7 +38,7 @@ bug.
 A reminder fires 2–3h before an event, but the user opted in whenever they last asked
 about events — often days earlier. WhatsApp only allows free-form messages within 24h of
 the recipient's **last inbound message**. Outside that window Twilio accepts the send,
-returns a SID, and drops the message with error 63016. Three weekly boards in this
+returns a SID, and drops the message with error 63016. Three boards in this
 project were lost exactly that way.
 
 `send-reminder.js` sends free text when the window is provably open (using

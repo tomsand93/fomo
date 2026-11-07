@@ -80,7 +80,7 @@ makes the offer honest.
 A reminder fires hours or days after the user last messaged, so **their 24-hour
 WhatsApp window will usually be closed**. A plain text send is accepted by
 Twilio and then silently dropped with error 63016 â€” this is not hypothetical,
-it silently lost three weekly boards in this project.
+it silently lost three boards in this project.
 
 That means a reminder needs an **approved Content template**, submitted to Meta
 in advance. Constraints learned the hard way here:

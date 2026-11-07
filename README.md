@@ -1,16 +1,16 @@
 # FOMO Haifa
 
-Automated WhatsApp intake and daily events digest for Haifa.
+Automated WhatsApp intake, daily board and graphic ads for Haifa.
 
 ## Goal
 
-Collect Haifa culture event messages, structure them, validate them, and publish one organized Hebrew WhatsApp message.
+Collect Haifa culture event messages, structure them, validate them, and publish a daily board of events and optional graphic ads.
 
 ## Product Shape
 
 - Two channels:
   - submission channel: users send events to the WhatsApp bot
-  - billboard channel: one daily organized digest is published
+  - group channel: a daily board and graphic ads are published
 - Users submit events by WhatsApp message.
 - Incoming messages are routed by classified intent, not by text length: a request for
   recommendations reaches the inquiry flow and is answered on the first reply, a flyer
@@ -18,15 +18,17 @@ Collect Haifa culture event messages, structure them, validate them, and publish
 - Chosen intake: WhatsApp number/bot.
 - The system extracts event details into `events.csv`.
 - Events are reviewed by Stav during MVP.
-- Once a day, the system generates one Hebrew WhatsApp digest.
-- The digest is prepared for manual forwarding to the live WhatsApp group during MVP.
-- Later, the same events can feed weekly boards, billboards, or a website.
+- The organizer confirms the short listing and the graphic ad before Stav sees the event.
+- Every approved event is listed free on the daily board for its own day (18:00 daily, 12:00 too on Friday and Saturday).
+- After approval the organizer is offered a graphic ad in a morning (10:00-13:00) or evening (18:00-21:00) window.
+- The board and the ads are handed to Stav, who forwards them to the live WhatsApp group during MVP.
+- Later, the same events can feed billboards or a website.
 
 ## Decisions Needed
 
 - WhatsApp publishing method:
   - official WhatsApp Business API if it can support the needed destination
-  - generated digest + manual paste if group posting is not supported
+  - generated board and ads + manual paste if group posting is not supported
   - alternative channel if needed
 - WhatsApp provider for intake: Twilio for MVP.
 
@@ -36,9 +38,9 @@ Collect Haifa culture event messages, structure them, validate them, and publish
 2. Deploy this webhook server.
 3. Set Twilio inbound webhook to `/webhook/twilio`.
 4. Extract incoming messages into `events.csv`.
-5. Generate daily digest from structured events.
+5. Generate the daily board from structured events.
 
-Skipped: full API integration first. Add it after the daily digest format works and the WhatsApp publishing path is confirmed.
+Skipped: full API integration first. Add it after the daily board format works and the WhatsApp publishing path is confirmed.
 
 ## Data
 
