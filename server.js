@@ -763,6 +763,10 @@ async function sendGoodbyes(events, today = todayIso()) {
   }
 }
 
+// Counts are mentioned only above this. A small number ("3 people viewed your event")
+// reads like a failure, not a success, so below it the goodbye says nothing about views.
+const MIN_VIEWS_TO_MENTION = 10;
+
 // One event keeps the original wording. Several become one message that names them,
 // because "thanks for publishing" repeated verbatim reads like a broken bot rather
 // than a thank-you.
@@ -773,7 +777,7 @@ function goodbyeMessage(theirs) {
 
   if (theirs.length === 1) {
     const views = viewsFor(theirs[0]);
-    const tail = views > 0 ? `\n\n${views} אנשים צפו בקישור לאירוע שלכם דרך FOMO 📈` : "";
+    const tail = views > MIN_VIEWS_TO_MENTION ? `\n\n${views} אנשים צפו בקישור לאירוע שלכם דרך FOMO 📈` : "";
     return `${goodbyeText()}${tail}`;
   }
 
@@ -782,9 +786,9 @@ function goodbyeMessage(theirs) {
   for (const event of theirs) {
     const views = viewsFor(event);
     total += views;
-    lines.push(`• ${event.event_name}${views > 0 ? ` — ${views} צפיות` : ""}`);
+    lines.push(`• ${event.event_name}${views > MIN_VIEWS_TO_MENTION ? ` — ${views} צפיות` : ""}`);
   }
-  if (total > 0) {
+  if (total > MIN_VIEWS_TO_MENTION) {
     lines.push("", `סה״כ ${total} אנשים צפו בקישורים שלכם דרך FOMO 📈`);
   }
   lines.push("", "לא לשכוח שאפשר גם לדבר עם הבוט שלנו ולברר על אירועים");

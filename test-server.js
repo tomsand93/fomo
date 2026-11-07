@@ -6,6 +6,12 @@ process.env.NODE_ENV = "test"; // skip real Twilio calls (admin forwarding) duri
 const TEST_EVENTS_FILE = path.join(__dirname, "test-events.csv");
 process.env.EVENTS_FILE = TEST_EVENTS_FILE;
 
+// Without this, clicks land in clicks.jsonl beside the events file: the live log. The suite
+// gets its own, emptied on every run, so seeded visits never reach real stats.
+const TEST_CLICKS_FILE = path.join(require("os").tmpdir(), "fomo-test-clicks.jsonl");
+process.env.CLICKS_FILE = TEST_CLICKS_FILE;
+fs.rmSync(TEST_CLICKS_FILE, { force: true });
+
 // Tests must never read or write the real state.json: a leaked flag (recentlyCompleted,
 // say) silently changes what the next run sees, and a test run would clobber live sessions.
 const TEST_STATE_FILE = path.join(__dirname, "test-state.json");
@@ -1578,6 +1584,44 @@ async function demo() {
   const singleGoodbye = goodbyeMessage([{ id: "1", event_name: "מעגל שירה", slug: "" }]);
   if (singleGoodbye !== goodbyeText()) {
     throw new Error("a single past event should keep the original goodbye wording");
+  }
+
+  // View counts are mentioned only above 10: a small number reads as a failure, not as
+  // zero. Seeded through the real click log, the same way a visitor's tap is recorded.
+  const { logClick: seedClick } = require("./clicks-store");
+  const seedViews = (eventId, count) => {
+    for (let i = 0; i < count; i += 1) {
+      seedClick({ slug: `bye-${eventId}`, eventId, userAgent: "Mozilla/5.0 (iPhone)" });
+    }
+  };
+  const viewEvent = (eventId, name) => ({ id: eventId, event_name: name, slug: `bye-${eventId}` });
+
+  seedViews("bye-s10", 10);
+  if (goodbyeMessage([viewEvent("bye-s10", "מעגל שירה")]) !== goodbyeText()) {
+    throw new Error("10 views must not be mentioned in the single-event goodbye");
+  }
+  seedViews("bye-s11", 11);
+  if (!goodbyeMessage([viewEvent("bye-s11", "מעגל שירה")]).includes("11 אנשים צפו")) {
+    throw new Error("11 views must be mentioned in the single-event goodbye");
+  }
+
+  seedViews("bye-m3", 3);
+  seedViews("bye-m12", 12);
+  const aboveTen = goodbyeMessage([viewEvent("bye-m3", "קוליארט"), viewEvent("bye-m12", "אימפרוב")]);
+  if (aboveTen.includes("3 צפיות")) {
+    throw new Error("3 views must not be mentioned per event in a grouped goodbye");
+  }
+  if (!aboveTen.includes("12 צפיות")) {
+    throw new Error("12 views must be mentioned per event in a grouped goodbye");
+  }
+  if (!aboveTen.includes("15 אנשים צפו בקישורים")) {
+    throw new Error("a grouped total above 10 must be mentioned");
+  }
+
+  seedViews("bye-m4", 4);
+  const belowTen = goodbyeMessage([viewEvent("bye-m3", "קוליארט"), viewEvent("bye-m4", "השועל והכרם")]);
+  if (belowTen.includes("צפיות") || belowTen.includes("אנשים צפו") || belowTen.includes("בקישורים")) {
+    throw new Error("a grouped total of 7 must not mention any view counts");
   }
 
   fs.unlinkSync(byeFile);
