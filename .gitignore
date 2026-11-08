@@ -26,3 +26,5 @@ chat_history.txt
 *.jpeg
 *.png
 *.webp
+# Our own design, not user content: the link-preview card.
+!assets/og-card.png

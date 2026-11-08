@@ -61,10 +61,13 @@ const BODY =
   `רוצים שנפרסם גם מודעה גרפית מורחבת? המודעה הקרובה ביותר: {{2}}.`;
 
 // Button ids are the ButtonPayload a tap sends back: 1, 2, 3 as in offerFor's options.
+// A button's title is fixed, so 3 can't name the board's day the way offerFor's text
+// option does, and "only the daily board" would be wrong once today's has gone out. The
+// reply to a tap (declineAd) names the board when there is one.
 const BUTTONS = [
   { key: "1", label: "כן, בהקדם האפשרי" },
   { key: "2", label: "כן, אבחר יום וחלון" },
-  { key: "3", label: "לא, רק בלוח היומי" },
+  { key: "3", label: "לא, תודה" },
 ];
 
 function request(method, path_, payload) {

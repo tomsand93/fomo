@@ -114,8 +114,12 @@ slot (18:00 daily; 12:00 as well on Friday and Saturday), then the ad offer:
 ```text
 1. כן, בהקדם האפשרי: <the first window that passes the rule> (<hours>)
 2. כן, אבחר יום וחלון
-3. לא, רק בלוח היומי
+3. לא, רק בלוח של <היום / מחר / the board's day>
 ```
+
+Option 3 names the board the event is on. Once every board it could be on has gone to
+Stav, it reads `לא, תודה` instead. The template's button is always `לא, תודה`, because a
+button title can't change; the reply after the tap names the board.
 
 - **1** books the first window that passes the rule.
 - **2** lists up to six windows, with `תאריך אחר` when there are more. Windows are morning

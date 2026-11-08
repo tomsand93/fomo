@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@400;600;800;900&display=block" rel="stylesheet">
+<style>
+  html, body { margin: 0; width: 1200px; height: 630px; overflow: hidden; }
+  body {
+    font-family: "Rubik", sans-serif;
+    background:
+      radial-gradient(ellipse 520px 360px at 50% 46%, rgba(224,138,60,.22), transparent 70%),
+      linear-gradient(180deg, #1d1912 0%, #17150f 100%);
+    color: #f2ede4;
+    position: relative;
+  }
+  .sun {
+    position: absolute; left: 50%; top: 300px; width: 520px; height: 520px;
+    transform: translateX(-50%); border-radius: 50%;
+    background: radial-gradient(circle at 50% 40%, #e08a3c 0%, #b4652a 55%, #7a3f17 100%);
+    opacity: .9;
+  }
+  svg.ridge { position: absolute; left: 0; bottom: 0; width: 1200px; height: 260px; }
+  .content {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center; padding-bottom: 40px;
+  }
+  .pill {
+    font-weight: 600; font-size: 30px; color: #e8a161;
+    border: 2px solid rgba(232,161,97,.55); border-radius: 999px;
+    padding: 6px 26px 8px; margin-bottom: 18px; letter-spacing: .02em;
+  }
+  .word {
+    direction: ltr; font-weight: 900; font-size: 180px; line-height: .9;
+    letter-spacing: .04em; color: #f7f2e9;
+    text-shadow: 0 6px 30px rgba(0,0,0,.45);
+  }
+  .city { font-weight: 900; font-size: 76px; line-height: 1; color: #17150f; margin-top: 14px; }
+  .tag {
+    margin-top: 22px; font-weight: 600; font-size: 40px; color: #f7f2e9;
+    background: rgba(23,21,15,.72); padding: 6px 22px 10px; border-radius: 14px;
+  }
+</style>
+</head>
+<body>
+  <div class="sun"></div>
+  <svg class="ridge" viewBox="0 0 1200 260" preserveAspectRatio="none">
+    <path d="M0 150 C 120 120, 220 95, 330 110 S 520 70, 640 92 S 860 60, 980 96 S 1130 120, 1200 112 L1200 260 L0 260 Z" fill="#2a241a"/>
+    <path d="M0 190 C 140 170, 260 150, 400 165 S 640 140, 780 160 S 1020 150, 1200 168 L1200 260 L0 260 Z" fill="#221d15"/>
+    <rect x="0" y="214" width="1200" height="46" fill="#17150f"/>
+    <path d="M0 214 L1200 214" stroke="#b4652a" stroke-opacity=".5" stroke-width="2"/>
+    <path d="M380 232 L820 232" stroke="#e8a161" stroke-opacity=".35" stroke-width="3" stroke-linecap="round"/>
+    <path d="M470 246 L730 246" stroke="#e8a161" stroke-opacity=".2" stroke-width="3" stroke-linecap="round"/>
+  </svg>
+  <div class="content">
+    <div class="pill">הלוח היומי</div>
+    <div class="word">FOMO</div>
+    <div class="city">חיפה</div>
+    <div class="tag">מה עושים היום בחיפה?</div>
+  </div>
+</body>
+</html>

@@ -2339,6 +2339,15 @@ function nextAdWindow(local) {
   }
 }
 
+// Option 3 of the offer names the board the event is really on. Once every board it
+// could be on has gone to Stav, it promises none.
+function declineLabel(board, today) {
+  if (!board) return "לא, תודה";
+  if (board.date === today) return "לא, רק בלוח של היום";
+  if (board.date === addDays(today, 1)) return "לא, רק בלוח של מחר";
+  return `לא, רק בלוח של ${dayName(board.date)}`;
+}
+
 // The approval message and the ad offer, as two texts. The approval names the daily
 // board's date and slot. offerText is empty when no window is left before the event
 // (the approval then says why) or the event already has its one booking.
@@ -2369,7 +2378,7 @@ function offerFor(event, local) {
   const options = [
     { key: "1", label: `כן, בהקדם האפשרי: *${phrase}* (${first.start}–${first.end})`, date: first.date, window: first.key },
     { key: "2", label: "כן, אבחר יום וחלון", action: "pick" },
-    { key: "3", label: "לא, רק בלוח היומי", action: "decline" },
+    { key: "3", label: declineLabel(board, today), action: "decline" },
   ];
   const prompt = `רוצים שנפרסם גם *מודעה גרפית מורחבת*${event.flyer ? " עם הפלייר" : ""}?`;
   return { ...result, offerText: renderNumbered(prompt, options), options, prompt, phrase };

@@ -2544,6 +2544,15 @@ async function demo() {
     if (offer.offerText.includes("שבועי")) throw new Error("no weekly board");
     if (!offer.approvalText.includes("12:00")) throw new Error("names the board slot");
     if (offer.options.map((o) => o.key).join() !== "1,2,3") throw new Error("the offer matches the fomo_ad_offer buttons");
+    // Option 3 names the board the event is actually on, and promises none once it's gone.
+    const declineLabel = (e, c) => offerFor(e, c).options.find((o) => o.action === "decline").label;
+    if (declineLabel(event, clock) !== "לא, רק בלוח של שבת 7.11") throw new Error("names the board's day");
+    if (declineLabel({ ...event, date: "2026-11-05" }, clock) !== "לא, רק בלוח של היום") throw new Error("today's board");
+    if (declineLabel({ ...event, date: "2026-11-06" }, clock) !== "לא, רק בלוח של מחר") throw new Error("tomorrow's board");
+    const boardGone = { ...clock, hour: 18, minute: 30 };
+    if (declineLabel({ ...event, date: "2026-11-05", start_time: "22:00" }, boardGone) !== "לא, תודה") {
+      throw new Error("today's board has gone out: no board is promised");
+    }
     // the 21:01 case: no offer, and the reason
     const late = offerFor({ ...event, date: "2026-11-05", start_time: "22:00" }, { ...clock, hour: 21, minute: 1 });
     if (late.offerText || !late.approvalText.includes("10:00")) throw new Error("no window");
