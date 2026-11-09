@@ -1524,30 +1524,50 @@ function appendEvent(event, source, sender) {
 //
 // The raw fields are gone deliberately: everything in them is visible in one of the
 // two previews, and repeating it made the message twice as long to read.
-function formatEventForReview(id, event, sender, unresolved = []) {
+//
+// Three messages, not one: the board line, the ad with its flyer, then what she can do.
+// It used to be a single block with the flyer hung on all of it, so the two versions
+// ran together and neither looked like what the group actually gets. The organizer has
+// always seen them apart (previewMessages); Stav now sees the same pair, then decides.
+function reviewMessages(id, event, sender, unresolved = []) {
+  const [short, ad] = previewMessages(event);
   // Surface anything the submitter couldn't clear up, so Stav reviews with the same
   // doubt the extractor had rather than trusting a silently guessed value.
-  const uncertaintyNote = unresolved.length
-    ? `⚠ לא הובהר: ${unresolved.join(" | ")}`
-    : "";
-
-  const { short, ad } = previewRenderings(event);
-  return [
+  const head = [
     `אירוע חדש לבדיקה #${id}`,
     `נשלח מ: ${sender}`,
-    uncertaintyNote || null,
-    "",
-    "— לוח יומי (מקוצר) —",
-    short,
-    "",
-    // Names the flyer only when there is one, as the organizer's preview does.
-    ad.mediaUrl ? "— מודעה גרפית (מורחבת, עם הפלייר) —" : "— מודעה גרפית (מורחבת) —",
-    ad.text,
-    "",
-    `לאישור: אשר ${id}`,
+    ...(unresolved.length ? [`⚠ לא הובהר: ${unresolved.join(" | ")}`] : []),
+  ].join("\n");
+  return [
+    { text: `${head}\n\n${short.text}`, mediaUrl: "" },
+    ad,
+    { text: reviewActionsText(id), mediaUrl: "" },
+  ];
+}
+
+// After both versions: edit first, since a fix comes before a yes.
+function reviewActionsText(id) {
+  return [
+    `#${id} — אחרי שבדקת את שתי הגרסאות:`,
     `לעריכה: ערוך ${id}`,
+    `לאישור: אשר ${id}`,
     `לדחייה: דחה ${id} [סיבה]`,
-  ].filter((line) => line !== null).join("\n");
+  ].join("\n");
+}
+
+// Sent one by one and in order, each awaited, so the ad cannot overtake the board line.
+// Returns the sids, so a swipe-reply on any of them resolves to the event.
+async function sendToAdmin(messages) {
+  if (process.env.NODE_ENV === "test") {
+    for (const { text, mediaUrl } of messages) outbox.push({ to: ADMIN_SENDER, text, mediaUrl: mediaUrl || "" });
+    return [];
+  }
+  const sids = [];
+  for (const { text, mediaUrl } of messages) {
+    const result = await sendWhatsApp(ADMIN_SENDER, text, mediaUrl || "");
+    sids.push(result && result.sid);
+  }
+  return sids;
 }
 
 const MAX_TRACKED_NOTICES = 50;
@@ -1582,7 +1602,7 @@ const UNDELIVERED_STATUSES = new Set(["undelivered", "failed"]);
 // forwardEventToAdmin — it goes through fomo_review_event via ContentSid, which (unlike
 // this preview) bypasses the 24h window whenever that template is approved. So the ping
 // reaches her regardless; only the flyer/description preview is what a closed window can
-// still cost her, and missedNoticesBanner is what surfaces that on her next message.
+// still cost her, and resendMissedReviews is what delivers that on her next message.
 async function confirmAdminNotification(id, sid) {
   try {
     const status = await getMessageStatus(sid);
@@ -1859,23 +1879,18 @@ async function sendReviewButtons(id, eventName) {
 }
 
 async function forwardEventToAdmin(id, event, sender, unresolved = [], flyer = "") {
+  // Preview the stored row, not the extractor's object: the slug and flyer are
+  // written by appendEvent and persistFlyer, so only the row has them. Previewing
+  // the extractor's version would show Stav a different link from the one the group
+  // will actually receive.
+  const stored = storeFindEvent(EVENTS_FILE, id) || { ...event, flyer };
   if (process.env.NODE_ENV === "test") {
-    const stored = storeFindEvent(EVENTS_FILE, id) || { ...event, flyer };
-    outbox.push({ to: ADMIN_SENDER, text: formatEventForReview(id, stored, sender, unresolved), mediaUrl: "" });
+    await sendToAdmin(reviewMessages(id, stored, sender, unresolved));
     return;
   }
   try {
-    // Preview the stored row, not the extractor's object: the slug and flyer are
-    // written by appendEvent and persistFlyer, so only the row has them. Previewing
-    // the extractor's version would show Stav a different link from the one the group
-    // will actually receive.
-    const stored = storeFindEvent(EVENTS_FILE, id) || { ...event, flyer };
-    const result = await sendWhatsApp(
-      ADMIN_SENDER,
-      formatEventForReview(id, stored, sender, unresolved),
-      flyerUrl(flyer)
-    );
-    rememberNotice(result.sid, id);
+    const sids = await sendToAdmin(reviewMessages(id, stored, sender, unresolved));
+    for (const sid of sids) rememberNotice(sid, id);
 
     // The previews and the buttons cannot share a message: a template message carries
     // only its own approved body, so putting the buttons on it would mean approving an
@@ -1888,7 +1903,8 @@ async function forwardEventToAdmin(id, event, sender, unresolved = [], flyer = "
     // still gets surfaced on Stav's next message) rather than silently disappearing.
     undeliveredAdminNotices.add(String(id));
     saveState();
-    confirmAdminNotification(id, result.sid);
+    // A closed window drops all three alike, so the first one's fate stands for them.
+    confirmAdminNotification(id, sids[0]);
   } catch (err) {
     console.error("failed to forward event to admin:", err);
     undeliveredAdminNotices.add(String(id));
@@ -2787,7 +2803,13 @@ function resolveEventId(explicitId, repliedSid) {
 
 // Any inbound admin message reopens WhatsApp's 24h window, so it's the one reliable moment
 // to deliver review notices that were dropped earlier (error 63016).
-function missedNoticesBanner(events) {
+//
+// The full review, not a name line: the only thing that reached her was the button
+// template ("event #N is waiting for approval"), and she cannot decide on a name alone
+// (Ben Band, 08/11/2026). Sent as its own messages — board line, ad with flyer, actions —
+// before her reply, and from then on she has seen them, so the flags are cleared. A
+// send that fails keeps its flag for her next message.
+async function resendMissedReviews(events) {
   if (!undeliveredAdminNotices.size) return "";
   const stillPending = events.filter(
     (e) => e.status === "submitted" && undeliveredAdminNotices.has(String(e.id))
@@ -2797,12 +2819,22 @@ function missedNoticesBanner(events) {
     saveState();
     return "";
   }
-  const lines = stillPending
-    .map((e) => `#${e.id} ${e.event_name} — ${e.date} ${e.start_time}`)
-    .join("\n");
-  // The original notice never reached her phone, so there is no message to swipe-reply to
-  // (WhatsApp itself will say "אין הודעה מעל" if she tries) — spell out the typed form.
-  return `⚠ אירועים שההודעה עליהם לא הגיעה אליך (אי אפשר לענות על ההודעה המקורית — היא לא הגיעה):\n${lines}\n\nלטפל: אשר [מספר] או דחה [מספר]\n\n`;
+  const resent = [];
+  for (const e of stillPending) {
+    try {
+      const sids = await sendToAdmin(reviewMessages(e.id, e, e.submitter || ""));
+      for (const sid of sids) rememberNotice(sid, e.id);
+      undeliveredAdminNotices.delete(String(e.id));
+      resent.push(`#${e.id}`);
+    } catch (err) {
+      console.error(`failed to resend the review of event #${e.id}:`, err);
+    }
+  }
+  saveState();
+  if (!resent.length) return "";
+  return `⚠ ${resent.length === 1 ? `המודעה ${resent[0]} לא הגיעה אליך קודם — שלחתי אותה עכשיו למעלה.` : `המודעות ${resent.join(", ")} לא הגיעו אליך קודם — שלחתי אותן עכשיו למעלה.`}
+
+`;
 }
 
 // "Views" rather than "clicks" on purpose: WhatsApp and every preview crawler fetch a
@@ -2859,10 +2891,19 @@ async function handleAdminEdit(id, text) {
   if (!event) return `לא נמצא אירוע #${id}.`;
   if (!changed.length) return askAgain(`${CORRECTION_UNCLEAR_TEXT}\n\n${editAskText(id)}`);
   const [short, ad] = previewMessages(event);
+  // Both updated versions as their own messages, as in the review itself, then the
+  // reply with what is next. Awaited, so they land above that reply.
+  try {
+    const sids = await sendToAdmin([{ text: `עודכן ✏ #${id}. ככה זה נראה עכשיו:\n\n${short.text}`, mediaUrl: "" }, ad]);
+    for (const sid of sids) rememberNotice(sid, id);
+  } catch (err) {
+    console.error(`failed to send the edited previews of event #${id}:`, err);
+    return `עודכן ✏ #${id}, אבל לא הצלחתי לשלוח את הגרסאות המעודכנות. לראות אותן שוב: ערוך ${id}`;
+  }
   // Only an event still under review can be approved; on any other the line would invite
   // a command that does nothing useful (or re-publishes one already out).
   const approvable = event.status === "submitted" || event.status === "needs_info";
-  return [`עודכן ✏ #${id}. ככה זה נראה עכשיו:`, short.text, ad.text, ...(approvable ? [`לאישור: אשר ${id}`] : [])].join("\n\n");
+  return approvable ? reviewActionsText(id) : `עודכן ✏ #${id}.`;
 }
 
 async function handleAdminMessage(text, repliedSid = "") {
@@ -2870,7 +2911,9 @@ async function handleAdminMessage(text, repliedSid = "") {
   // Her message just reopened the 24h WhatsApp window, so any board Twilio dropped with
   // 63016 can finally be delivered. Detached: a slow re-send must not delay her reply.
   const flushing = flushPendingBoards();
-  const banner = missedNoticesBanner(loadEvents(EVENTS_FILE));
+  // Read before the banner, which clears the flags of the reviews it shows.
+  const missedBefore = new Set(undeliveredAdminNotices);
+  const banner = await resendMissedReviews(loadEvents(EVENTS_FILE));
 
   // An open edit takes her next message, unless it is a command: any command closes the
   // edit and runs as usual. Only the strict command forms count, so an edit that starts
@@ -2937,6 +2980,19 @@ async function handleAdminMessage(text, repliedSid = "") {
   const existing = storeFindEvent(EVENTS_FILE, id);
   if (!existing) {
     return `${banner}לא נמצא אירוע #${id}.\n\n${formatPendingList(loadEvents(EVENTS_FILE))}`;
+  }
+
+  // A button tap (no id typed) on an event whose full review never reached her: she
+  // pressed "approve" having seen only "event #N is waiting". Nothing is decided — both
+  // versions were just sent above (resendMissedReviews), and a second tap acts (the flag
+  // is gone, lastButtonEventId still points here). A typed "אשר 12" is a deliberate
+  // choice and goes through as before.
+  if (!explicitId && missedBefore.has(String(id)) && existing.status === "submitted") {
+    const verb = action === "אשר" ? "אישרתי" : "דחיתי";
+    if (undeliveredAdminNotices.has(String(id))) {
+      return `${banner}עדיין לא ${verb} את #${id}: המודעה לא הגיעה אליך, וגם השליחה החוזרת נכשלה. לנסות שוב: ממתינים`;
+    }
+    return `${banner}עדיין לא ${verb} את #${id} — שתי הגרסאות נשלחו עכשיו למעלה.\nאחרי שבדקת: ללחוץ שוב על הכפתור, או לכתוב ${action} ${id}`;
   }
 
   // Acting on an event means it was seen; stop flagging it as a missed notice.
@@ -4175,7 +4231,7 @@ module.exports = {
   server,
   shortLink,
   destinationFor,
-  formatEventForReview,
+  reviewMessages,
   missingFields,
   missingFieldsPrompt,
   parseUserDate,

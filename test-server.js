@@ -31,7 +31,7 @@ process.env.PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://test.fomo.
 // The flyer-and-text pairing window, shortened so the suite does not sit in it.
 process.env.PAIR_WAIT_MS = "50";
 
-const { receiveInbound, looksLikeEventAnnouncement, routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, formatEventForReview, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, goodbyeText, goodbyeMessage, sendGoodbyes, mapsUrl, mapLink, awaitingAdChoice, pendingAdOffers, offerFor, activeSubmissions, awaitingIntentConfirm, offeredEscape, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, lastInbound, IDLE_TIMEOUT_MS, outbox, awaitingConfirmation } = require("./server");
+const { receiveInbound, looksLikeEventAnnouncement, routeMessage, slotsDueAt, isDue, PENDING_REMINDER_SLOT, destinationFor, shortLink, reviewMessages, missingFields: serverMissingFields, missingFieldsPrompt, parseUserDate, ASK_OTHER_DATE_TEXT, buttonReplyFor, goodbyeText, goodbyeMessage, sendGoodbyes, mapsUrl, mapLink, awaitingAdChoice, pendingAdOffers, offerFor, activeSubmissions, awaitingIntentConfirm, offeredEscape, activeInquiries, activeInquiryHistories, recentlyCompleted, upcomingPublishedEvents, undeliveredAdminNotices, adminMode, lastActivity, lastInbound, IDLE_TIMEOUT_MS, outbox, awaitingConfirmation } = require("./server");
 
 const ADMIN = `whatsapp:${process.env.ADMIN_PHONE || "+972528762432"}`;
 
@@ -261,17 +261,40 @@ async function demo() {
     .filter((e) => e.status === "submitted");
   const missedId = submittedNow[submittedNow.length - 1].id;
   undeliveredAdminNotices.add(missedId);
+  outbox.length = 0;
   const adminWithMissed = await routeMessage(ADMIN, "ממתינים");
   if (!adminWithMissed.includes("לא הגיעה אליך")) {
     throw new Error("admin should be warned about review notices that were never delivered");
   }
-  if (!adminWithMissed.includes(`#${missedId}`)) {
-    throw new Error("the missed-notice warning should name the undelivered event");
+  // The full review, not just its name: the button template that did arrive says only
+  // "event #N is waiting", and she cannot decide on that (Ben Band, 08/11/2026). Resent
+  // as the board line, the ad, then the actions — three messages, as in the review itself.
+  const resentReview = outbox.filter((m) => m.to === ADMIN);
+  if (resentReview.length !== 3 || !resentReview[0].text.includes(`אירוע חדש לבדיקה #${missedId}`)
+    || !resentReview[0].text.includes("*לוח יומי") || !resentReview[1].text.includes("*מודעה גרפית")
+    || !resentReview[2].text.includes(`ערוך ${missedId}`) || !resentReview[2].text.includes(`אשר ${missedId}`)) {
+    throw new Error("the missed review should be resent in full, as separate messages");
+  }
+  if (undeliveredAdminNotices.has(missedId)) {
+    throw new Error("once the full review has been shown, the event is no longer a missed notice");
+  }
+
+  // A button tap as her first message, on an event whose review never arrived: show the
+  // review and approve nothing. The second tap approves.
+  undeliveredAdminNotices.add(missedId);
+  require("./server").rememberNotice("SM-missed-review-tap", missedId);
+  outbox.length = 0;
+  const blindTap = await routeMessage(ADMIN, "אשר", [], "SM-missed-review-tap");
+  if (outbox.filter((m) => m.to === ADMIN).length !== 3 || !blindTap.includes("עדיין לא אישרתי")) {
+    throw new Error("an approve tap on an unseen review should show the review instead of approving");
+  }
+  if (require("./events-store").findEvent(TEST_EVENTS_FILE, missedId).status !== "submitted") {
+    throw new Error("an approve tap on an unseen review must not publish the event");
   }
 
   // Acting on the event clears the flag, so it isn't reported forever.
-  const adminApprove = await routeMessage(ADMIN, `אשר ${missedId}`);
-  if (!adminApprove.includes(`אירוע #${missedId} אושר.`)) throw new Error("admin approval should publish the event");
+  const adminApprove = await routeMessage(ADMIN, "אשר", [], "SM-missed-review-tap");
+  if (!adminApprove.includes(`אירוע #${missedId} אושר.`)) throw new Error("a second tap, after the review was shown, should publish the event");
   if (undeliveredAdminNotices.has(missedId)) {
     throw new Error("acting on an event should clear its missed-notice flag");
   }
@@ -1300,13 +1323,23 @@ async function demo() {
     organizer: "סילביה", contact_link: "https://x.co/rev", contact_person: "מאיה",
     description: "ערב הופעות", flyer: "", slug: "rv12",
   };
-  const notice = formatEventForReview(77, reviewEvent, "whatsapp:+972500009777", ["המחיר לא ברור"]);
-  if (!notice.includes("— לוח יומי (מקוצר) —") || notice.includes("שבועי")) {
-    throw new Error("the review notice must label the daily-board preview");
+  // Three messages, in order: the board line, the ad with its flyer, then the actions.
+  // As one block the two versions ran together and the flyer hung on all of it.
+  const reviewParts = reviewMessages(77, { ...reviewEvent, flyer: "77.jpg" }, "whatsapp:+972500009777", ["המחיר לא ברור"]);
+  if (reviewParts.length !== 3) throw new Error("the review is three messages: board line, ad, actions");
+  if (!reviewParts[0].text.includes("*לוח יומי") || reviewParts[0].text.includes("*מודעה גרפית") || reviewParts[0].mediaUrl) {
+    throw new Error("the first review message is the board line alone, without the flyer");
   }
-  if (!notice.includes("— מודעה גרפית (מורחבת") || !notice.includes("לעריכה: ערוך 77")) {
-    throw new Error("the review notice must label the ad preview and offer the edit");
+  if (!reviewParts[1].text.includes("*מודעה גרפית") || reviewParts[1].text.includes("*לוח יומי")) {
+    throw new Error("the second review message is the ad alone");
   }
+  if (process.env.PUBLIC_BASE_URL && !reviewParts[1].mediaUrl) throw new Error("the flyer rides on the ad");
+  const actions = reviewParts[2].text;
+  if (!actions.includes("לעריכה: ערוך 77") || actions.indexOf("ערוך 77") > actions.indexOf("אשר 77")) {
+    throw new Error("the actions offer the edit, before the approve");
+  }
+  const notice = reviewParts.map((m) => m.text).join("\n\n");
+  if (notice.includes("שבועי")) throw new Error("the review has no weekly version");
   // The SHORT line joins with " · "; the LONG block has its own date line. Both being
   // present is what proves two distinct renderings, not one repeated.
   if (!notice.includes("📍 סילביה, החלוץ 27 · 🎫 70 ₪")) {
@@ -1334,11 +1367,8 @@ async function demo() {
     throw new Error("the review notice must keep the approve/reject instructions");
   }
   // WhatsApp truncates a body over 1600 chars, which would cut off those instructions.
-  const longDescription = formatEventForReview(
-    77, { ...reviewEvent, description: "א".repeat(600) }, "whatsapp:+972500009777", []
-  );
-  if (longDescription.length > 1600) {
-    throw new Error(`the review notice must fit in one message, got ${longDescription.length}`);
+  for (const part of reviewMessages(77, { ...reviewEvent, description: "א".repeat(600) }, "whatsapp:+972500009777", [])) {
+    if (part.text.length > 1600) throw new Error(`each review message must fit, got ${part.text.length}`);
   }
 
   // "Haifa" is not somewhere you can turn up to. A bare city is treated as missing so
@@ -2353,7 +2383,7 @@ async function demo() {
     lastActivity.set(sender, Date.now() - 6 * 60 * 60 * 1000);
     const done = await routeMessage(sender, "1");
     if (!done.includes("עבר לבדיקה") || find().status !== "submitted") throw new Error("confirmed after idle");
-    if (toAdmin().length !== 1) throw new Error("Stav gets it once");
+    if (toAdmin().length !== 3) throw new Error("Stav gets it once: board line, ad, actions");
     if (awaitingConfirmation.has(sender)) throw new Error("the question closes");
 
     // ביטול cancels instead of stranding it; תפריט only closes the question
@@ -2468,17 +2498,21 @@ async function demo() {
     );
     eventsStore.updateEvent(TEST_EVENTS_FILE, id, { status: "submitted" });
     const find = () => eventsStore.findEvent(TEST_EVENTS_FILE, id);
-    const notice = formatEventForReview(id, find(), "x");
+    const notice = reviewMessages(id, find(), "x").map((m) => m.text).join("\n\n");
     if (notice.includes("שבועי") || !notice.includes("לוח יומי") || !notice.includes(`ערוך ${id}`)) throw new Error("notice labels");
 
     if (!(await routeMessage(ADMIN, `ערוך ${id}`)).includes("מה לשנות")) throw new Error("asks what to change");
     // text that changes nothing says so and keeps the edit open
     if (!(await routeMessage(ADMIN, "שלום")).includes("לא הצלחנו להבין")) throw new Error("unclear edit");
     CORRECTION_STUB.set("תיאור חדש", { description: "תיאור חדש" });
+    outbox.length = 0;
     const edited = await routeMessage(ADMIN, "תיאור חדש");
-    if (!edited.includes("עודכן") || !edited.includes(`אשר ${id}`)) throw new Error("shows the result");
-    if (!edited.includes("*לוח יומי") || !edited.includes("*מודעה גרפית") || !edited.includes("תיאור חדש")) throw new Error("both updated previews");
-    if (edited.length > 1600) throw new Error("the edit result fits in one message");
+    if (!edited.includes(`אשר ${id}`)) throw new Error("shows what is next");
+    const editedParts = outbox.filter((m) => m.to === ADMIN);
+    if (editedParts.length !== 2 || !editedParts[0].text.includes("עודכן") || !editedParts[0].text.includes("*לוח יומי")
+      || !editedParts[1].text.includes("*מודעה גרפית") || !editedParts[1].text.includes("תיאור חדש")) {
+      throw new Error("both updated previews, each its own message");
+    }
     if (find().description !== "תיאור חדש") throw new Error("saved");
     // the edit is closed: her next text is not another edit
     CORRECTION_STUB.set("תיאור שלישי", { description: "תיאור שלישי" });
@@ -2975,8 +3009,10 @@ async function demo() {
       eventsStore.updateEvent(TEST_EVENTS_FILE, id, { status });
       await routeMessage(ADMIN, `ערוך ${id}`);
       CORRECTION_STUB.set(description, { description });
+      outbox.length = 0;
       const reply = await routeMessage(ADMIN, description);
-      if (!reply.includes("עודכן")) throw new Error(`the ${status} edit is applied`);
+      // The updated versions go out as their own messages; the reply says what is next.
+      if (!outbox.some((m) => m.to === ADMIN && m.text.includes("עודכן"))) throw new Error(`the ${status} edit is applied`);
       return reply;
     };
     if (!(await editTo("submitted", "תיאור א")).includes(`לאישור: אשר ${id}`)) throw new Error("submitted: the approve line is shown");
