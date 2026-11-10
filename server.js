@@ -1525,25 +1525,33 @@ function appendEvent(event, source, sender) {
 // The raw fields are gone deliberately: everything in them is visible in one of the
 // two previews, and repeating it made the message twice as long to read.
 //
-// Three messages, not one: the board line, the ad with its flyer, then what she can do.
+// Four messages: a header, the board line, the ad with its flyer, then what she can do.
 // It used to be a single block with the flyer hung on all of it, so the two versions
-// ran together and neither looked like what the group actually gets. The organizer has
-// always seen them apart (previewMessages); Stav now sees the same pair, then decides.
+// ran together and neither looked like what the group actually gets.
+//
+// The two versions carry nothing but themselves, so either forwards to the group as is.
+// Labels on them ("*מודעה גרפית מורחבת*" on top of the ad) went along with every forward
+// (10/11/2026); everything about them is said in the header instead.
 function reviewMessages(id, event, sender, unresolved = []) {
-  const [short, ad] = previewMessages(event);
+  const { short, ad } = previewRenderings(event);
   // Surface anything the submitter couldn't clear up, so Stav reviews with the same
   // doubt the extractor had rather than trusting a silently guessed value.
   const head = [
     `אירוע חדש לבדיקה #${id}`,
     `נשלח מ: ${sender}`,
     ...(unresolved.length ? [`⚠ לא הובהר: ${unresolved.join(" | ")}`] : []),
+    "",
+    VERSIONS_BELOW_TEXT,
   ].join("\n");
   return [
-    { text: `${head}\n\n${short.text}`, mediaUrl: "" },
-    ad,
+    { text: head, mediaUrl: "" },
+    { text: short, mediaUrl: "" },
+    { text: ad.text, mediaUrl: ad.mediaUrl || "" },
     { text: reviewActionsText(id), mediaUrl: "" },
   ];
 }
+
+const VERSIONS_BELOW_TEXT = "👇 הלוח היומי ואחריו הפוסט, כל אחד בהודעה משלו, מוכנים להעברה כמו שהם.";
 
 // After both versions: edit first, since a fix comes before a yes.
 function reviewActionsText(id) {
@@ -2890,11 +2898,16 @@ async function handleAdminEdit(id, text) {
   const { changed, event } = await applyCorrection(id, trimmed, { byAdmin: true });
   if (!event) return `לא נמצא אירוע #${id}.`;
   if (!changed.length) return askAgain(`${CORRECTION_UNCLEAR_TEXT}\n\n${editAskText(id)}`);
-  const [short, ad] = previewMessages(event);
+  const { short, ad } = previewRenderings(event);
   // Both updated versions as their own messages, as in the review itself, then the
-  // reply with what is next. Awaited, so they land above that reply.
+  // reply with what is next. Awaited, so they land above that reply. Bare, like the
+  // review's, so either forwards as is.
   try {
-    const sids = await sendToAdmin([{ text: `עודכן ✏ #${id}. ככה זה נראה עכשיו:\n\n${short.text}`, mediaUrl: "" }, ad]);
+    const sids = await sendToAdmin([
+      { text: `עודכן ✏ #${id}. ככה זה נראה עכשיו:\n${VERSIONS_BELOW_TEXT}`, mediaUrl: "" },
+      { text: short, mediaUrl: "" },
+      { text: ad.text, mediaUrl: ad.mediaUrl || "" },
+    ]);
     for (const sid of sids) rememberNotice(sid, id);
   } catch (err) {
     console.error(`failed to send the edited previews of event #${id}:`, err);

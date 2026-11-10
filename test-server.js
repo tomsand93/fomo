@@ -268,11 +268,10 @@ async function demo() {
   }
   // The full review, not just its name: the button template that did arrive says only
   // "event #N is waiting", and she cannot decide on that (Ben Band, 08/11/2026). Resent
-  // as the board line, the ad, then the actions — three messages, as in the review itself.
+  // as a header, the board line, the ad, then the actions, as in the review itself.
   const resentReview = outbox.filter((m) => m.to === ADMIN);
-  if (resentReview.length !== 3 || !resentReview[0].text.includes(`אירוע חדש לבדיקה #${missedId}`)
-    || !resentReview[0].text.includes("*לוח יומי") || !resentReview[1].text.includes("*מודעה גרפית")
-    || !resentReview[2].text.includes(`ערוך ${missedId}`) || !resentReview[2].text.includes(`אשר ${missedId}`)) {
+  if (resentReview.length !== 4 || !resentReview[0].text.includes(`אירוע חדש לבדיקה #${missedId}`)
+    || !resentReview[3].text.includes(`ערוך ${missedId}`) || !resentReview[3].text.includes(`אשר ${missedId}`)) {
     throw new Error("the missed review should be resent in full, as separate messages");
   }
   if (undeliveredAdminNotices.has(missedId)) {
@@ -285,7 +284,7 @@ async function demo() {
   require("./server").rememberNotice("SM-missed-review-tap", missedId);
   outbox.length = 0;
   const blindTap = await routeMessage(ADMIN, "אשר", [], "SM-missed-review-tap");
-  if (outbox.filter((m) => m.to === ADMIN).length !== 3 || !blindTap.includes("עדיין לא אישרתי")) {
+  if (outbox.filter((m) => m.to === ADMIN).length !== 4 || !blindTap.includes("עדיין לא אישרתי")) {
     throw new Error("an approve tap on an unseen review should show the review instead of approving");
   }
   if (require("./events-store").findEvent(TEST_EVENTS_FILE, missedId).status !== "submitted") {
@@ -1323,18 +1322,25 @@ async function demo() {
     organizer: "סילביה", contact_link: "https://x.co/rev", contact_person: "מאיה",
     description: "ערב הופעות", flyer: "", slug: "rv12",
   };
-  // Three messages, in order: the board line, the ad with its flyer, then the actions.
-  // As one block the two versions ran together and the flyer hung on all of it.
-  const reviewParts = reviewMessages(77, { ...reviewEvent, flyer: "77.jpg" }, "whatsapp:+972500009777", ["המחיר לא ברור"]);
-  if (reviewParts.length !== 3) throw new Error("the review is three messages: board line, ad, actions");
-  if (!reviewParts[0].text.includes("*לוח יומי") || reviewParts[0].text.includes("*מודעה גרפית") || reviewParts[0].mediaUrl) {
-    throw new Error("the first review message is the board line alone, without the flyer");
+  // Four messages, in order: a header, the board line, the ad with its flyer, then the
+  // actions. The two versions are bare, exactly as the group gets them, so Stav can
+  // forward either as is: a label on top went along with every forward (10/11/2026).
+  const reviewEventWithFlyer = { ...reviewEvent, flyer: "77.jpg" };
+  const reviewParts = reviewMessages(77, reviewEventWithFlyer, "whatsapp:+972500009777", ["המחיר לא ברור"]);
+  if (reviewParts.length !== 4) throw new Error("the review is four messages: header, board line, ad, actions");
+  if (!reviewParts[0].text.includes("אירוע חדש לבדיקה #77") || !reviewParts[0].text.includes("לא הובהר")) {
+    throw new Error("the header names the event and keeps the uncertainty warning");
   }
-  if (!reviewParts[1].text.includes("*מודעה גרפית") || reviewParts[1].text.includes("*לוח יומי")) {
-    throw new Error("the second review message is the ad alone");
+  if (reviewParts[1].text !== require("./format-event").formatShort(reviewEventWithFlyer, { linkFor: shortLink }) || reviewParts[1].mediaUrl) {
+    throw new Error("the second review message is the board line exactly as the group gets it, without the flyer");
   }
-  if (process.env.PUBLIC_BASE_URL && !reviewParts[1].mediaUrl) throw new Error("the flyer rides on the ad");
-  const actions = reviewParts[2].text;
+  for (const part of reviewParts.slice(1, 3)) {
+    if (/מודעה גרפית|לוח יומי|אירוע חדש לבדיקה|אשר 77/.test(part.text)) {
+      throw new Error(`a version Stav forwards must carry no label or command, got: ${part.text.slice(0, 60)}`);
+    }
+  }
+  if (process.env.PUBLIC_BASE_URL && !reviewParts[2].mediaUrl) throw new Error("the flyer rides on the ad");
+  const actions = reviewParts[3].text;
   if (!actions.includes("לעריכה: ערוך 77") || actions.indexOf("ערוך 77") > actions.indexOf("אשר 77")) {
     throw new Error("the actions offer the edit, before the approve");
   }
@@ -2383,7 +2389,7 @@ async function demo() {
     lastActivity.set(sender, Date.now() - 6 * 60 * 60 * 1000);
     const done = await routeMessage(sender, "1");
     if (!done.includes("עבר לבדיקה") || find().status !== "submitted") throw new Error("confirmed after idle");
-    if (toAdmin().length !== 3) throw new Error("Stav gets it once: board line, ad, actions");
+    if (toAdmin().length !== 4) throw new Error("Stav gets it once: header, board line, ad, actions");
     if (awaitingConfirmation.has(sender)) throw new Error("the question closes");
 
     // ביטול cancels instead of stranding it; תפריט only closes the question
@@ -2499,7 +2505,7 @@ async function demo() {
     eventsStore.updateEvent(TEST_EVENTS_FILE, id, { status: "submitted" });
     const find = () => eventsStore.findEvent(TEST_EVENTS_FILE, id);
     const notice = reviewMessages(id, find(), "x").map((m) => m.text).join("\n\n");
-    if (notice.includes("שבועי") || !notice.includes("לוח יומי") || !notice.includes(`ערוך ${id}`)) throw new Error("notice labels");
+    if (notice.includes("שבועי") || !notice.includes("הלוח היומי") || !notice.includes(`ערוך ${id}`)) throw new Error("notice labels");
 
     if (!(await routeMessage(ADMIN, `ערוך ${id}`)).includes("מה לשנות")) throw new Error("asks what to change");
     // text that changes nothing says so and keeps the edit open
@@ -2509,8 +2515,8 @@ async function demo() {
     const edited = await routeMessage(ADMIN, "תיאור חדש");
     if (!edited.includes(`אשר ${id}`)) throw new Error("shows what is next");
     const editedParts = outbox.filter((m) => m.to === ADMIN);
-    if (editedParts.length !== 2 || !editedParts[0].text.includes("עודכן") || !editedParts[0].text.includes("*לוח יומי")
-      || !editedParts[1].text.includes("*מודעה גרפית") || !editedParts[1].text.includes("תיאור חדש")) {
+    if (editedParts.length !== 3 || !editedParts[0].text.includes("עודכן") || !editedParts[2].text.includes("תיאור חדש")
+      || editedParts.slice(1).some((m) => /מודעה גרפית|לוח יומי|עודכן/.test(m.text))) {
       throw new Error("both updated previews, each its own message");
     }
     if (find().description !== "תיאור חדש") throw new Error("saved");
